@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+*.pyo
+.venv/
+.git/
+.pytest_cache/
+tests/
+.gitignore
+.env
+CLAUDE.md
