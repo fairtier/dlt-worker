@@ -42,4 +42,4 @@ jobs:
 
       - name: Update coverage badge
         if: github.ref == format('refs/heads/{0}', 'master')
-        uses: we-cli/coverage-badge-action@main
+        uses: Maoyao233/coverage-badge-action@upgrade-action-version # TODO: switch back to we-cli/coverage-badge-action@main once PR #8 is merged
