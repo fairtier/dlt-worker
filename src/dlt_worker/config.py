@@ -24,7 +24,7 @@ def _require(name: str) -> str:
 # Worker config
 # ---------------------------------------------------------------------------
 CUSTOMER_SLUG: str = ""
-PLATFORM_API_URL: str = ""
+FAIRTIER_API_URL: str = ""
 LAKEKEEPER_URL: str = ""
 POLL_INTERVAL_SECONDS: int = 60
 DLT_STATE_DIR: str = "/dlt-state"
@@ -48,7 +48,7 @@ OIDC_TOKEN_URL: str = ""
 
 def load() -> None:
     """Read env vars and set module-level config. Also injects dlt env vars."""
-    global CUSTOMER_SLUG, PLATFORM_API_URL, LAKEKEEPER_URL
+    global CUSTOMER_SLUG, FAIRTIER_API_URL, LAKEKEEPER_URL
     global POLL_INTERVAL_SECONDS, DLT_STATE_DIR, HEALTHZ_PORT
     global PIPELINE_MAX_RETRIES, PIPELINE_RETRY_BASE_DELAY, SNAPSHOT_URL
     global \
@@ -60,7 +60,7 @@ def load() -> None:
     global OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_TOKEN_URL
 
     CUSTOMER_SLUG = _require("CUSTOMER_SLUG")
-    PLATFORM_API_URL = _require("PLATFORM_API_URL")
+    FAIRTIER_API_URL = _require("FAIRTIER_API_URL")
     LAKEKEEPER_URL = _require("LAKEKEEPER_URL")
     POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
     DLT_STATE_DIR = os.environ.get("DLT_STATE_DIR", "/dlt-state")

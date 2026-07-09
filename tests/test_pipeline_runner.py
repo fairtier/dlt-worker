@@ -18,7 +18,7 @@ from dlt_worker.pipeline_runner import (
     _count_rows,
     _trigger_snapshot,
 )
-from dlt_worker.platform_client import PipelineConfig
+from dlt_worker.api_client import PipelineConfig
 
 
 def _make_config(**overrides: Any) -> PipelineConfig:

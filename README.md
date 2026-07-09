@@ -19,7 +19,7 @@ Worker that polls a control plane for pipeline configurations and runs them via 
 ```bash
 docker run --rm \
   -e CUSTOMER_SLUG=acme \
-  -e PLATFORM_API_URL=https://api.example.com \
+  -e FAIRTIER_API_URL=https://api.example.com \
   -e LAKEKEEPER_URL=https://lakekeeper.example.com \
   -e AWS_ACCESS_KEY_ID=... \
   -e AWS_SECRET_ACCESS_KEY=... \
@@ -38,7 +38,7 @@ All configuration is via environment variables.
 | Variable                | Description                                                          |
 |-------------------------|----------------------------------------------------------------------|
 | `CUSTOMER_SLUG`         | Customer identifier sent to the control plane                        |
-| `PLATFORM_API_URL`      | Base URL of the control plane API (Connect/JSON)                     |
+| `FAIRTIER_API_URL`      | Base URL of the control plane API (Connect/JSON)                     |
 | `LAKEKEEPER_URL`        | URL of the [Lakekeeper](https://lakekeeper.io/) Iceberg REST catalog |
 | `AWS_ACCESS_KEY_ID`     | AWS (or S3-compatible) access key                                    |
 | `AWS_SECRET_ACCESS_KEY` | AWS (or S3-compatible) secret key                                    |
@@ -56,9 +56,9 @@ All configuration is via environment variables.
 | `PIPELINE_MAX_RETRIES`      | `2`          | Max retry attempts per pipeline on failure                                            |
 | `PIPELINE_RETRY_BASE_DELAY` | `30`         | Base delay in seconds for exponential backoff                                         |
 | `SNAPSHOT_URL`              | _(empty)_    | URL to trigger a state snapshot sidecar after each pipeline run (disabled when empty) |
-| `OIDC_CLIENT_ID`            | _(empty)_    | OIDC client ID for Lakekeeper catalog auth                                            |
-| `OIDC_CLIENT_SECRET`        | _(empty)_    | OIDC client secret for Lakekeeper catalog auth                                        |
-| `OIDC_TOKEN_URL`            | _(empty)_    | OIDC token endpoint for Lakekeeper catalog auth                                       |
+| `OIDC_CLIENT_ID`            | _(empty)_    | OIDC client ID for Lakekeeper catalog auth **and** FairTier API bearer auth           |
+| `OIDC_CLIENT_SECRET`        | _(empty)_    | OIDC client secret for Lakekeeper catalog auth **and** FairTier API bearer auth       |
+| `OIDC_TOKEN_URL`            | _(empty)_    | OIDC token endpoint for Lakekeeper catalog auth **and** FairTier API bearer auth      |
 | `LAKEKEEPER_WAREHOUSE`      | `default`    | Lakekeeper warehouse name                                                             |
 
 ## Supported source types

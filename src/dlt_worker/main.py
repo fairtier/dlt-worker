@@ -1,6 +1,6 @@
 """Main poll loop with graceful shutdown.
 
-Polls the Platform API for pipeline configurations, evaluates cron
+Polls the FairTier API for pipeline configurations, evaluates cron
 schedules, and runs pipelines that are due. Handles SIGTERM/SIGINT
 for graceful shutdown (important in Kubernetes).
 """
@@ -17,7 +17,7 @@ from croniter import croniter
 from dlt_worker import config
 from dlt_worker.health import start_health_server
 from dlt_worker.pipeline_runner import run_pipeline
-from dlt_worker.platform_client import PipelineConfig, PipelineRunReport, PlatformClient
+from dlt_worker.api_client import PipelineConfig, PipelineRunReport, APIClient
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +62,19 @@ def run() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    client = PlatformClient(
-        base_url=config.PLATFORM_API_URL,
+    client = APIClient(
+        base_url=config.FAIRTIER_API_URL,
         customer_slug=config.CUSTOMER_SLUG,
+        oidc_token_url=config.OIDC_TOKEN_URL,
+        oidc_client_id=config.OIDC_CLIENT_ID,
+        oidc_client_secret=config.OIDC_CLIENT_SECRET,
     )
+    if not client.auth_enabled:
+        logger.warning(
+            "OIDC credentials not configured — FairTier API calls are "
+            "unauthenticated and will be rejected once the API enforces "
+            "tenant-bound auth"
+        )
 
     start_health_server(client, config.HEALTHZ_PORT)
 
@@ -90,7 +99,7 @@ def run() -> None:
     logger.info("dlt-worker shut down cleanly")
 
 
-def _poll_and_run(client: PlatformClient) -> None:
+def _poll_and_run(client: APIClient) -> None:
     configs = client.get_pipeline_configs()
     if not configs:
         return
@@ -129,7 +138,7 @@ def _poll_and_run(client: PlatformClient) -> None:
         _run_with_retry(cfg, run_id, client)
 
 
-def _run_with_retry(cfg: PipelineConfig, run_id: str, client: PlatformClient) -> None:
+def _run_with_retry(cfg: PipelineConfig, run_id: str, client: APIClient) -> None:
     """Run a pipeline with exponential-backoff retries on failure."""
     max_attempts = config.PIPELINE_MAX_RETRIES + 1
     last_report: PipelineRunReport | None = None

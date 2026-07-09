@@ -1,15 +1,22 @@
-"""HTTP client for the Platform API.
+"""HTTP client for the FairTier API.
 
 Fetches pipeline configurations and reports run results. Uses plain HTTP
 (requests) rather than gRPC to avoid pulling in a heavy protobuf/grpc
-dependency on the Python side.  The Platform API exposes a Connect
+dependency on the Python side.  The FairTier API exposes a Connect
 (JSON) endpoint that works with regular HTTP POST + JSON bodies.
+
+Authentication: when OIDC credentials are configured, every call carries a
+Casdoor client-credentials bearer token. The FairTier API binds the token's
+tenant (the app name in its subject, ``dlt-worker-<slug>``) to the requested
+customer slug, so one tenant's worker can never read another's pipeline
+configs. The same OIDC app is used for the Lakekeeper catalog.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -17,6 +24,9 @@ from typing import Any, Literal
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Refresh the cached token this many seconds before it expires.
+_TOKEN_REFRESH_MARGIN = 60
 
 
 @dataclass
@@ -48,14 +58,71 @@ class PipelineRunReport:
 
 
 @dataclass
-class PlatformClient:
+class APIClient:
     base_url: str
     customer_slug: str
+    oidc_token_url: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
     timeout: int = 30
     _session: requests.Session = field(default_factory=requests.Session, repr=False)
     _healthy: bool = field(default=True, repr=False)
     _last_error: str = field(default="", repr=False)
     _last_check_at: str = field(default="", repr=False)
+    _token: str = field(default="", repr=False)
+    _token_expires_at: float = field(default=0.0, repr=False)
+
+    @property
+    def auth_enabled(self) -> bool:
+        """Whether FairTier API calls carry a bearer token."""
+        return bool(
+            self.oidc_token_url and self.oidc_client_id and self.oidc_client_secret
+        )
+
+    def _get_token(self) -> str:
+        """Return a cached client-credentials token, fetching when stale."""
+        if self._token and time.monotonic() < self._token_expires_at:
+            return self._token
+
+        resp = self._session.post(
+            self.oidc_token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self.oidc_client_id,
+                "client_secret": self.oidc_client_secret,
+            },
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self._token = data["access_token"]
+        expires_in = int(data.get("expires_in", 3600))
+        self._token_expires_at = time.monotonic() + max(
+            expires_in - _TOKEN_REFRESH_MARGIN, 30
+        )
+        return self._token
+
+    def _post(self, url: str, payload: dict[str, Any]) -> requests.Response:
+        """POST JSON with bearer auth when configured.
+
+        Retries once with a fresh token on 401 (token revoked/expired early,
+        e.g. after a Casdoor credential rotation).
+        """
+        headers = {"Content-Type": "application/json"}
+        if self.auth_enabled:
+            headers["Authorization"] = f"Bearer {self._get_token()}"
+
+        resp = self._session.post(
+            url, json=payload, timeout=self.timeout, headers=headers
+        )
+        if resp.status_code == 401 and self.auth_enabled:
+            self._token = ""
+            self._token_expires_at = 0.0
+            headers["Authorization"] = f"Bearer {self._get_token()}"
+            resp = self._session.post(
+                url, json=payload, timeout=self.timeout, headers=headers
+            )
+        return resp
 
     def health_status(self) -> tuple[bool, dict[str, Any]]:
         """Return health status and details dict."""
@@ -79,12 +146,7 @@ class PlatformClient:
         """Fetch all enabled pipeline configs for this customer."""
         url = f"{self.base_url}/pipeline.v1.PipelineService/GetPipelineConfigs"
         try:
-            resp = self._session.post(
-                url,
-                json={"customerSlug": self.customer_slug},
-                timeout=self.timeout,
-                headers={"Content-Type": "application/json"},
-            )
+            resp = self._post(url, {"customerSlug": self.customer_slug})
             resp.raise_for_status()
         except requests.RequestException as e:
             logger.exception("Failed to fetch pipeline configs")
@@ -126,15 +188,15 @@ class PlatformClient:
         return configs
 
     def report_pipeline_run(self, report: PipelineRunReport) -> bool:
-        """Report the result of a pipeline run back to Platform API.
+        """Report the result of a pipeline run back to FairTier API.
 
         Returns True on success, False on failure.
         """
         url = f"{self.base_url}/pipeline.v1.PipelineService/ReportPipelineRun"
         try:
-            resp = self._session.post(
+            resp = self._post(
                 url,
-                json={
+                {
                     "pipelineId": report.pipeline_id,
                     "status": report.status,
                     "startedAt": report.started_at,
@@ -143,8 +205,6 @@ class PlatformClient:
                     "errorMessage": report.error_message,
                     "runId": report.run_id,
                 },
-                timeout=self.timeout,
-                headers={"Content-Type": "application/json"},
             )
             resp.raise_for_status()
             self._mark_healthy()

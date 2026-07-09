@@ -1,7 +1,7 @@
 """Minimal health-check HTTP server for Kubernetes readiness probes.
 
 Runs in a daemon thread so it doesn't block the main poll loop.
-Returns 200 when the Platform API connection is healthy, 503 otherwise.
+Returns 200 when the FairTier API connection is healthy, 503 otherwise.
 """
 
 from __future__ import annotations
@@ -11,12 +11,12 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from dlt_worker.platform_client import PlatformClient
+from dlt_worker.api_client import APIClient
 
 logger = logging.getLogger(__name__)
 
 
-def start_health_server(client: PlatformClient, port: int) -> None:
+def start_health_server(client: APIClient, port: int) -> None:
     """Start the /healthz HTTP server in a daemon thread."""
 
     class Handler(BaseHTTPRequestHandler):

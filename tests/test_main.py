@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from dlt_worker import config, main
 from dlt_worker.main import _should_run
-from dlt_worker.platform_client import PipelineConfig, PipelineRunReport
+from dlt_worker.api_client import PipelineConfig, PipelineRunReport
 
 
 def _make_config(**overrides: Any) -> PipelineConfig:

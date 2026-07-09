@@ -1,6 +1,6 @@
 # dlt-worker
 
-Worker that polls Platform API for pipeline configurations and runs them via [dlt](https://dlthub.com/).
+Worker that polls FairTier API for pipeline configurations and runs them via [dlt](https://dlthub.com/).
 
 Published as `github.com/fairtier/dlt-worker`. Docker images at `ghcr.io/fairtier/dlt-worker`.
 
@@ -43,7 +43,7 @@ src/dlt_worker/       # Application source
   health.py           # Kubernetes health check server
   main.py             # Main poll loop with graceful shutdown
   pipeline_runner.py  # dlt pipeline execution
-  platform_client.py  # Platform API HTTP client
+  api_client.py  # FairTier API HTTP client
 tests/                # pytest test suite
 ```
 

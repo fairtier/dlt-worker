@@ -12,7 +12,7 @@ import requests
 from dlt.common.schema.typing import TMergeDispositionDict, TWriteDispositionConfig
 
 from dlt_worker import config
-from dlt_worker.platform_client import PipelineConfig, PipelineRunReport
+from dlt_worker.api_client import PipelineConfig, PipelineRunReport
 
 logger = logging.getLogger(__name__)
 
