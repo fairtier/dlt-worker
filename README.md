@@ -60,6 +60,9 @@ All configuration is via environment variables.
 | `OIDC_CLIENT_SECRET`        | _(empty)_    | OIDC client secret for Lakekeeper catalog auth **and** FairTier API bearer auth       |
 | `OIDC_TOKEN_URL`            | _(empty)_    | OIDC token endpoint for Lakekeeper catalog auth **and** FairTier API bearer auth      |
 | `LAKEKEEPER_WAREHOUSE`      | `default`    | Lakekeeper warehouse name                                                             |
+| `TRANSFORM_REPO_URL`        | _(empty)_    | HTTPS clone URL of the hosted dbt repo (used when a transformation has no repo of its own) |
+| `TRANSFORM_GIT_USERNAME`    | _(empty)_    | Git username for the hosted dbt repo                                                  |
+| `TRANSFORM_GIT_TOKEN`       | _(empty)_    | Git token for the hosted dbt repo                                                     |
 
 ## Supported source types
 
@@ -68,6 +71,17 @@ The control plane provides pipeline configurations that specify one of these sou
 - **`sql_database`** -- Reads from SQL databases (PostgreSQL, MySQL, etc.) via [dlt's sql_database source](https://dlthub.com/docs/dlt-ecosystem/verified-sources/sql_database). Supports incremental loading with cursor-based tracking.
 - **`rest_api`** -- Reads from HTTP/REST APIs via [dlt's rest_api source](https://dlthub.com/docs/dlt-ecosystem/verified-sources/rest_api). Supports pagination, auth (bearer, OAuth2, HTTP basic), and incremental loading.
 - **`filesystem`** -- Reads files from S3-compatible storage via [dlt's filesystem source](https://dlthub.com/docs/dlt-ecosystem/verified-sources/filesystem).
+
+## Transformations (dbt)
+
+Besides ingestion pipelines, the worker runs [dbt](https://www.getdbt.com/) transformations. The control plane provides transformation configs (git repo, ref, schedule); for each due transformation the worker:
+
+1. Shallow-clones the dbt project -- either a connected repo with its own credentials, or the hosted repo from `TRANSFORM_REPO_URL`
+2. Generates `profiles.yml` at run time -- credentials never live in git; data-file access uses credentials vended by the [Lakekeeper](https://lakekeeper.io/) REST catalog
+3. Runs `dbt build` against DuckDB with the Iceberg catalog attached
+4. Reports per-model and per-test results back to the control plane
+
+Transformations run on a cron schedule, on manual trigger, or chained after a successful pipeline run.
 
 ## Development
 

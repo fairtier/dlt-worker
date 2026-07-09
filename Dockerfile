@@ -27,6 +27,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ############################
 FROM python:3.12-slim
 
+# git is needed at run time to shallow-clone dbt transformation repos
+# (the builder stage doesn't need it — no git dependencies in uv.lock)
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy the virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
 

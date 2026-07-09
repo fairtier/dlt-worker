@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 
 from dlt_worker import config, main
 from dlt_worker.main import _should_run
-from dlt_worker.api_client import PipelineConfig, PipelineRunReport
+from dlt_worker.api_client import (
+    PipelineConfig,
+    PipelineRunReport,
+    TransformationConfig,
+    TransformationRunReport,
+)
 
 
 def _make_config(**overrides: Any) -> PipelineConfig:
@@ -233,3 +238,99 @@ class TestRunWithRetry:
 
         report = client.report_pipeline_run.call_args[0][0]
         assert report.run_id == "run-123"
+
+
+# --- transformation scheduling ---
+
+
+def _make_tconfig(**overrides: Any) -> TransformationConfig:
+    defaults: dict[str, Any] = {
+        "id": "t1",
+        "name": "nightly",
+        "repo_url": "",
+        "repo_ref": "main",
+        "git_credentials": {},
+        "schedule": None,
+        "trigger_after_pipeline_id": "",
+        "dbt_selector": "",
+        "enabled": True,
+    }
+    defaults.update(overrides)
+    return TransformationConfig(**defaults)
+
+
+def _transformation_report(status: str = "success") -> TransformationRunReport:
+    return TransformationRunReport(
+        transformation_id="t1",
+        status=status,
+        started_at="2025-06-01T12:00:00Z",
+        completed_at="2025-06-01T12:05:00Z",
+    )
+
+
+class TestRunDueTransformations:
+    """Tests for main._run_due_transformations."""
+
+    @patch("dlt_worker.main.run_transformation")
+    def test_chained_after_pipeline_success(self, mock_run: MagicMock) -> None:
+        cfg = _make_tconfig(trigger_after_pipeline_id="p1")
+        client = MagicMock()
+        client.get_transformation_configs.return_value = [cfg]
+        client.report_transformation_run.return_value = True
+        mock_run.return_value = _transformation_report()
+
+        main._run_due_transformations(client, succeeded_pipelines={"p1"})
+
+        mock_run.assert_called_once_with(cfg)
+        client.report_transformation_run.assert_called_once()
+
+    @patch("dlt_worker.main.run_transformation")
+    def test_not_chained_without_pipeline_success(self, mock_run: MagicMock) -> None:
+        cfg = _make_tconfig(trigger_after_pipeline_id="p1")
+        client = MagicMock()
+        client.get_transformation_configs.return_value = [cfg]
+
+        main._run_due_transformations(client, succeeded_pipelines=set())
+
+        mock_run.assert_not_called()
+
+    @patch("dlt_worker.main.run_transformation")
+    def test_trigger_now_and_chained_runs_once(self, mock_run: MagicMock) -> None:
+        cfg = _make_tconfig(trigger_after_pipeline_id="p1", trigger_now=True)
+        client = MagicMock()
+        client.get_transformation_configs.return_value = [cfg]
+        client.report_transformation_run.return_value = True
+        mock_run.return_value = _transformation_report()
+
+        main._run_due_transformations(client, succeeded_pipelines={"p1"})
+
+        mock_run.assert_called_once()
+
+    @patch("dlt_worker.main.run_transformation")
+    def test_disabled_never_runs(self, mock_run: MagicMock) -> None:
+        cfg = _make_tconfig(
+            enabled=False, trigger_after_pipeline_id="p1", trigger_now=True
+        )
+        client = MagicMock()
+        client.get_transformation_configs.return_value = [cfg]
+
+        main._run_due_transformations(client, succeeded_pipelines={"p1"})
+
+        mock_run.assert_not_called()
+
+    @patch("dlt_worker.main.run_transformation")
+    def test_fetch_error_is_swallowed(self, mock_run: MagicMock) -> None:
+        client = MagicMock()
+        client.get_transformation_configs.side_effect = RuntimeError("boom")
+
+        # Must not raise — pipeline processing already happened.
+        main._run_due_transformations(client, succeeded_pipelines=set())
+
+        mock_run.assert_not_called()
+
+    def test_should_run_works_for_transformations(self) -> None:
+        now = datetime.now(timezone.utc)
+        cfg = _make_tconfig(
+            schedule="*/5 * * * *", last_run_at=now - timedelta(minutes=6)
+        )
+        assert _should_run(cfg, now) is True

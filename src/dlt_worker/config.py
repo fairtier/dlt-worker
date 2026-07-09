@@ -45,6 +45,16 @@ OIDC_CLIENT_ID: str = ""
 OIDC_CLIENT_SECRET: str = ""
 OIDC_TOKEN_URL: str = ""
 
+# Lakekeeper warehouse name
+LAKEKEEPER_WAREHOUSE: str = "default"
+
+# Transformations (dbt) — optional, only used when transformations are
+# configured. The hosted-repo fallback for transformations without a
+# connected git repo of their own.
+TRANSFORM_REPO_URL: str = ""
+TRANSFORM_GIT_USERNAME: str = ""
+TRANSFORM_GIT_TOKEN: str = ""
+
 
 def load() -> None:
     """Read env vars and set module-level config. Also injects dlt env vars."""
@@ -58,6 +68,8 @@ def load() -> None:
         AWS_REGION, \
         S3_BUCKET
     global OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_TOKEN_URL
+    global LAKEKEEPER_WAREHOUSE
+    global TRANSFORM_REPO_URL, TRANSFORM_GIT_USERNAME, TRANSFORM_GIT_TOKEN
 
     CUSTOMER_SLUG = _require("CUSTOMER_SLUG")
     FAIRTIER_API_URL = _require("FAIRTIER_API_URL")
@@ -79,6 +91,13 @@ def load() -> None:
     OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "")
     OIDC_CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET", "")
     OIDC_TOKEN_URL = os.environ.get("OIDC_TOKEN_URL", "")
+
+    LAKEKEEPER_WAREHOUSE = os.environ.get("LAKEKEEPER_WAREHOUSE", "default")
+
+    # Transformations (optional — hosted-repo fallback for dbt transformations)
+    TRANSFORM_REPO_URL = os.environ.get("TRANSFORM_REPO_URL", "")
+    TRANSFORM_GIT_USERNAME = os.environ.get("TRANSFORM_GIT_USERNAME", "")
+    TRANSFORM_GIT_TOKEN = os.environ.get("TRANSFORM_GIT_TOKEN", "")
 
     # Filesystem destination: bucket URL for S3/R2 storage.
     os.environ.setdefault("DESTINATION__FILESYSTEM__BUCKET_URL", f"s3://{S3_BUCKET}")
@@ -105,7 +124,7 @@ def load() -> None:
     catalog_config: dict[str, str] = {
         "type": "rest",
         "uri": catalog_uri,
-        "warehouse": os.environ.get("LAKEKEEPER_WAREHOUSE", "default"),
+        "warehouse": LAKEKEEPER_WAREHOUSE,
     }
     if OIDC_CLIENT_ID and OIDC_CLIENT_SECRET and OIDC_TOKEN_URL:
         catalog_config["oauth2-server-uri"] = OIDC_TOKEN_URL

@@ -299,3 +299,110 @@ class TestHealthStatus:
         assert healthy is False
         assert "refused" in details["last_error"]
         assert details["last_check_at"] != ""
+
+
+class TestGetTransformationConfigs:
+    """Tests for APIClient.get_transformation_configs."""
+
+    def test_parses_full_response(self) -> None:
+        client = _make_client()
+        mock_resp = _api_response(
+            {
+                "transformations": [
+                    {
+                        "id": "t1",
+                        "name": "nightly",
+                        "repoUrl": "https://git/x.git",
+                        "repoRef": "prod",
+                        "gitCredentials": '{"username":"u","token":"tok"}',
+                        "schedule": "0 3 * * *",
+                        "triggerAfterPipelineId": "p1",
+                        "dbtSelector": "tag:daily",
+                        "enabled": True,
+                        "triggerNow": True,
+                        "pendingRunId": "run-1",
+                        "lastRunAt": "2025-06-01T12:00:00Z",
+                    }
+                ]
+            }
+        )
+        client._session = MagicMock()
+        client._session.post.return_value = mock_resp
+
+        (cfg,) = client.get_transformation_configs()
+        assert cfg.id == "t1"
+        assert cfg.repo_ref == "prod"
+        assert cfg.git_credentials == {"username": "u", "token": "tok"}
+        assert cfg.trigger_after_pipeline_id == "p1"
+        assert cfg.trigger_now is True
+        assert cfg.pending_run_id == "run-1"
+        assert cfg.last_run_at is not None
+
+    def test_missing_optional_fields_default(self) -> None:
+        # Connect omits zero-value fields from the JSON.
+        client = _make_client()
+        mock_resp = _api_response({"transformations": [{"id": "t1", "name": "n"}]})
+        client._session = MagicMock()
+        client._session.post.return_value = mock_resp
+
+        (cfg,) = client.get_transformation_configs()
+        assert cfg.repo_url == ""
+        assert cfg.repo_ref == "main"
+        assert cfg.git_credentials == {}
+        assert cfg.schedule is None
+        assert cfg.trigger_now is False
+        assert cfg.last_run_at is None
+
+    def test_http_error_returns_empty(self) -> None:
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.side_effect = requests.ConnectionError("refused")
+
+        assert client.get_transformation_configs() == []
+
+
+class TestReportTransformationRun:
+    """Tests for APIClient.report_transformation_run."""
+
+    def test_payload_shape(self) -> None:
+        from dlt_worker.api_client import TransformationRunReport
+
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response({})
+
+        report = TransformationRunReport(
+            transformation_id="t1",
+            status="success",
+            started_at="2025-06-01T12:00:00Z",
+            completed_at="2025-06-01T12:05:00Z",
+            commit_sha="abc123",
+            models_total=3,
+            tests_total=2,
+            model_results='[{"name":"m"}]',
+            run_id="run-1",
+        )
+        assert client.report_transformation_run(report) is True
+
+        payload = client._session.post.call_args.kwargs["json"]
+        assert payload["transformationId"] == "t1"
+        assert payload["commitSha"] == "abc123"
+        assert payload["modelsTotal"] == 3
+        assert payload["testsTotal"] == 2
+        assert payload["modelResults"] == '[{"name":"m"}]'
+        assert payload["runId"] == "run-1"
+
+    def test_http_error_returns_false(self) -> None:
+        from dlt_worker.api_client import TransformationRunReport
+
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.side_effect = requests.ConnectionError("refused")
+
+        report = TransformationRunReport(
+            transformation_id="t1",
+            status="failed",
+            started_at="2025-06-01T12:00:00Z",
+            completed_at="2025-06-01T12:05:00Z",
+        )
+        assert client.report_transformation_run(report) is False

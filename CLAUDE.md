@@ -43,6 +43,7 @@ src/dlt_worker/       # Application source
   health.py           # Kubernetes health check server
   main.py             # Main poll loop with graceful shutdown
   pipeline_runner.py  # dlt pipeline execution
+  transformation_runner.py  # dbt transformation execution (git clone + dbt build)
   api_client.py  # FairTier API HTTP client
 tests/                # pytest test suite
 ```

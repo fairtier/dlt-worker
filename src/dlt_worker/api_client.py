@@ -1,6 +1,7 @@
 """HTTP client for the FairTier API.
 
-Fetches pipeline configurations and reports run results. Uses plain HTTP
+Fetches pipeline and transformation configurations and reports run
+results. Uses plain HTTP
 (requests) rather than gRPC to avoid pulling in a heavy protobuf/grpc
 dependency on the Python side.  The FairTier API exposes a Connect
 (JSON) endpoint that works with regular HTTP POST + JSON bodies.
@@ -53,6 +54,38 @@ class PipelineRunReport:
     started_at: str
     completed_at: str
     rows_loaded: int = 0
+    error_message: str = ""
+    run_id: str = ""
+
+
+@dataclass
+class TransformationConfig:
+    id: str
+    name: str
+    repo_url: str  # empty string means the hosted repo (TRANSFORM_REPO_URL)
+    repo_ref: str
+    git_credentials: dict[str, Any]
+    schedule: str | None
+    trigger_after_pipeline_id: str
+    dbt_selector: str
+    enabled: bool
+    trigger_now: bool = False
+    pending_run_id: str = ""
+    last_run_at: datetime | None = None
+
+
+@dataclass
+class TransformationRunReport:
+    transformation_id: str
+    status: str  # "success" or "failed"
+    started_at: str
+    completed_at: str
+    commit_sha: str = ""
+    models_total: int = 0
+    models_failed: int = 0
+    tests_total: int = 0
+    tests_failed: int = 0
+    model_results: str = ""  # JSON array of per-node results
     error_message: str = ""
     run_id: str = ""
 
@@ -186,6 +219,89 @@ class APIClient:
                 )
             )
         return configs
+
+    def get_transformation_configs(self) -> list[TransformationConfig]:
+        """Fetch all dbt transformation configs for this customer.
+
+        Deliberately does not touch health status: transformations are
+        optional, and a FairTier API without the TransformationService yet
+        must not flip the pod unready while pipelines still work.
+        """
+        url = (
+            f"{self.base_url}"
+            "/transformation.v1.TransformationService/GetTransformationConfigs"
+        )
+        try:
+            resp = self._post(url, {"customerSlug": self.customer_slug})
+            resp.raise_for_status()
+        except requests.RequestException:
+            logger.warning("Failed to fetch transformation configs", exc_info=True)
+            return []
+
+        data = resp.json()
+        configs = []
+        for t in data.get("transformations", []):
+            git_credentials = t.get("gitCredentials", "{}")
+            last_run_at_str = t.get("lastRunAt", "")
+            last_run_at = (
+                datetime.fromisoformat(last_run_at_str.replace("Z", "+00:00"))
+                if last_run_at_str
+                else None
+            )
+            configs.append(
+                TransformationConfig(
+                    id=t["id"],
+                    name=t["name"],
+                    repo_url=t.get("repoUrl", ""),
+                    repo_ref=t.get("repoRef") or "main",
+                    git_credentials=json.loads(git_credentials)
+                    if git_credentials
+                    else {},
+                    schedule=t.get("schedule") or None,
+                    trigger_after_pipeline_id=t.get("triggerAfterPipelineId", ""),
+                    dbt_selector=t.get("dbtSelector", ""),
+                    enabled=t.get("enabled", True),
+                    trigger_now=t.get("triggerNow", False),
+                    pending_run_id=t.get("pendingRunId", ""),
+                    last_run_at=last_run_at,
+                )
+            )
+        return configs
+
+    def report_transformation_run(self, report: TransformationRunReport) -> bool:
+        """Report the result of a transformation run back to FairTier API.
+
+        Returns True on success, False on failure.
+        """
+        url = (
+            f"{self.base_url}"
+            "/transformation.v1.TransformationService/ReportTransformationRun"
+        )
+        try:
+            resp = self._post(
+                url,
+                {
+                    "transformationId": report.transformation_id,
+                    "status": report.status,
+                    "startedAt": report.started_at,
+                    "completedAt": report.completed_at,
+                    "commitSha": report.commit_sha,
+                    "modelsTotal": report.models_total,
+                    "modelsFailed": report.models_failed,
+                    "testsTotal": report.tests_total,
+                    "testsFailed": report.tests_failed,
+                    "modelResults": report.model_results,
+                    "errorMessage": report.error_message,
+                    "runId": report.run_id,
+                },
+            )
+            resp.raise_for_status()
+            return True
+        except requests.RequestException:
+            logger.exception(
+                "Failed to report transformation run for %s", report.transformation_id
+            )
+            return False
 
     def report_pipeline_run(self, report: PipelineRunReport) -> bool:
         """Report the result of a pipeline run back to FairTier API.

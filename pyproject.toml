@@ -1,6 +1,6 @@
 [project]
 name = "dlt-worker"
-version = "0.0.2"
+version = "0.0.3"
 description = "Worker that polls the FairTier API for pipeline configurations and runs them via dlt"
 readme = "README.md"
 license = "Apache-2.0"
@@ -10,6 +10,10 @@ dependencies = [
     "pyiceberg[pyarrow]>=0.10",
     "requests>=2.32",
     "croniter>=6.0",
+    "dbt-core>=1.10,<2",
+    "dbt-duckdb>=1.9",
+    "duckdb>=1.4",
+    "pyyaml>=6",
 ]
 
 [project.urls]
