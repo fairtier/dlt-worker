@@ -49,6 +49,7 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
     token = ""
     commit_sha = ""
     tmpdir = tempfile.mkdtemp(prefix="dbt-run-")
+    prev_cwd = os.getcwd()
 
     try:
         repo_url, username, token = _resolve_repo(cfg)
@@ -57,6 +58,11 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
             repo_url, cfg.repo_ref or "main", username, token, clone_dir
         )
         profiles_dir = _write_profiles(clone_dir, tmpdir)
+
+        # dbt (and DuckDB's iceberg extension) resolve relative paths against
+        # the process cwd, which in the container is a non-writable /app —
+        # the extension's staging mkdir fails there. Run from the temp dir.
+        os.chdir(tmpdir)
 
         runner = dbtRunner()
         _run_deps(runner, clone_dir, profiles_dir, token)
@@ -127,6 +133,7 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
         )
 
     finally:
+        os.chdir(prev_cwd)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

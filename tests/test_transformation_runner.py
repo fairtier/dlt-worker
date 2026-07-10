@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -188,13 +189,20 @@ def test_run_transformation_success(monkeypatch: pytest.MonkeyPatch) -> None:
         pending_run_id="run-9",
     )
     runner = MagicMock()
-    runner.invoke.return_value = _fake_dbt_result(
-        [
-            _fake_node("model", "stg_orders", "success"),
-            _fake_node("test", "unique_id", "pass"),
-        ],
-        success=True,
-    )
+    invoke_cwds: list[str] = []
+
+    def _invoke(args: list[str]) -> SimpleNamespace:
+        invoke_cwds.append(os.getcwd())
+        return _fake_dbt_result(
+            [
+                _fake_node("model", "stg_orders", "success"),
+                _fake_node("test", "unique_id", "pass"),
+            ],
+            success=True,
+        )
+
+    runner.invoke.side_effect = _invoke
+    cwd_before = os.getcwd()
 
     with (
         patch("dlt_worker.transformation_runner._clone_repo", return_value="abc123"),
@@ -214,6 +222,12 @@ def test_run_transformation_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert build_args[0] == "build"
     assert build_args[-2:] == ["--select", "tag:daily"]
     assert "--target" in build_args
+
+    # dbt must run from the writable temp dir (the container cwd is
+    # read-only and DuckDB's iceberg extension mkdirs relative to cwd),
+    # and the previous cwd must be restored afterwards.
+    assert all(c.startswith(tempfile.gettempdir()) for c in invoke_cwds)
+    assert os.getcwd() == cwd_before
 
 
 def test_run_transformation_dbt_failure(monkeypatch: pytest.MonkeyPatch) -> None:
