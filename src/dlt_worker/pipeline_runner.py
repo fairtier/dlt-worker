@@ -382,6 +382,8 @@ def _build_google_sheets_source(cfg: PipelineConfig) -> Any:
             table = f"{table}_{count + 1}"
         resources.append(dlt.resource(records, name=table))
     return resources
+
+
 def _reader_for(pipeline_name: str, file_glob: str) -> tuple[Any, dict[str, Any]]:
     """Pick the dlt reader transformer (and its kwargs) for a file glob.
 

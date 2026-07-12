@@ -578,6 +578,8 @@ class TestBuildGoogleSheetsSource:
 
         with pytest.raises(ValueError, match="no sheets to load"):
             _build_google_sheets_source(cfg)
+
+
 @patch("dlt.sources.filesystem.read_jsonl")
 @patch("dlt.sources.filesystem.read_parquet")
 @patch("dlt.sources.filesystem.read_csv")
