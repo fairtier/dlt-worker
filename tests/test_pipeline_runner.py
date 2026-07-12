@@ -578,6 +578,112 @@ class TestBuildGoogleSheetsSource:
 
         with pytest.raises(ValueError, match="no sheets to load"):
             _build_google_sheets_source(cfg)
+@patch("dlt.sources.filesystem.read_jsonl")
+@patch("dlt.sources.filesystem.read_parquet")
+@patch("dlt.sources.filesystem.read_csv")
+@patch("dlt.sources.filesystem.filesystem")
+class TestBuildFilesystemTables:
+    """Tables mode (FairTier file drop): one parsed resource per table entry."""
+
+    def _tables_config(self, tables: list[dict[str, Any]]) -> PipelineConfig:
+        return _make_config(
+            source_type="filesystem",
+            source_config={
+                "bucket_url": "s3://ft-acme/uploads/p1/",
+                "tables": tables,
+            },
+            source_credentials={
+                "access_key_id": "AKID",
+                "secret_access_key": "SECRET",
+                "endpoint_url": "https://acct.r2.cloudflarestorage.com",
+                "region": "auto",
+            },
+        )
+
+    def test_one_resource_per_table_with_matching_reader(
+        self,
+        mock_fs: MagicMock,
+        mock_read_csv: MagicMock,
+        mock_read_parquet: MagicMock,
+        mock_read_jsonl: MagicMock,
+    ) -> None:
+        cfg = self._tables_config(
+            [
+                {"name": "orders", "file_glob": "orders.csv"},
+                {"name": "users", "file_glob": "users.parquet"},
+                {"name": "events", "file_glob": "events.jsonl"},
+            ]
+        )
+
+        resources = _build_filesystem_source(cfg)
+
+        assert isinstance(resources, list)
+        assert len(resources) == 3
+        # One filesystem listing per table, scoped to that table's glob.
+        globs = [c.kwargs["file_glob"] for c in mock_fs.call_args_list]
+        assert globs == ["orders.csv", "users.parquet", "events.jsonl"]
+        mock_read_csv.assert_called_once_with()
+        mock_read_parquet.assert_called_once_with()
+        mock_read_jsonl.assert_called_once_with()
+        # Each piped resource is named after its table.
+        piped = mock_fs.return_value.__or__.return_value
+        named = [c.args[0] for c in piped.with_name.call_args_list]
+        assert named == ["orders", "users", "events"]
+
+    def test_tsv_uses_tab_separator(
+        self,
+        mock_fs: MagicMock,
+        mock_read_csv: MagicMock,
+        mock_read_parquet: MagicMock,
+        mock_read_jsonl: MagicMock,
+    ) -> None:
+        cfg = self._tables_config([{"name": "t", "file_glob": "data.tsv"}])
+
+        _build_filesystem_source(cfg)
+
+        mock_read_csv.assert_called_once_with(sep="\t")
+
+    def test_unsupported_extension_raises(
+        self,
+        mock_fs: MagicMock,
+        mock_read_csv: MagicMock,
+        mock_read_parquet: MagicMock,
+        mock_read_jsonl: MagicMock,
+    ) -> None:
+        cfg = self._tables_config([{"name": "t", "file_glob": "report.xlsx"}])
+
+        with pytest.raises(ValueError, match="unsupported file type"):
+            _build_filesystem_source(cfg)
+
+    def test_incomplete_table_entry_raises(
+        self,
+        mock_fs: MagicMock,
+        mock_read_csv: MagicMock,
+        mock_read_parquet: MagicMock,
+        mock_read_jsonl: MagicMock,
+    ) -> None:
+        cfg = self._tables_config([{"name": "t"}])
+
+        with pytest.raises(
+            ValueError, match=r"tables\[0\] missing required 'file_glob'"
+        ):
+            _build_filesystem_source(cfg)
+
+    def test_empty_tables_falls_back_to_listing_mode(
+        self,
+        mock_fs: MagicMock,
+        mock_read_csv: MagicMock,
+        mock_read_parquet: MagicMock,
+        mock_read_jsonl: MagicMock,
+    ) -> None:
+        """tables: [] behaves like the pre-tables contract (bare filesystem)."""
+        cfg = self._tables_config([])
+
+        _build_filesystem_source(cfg)
+
+        mock_fs.assert_called_once()
+        assert mock_fs.call_args.kwargs["file_glob"] == "**/*"
+        mock_read_csv.assert_not_called()
 
 
 @patch("dlt.sources.rest_api.rest_api_source")

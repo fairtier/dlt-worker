@@ -382,6 +382,27 @@ def _build_google_sheets_source(cfg: PipelineConfig) -> Any:
             table = f"{table}_{count + 1}"
         resources.append(dlt.resource(records, name=table))
     return resources
+def _reader_for(pipeline_name: str, file_glob: str) -> tuple[Any, dict[str, Any]]:
+    """Pick the dlt reader transformer (and its kwargs) for a file glob.
+
+    The format is chosen from the glob's extension, matching the FairTier API's
+    upload allowlist: csv/tsv → read_csv, parquet → read_parquet,
+    jsonl/ndjson → read_jsonl.
+    """
+    from dlt.sources.filesystem import read_csv, read_jsonl, read_parquet
+
+    lower = file_glob.lower()
+    if lower.endswith(".csv"):
+        return read_csv, {}
+    if lower.endswith(".tsv"):
+        return read_csv, {"sep": "\t"}
+    if lower.endswith(".parquet"):
+        return read_parquet, {}
+    if lower.endswith((".jsonl", ".ndjson")):
+        return read_jsonl, {}
+    raise ValueError(
+        f"Pipeline {pipeline_name!r}: unsupported file type in glob {file_glob!r}"
+    )
 
 
 def _build_filesystem_source(cfg: PipelineConfig) -> Any:
@@ -411,8 +432,30 @@ def _build_filesystem_source(cfg: PipelineConfig) -> Any:
         region_name=creds.get("region", "auto"),
     )
 
-    return filesystem(
-        bucket_url=bucket_url,
-        file_glob=src_cfg.get("file_glob", "**/*"),
-        credentials=aws_creds,
-    )
+    # Tables mode (FairTier file drop): each entry maps files matching a glob
+    # to one parsed table via the matching reader transformer. Without it, the
+    # bare filesystem resource is returned unchanged — that loads file
+    # *listings*, which is only useful for inventory-style pipelines.
+    tables = src_cfg.get("tables")
+    if not tables:
+        return filesystem(
+            bucket_url=bucket_url,
+            file_glob=src_cfg.get("file_glob", "**/*"),
+            credentials=aws_creds,
+        )
+
+    resources = []
+    for i, table in enumerate(tables):
+        for key in ("name", "file_glob"):
+            if not table.get(key):
+                raise ValueError(
+                    f"Pipeline {cfg.name!r}: tables[{i}] missing required {key!r}"
+                )
+        reader, reader_kwargs = _reader_for(cfg.name, table["file_glob"])
+        files = filesystem(
+            bucket_url=bucket_url,
+            file_glob=table["file_glob"],
+            credentials=aws_creds,
+        )
+        resources.append((files | reader(**reader_kwargs)).with_name(table["name"]))
+    return resources
