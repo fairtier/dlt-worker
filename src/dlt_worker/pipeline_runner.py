@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -124,6 +126,8 @@ def _build_source(cfg: PipelineConfig) -> Any:
         return _build_sql_database_source(cfg)
     if cfg.source_type == "filesystem":
         return _build_filesystem_source(cfg)
+    if cfg.source_type == "google_sheets":
+        return _build_google_sheets_source(cfg)
 
     raise ValueError(f"Unsupported source type: {cfg.source_type}")
 
@@ -244,6 +248,140 @@ def _build_sql_database_source(cfg: PipelineConfig) -> Any:
     # Simple table list (full load)
     table_names = src_cfg.get("tables")
     return sql_database(credentials=connection_string, table_names=table_names)
+
+
+_SPREADSHEET_URL_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9_-]+)")
+
+# Google Sheets API v4; readonly scope — the worker never writes to sheets.
+_SHEETS_API_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
+_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
+
+
+def _spreadsheet_id(url_or_id: str) -> str:
+    """Extract the spreadsheet ID from a docs.google.com URL, or pass an ID through."""
+    m = _SPREADSHEET_URL_RE.search(url_or_id)
+    return m.group(1) if m else url_or_id
+
+
+def _range_table_name(range_name: str) -> str:
+    """Derive a table name from a range: "Orders 2024!A1:D" -> "orders_2024"."""
+    sheet = range_name.split("!", 1)[0].strip().strip("'")
+    name = re.sub(r"[^a-zA-Z0-9]+", "_", sheet).strip("_").lower()
+    return name or "sheet"
+
+
+def _normalize_headers(header_row: list[Any]) -> list[str]:
+    """First-row cells -> column names: blanks become col_N, duplicates get _N."""
+    headers: list[str] = []
+    seen: dict[str, int] = {}
+    for i, cell in enumerate(header_row):
+        name = str(cell).strip() if cell not in (None, "") else ""
+        if not name:
+            name = f"col_{i + 1}"
+        count = seen.get(name, 0)
+        seen[name] = count + 1
+        if count:
+            name = f"{name}_{count + 1}"
+        headers.append(name)
+    return headers
+
+
+def _rows_to_records(
+    pipeline_name: str, range_name: str, rows: list[list[Any]]
+) -> list[dict[str, Any]]:
+    """Header row + data rows -> dicts. Short rows are padded (the API omits
+    trailing empty cells); cells beyond the header width are dropped; fully
+    empty rows are skipped."""
+    if len(rows) < 2:
+        logger.warning(
+            "Pipeline %s: range %r has a header but no data rows",
+            pipeline_name,
+            range_name,
+        )
+        return []
+    headers = _normalize_headers(rows[0])
+    records = []
+    for row in rows[1:]:
+        if all(cell in (None, "") for cell in row):
+            continue
+        padded = list(row) + [None] * (len(headers) - len(row))
+        records.append(dict(zip(headers, padded)))
+    return records
+
+
+def _build_google_sheets_source(cfg: PipelineConfig) -> Any:
+    """Read spreadsheet ranges via the Sheets API into one resource per range.
+
+    source_config: spreadsheet_url_or_id (required), range_names (optional —
+    tab names, "Tab!A1:D" ranges, or named ranges; defaults to every tab).
+    source_credentials: service_account_key — the GCP service-account key JSON
+    (object or string); the spreadsheet must be shared read-only with the
+    key's client_email. The first row of each range is the header row.
+    """
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2.service_account import Credentials
+
+    src_cfg = cfg.source_config
+
+    try:
+        spreadsheet = src_cfg["spreadsheet_url_or_id"]
+    except KeyError:
+        raise ValueError(
+            f"Pipeline {cfg.name!r}: source_config missing required "
+            "'spreadsheet_url_or_id'"
+        ) from None
+
+    key_info = cfg.source_credentials.get("service_account_key")
+    if not key_info:
+        raise ValueError(
+            f"Pipeline {cfg.name!r}: source_credentials missing required "
+            "'service_account_key'"
+        )
+    if isinstance(key_info, str):
+        key_info = json.loads(key_info)
+
+    credentials = Credentials.from_service_account_info(
+        key_info, scopes=[_SHEETS_SCOPE]
+    )
+    session = AuthorizedSession(credentials)
+    base = f"{_SHEETS_API_BASE}/{_spreadsheet_id(spreadsheet)}"
+
+    range_names = src_cfg.get("range_names")
+    if not range_names:
+        resp = session.get(
+            base, params={"fields": "sheets.properties.title"}, timeout=60
+        )
+        resp.raise_for_status()
+        range_names = [s["properties"]["title"] for s in resp.json().get("sheets", [])]
+    if not range_names:
+        raise ValueError(f"Pipeline {cfg.name!r}: spreadsheet has no sheets to load")
+
+    # UNFORMATTED_VALUE keeps numbers/booleans typed; date/time cells come back
+    # as locale-formatted strings (FORMATTED_STRING) instead of raw serials.
+    resp = session.get(
+        f"{base}/values:batchGet",
+        params=[
+            ("majorDimension", "ROWS"),
+            ("valueRenderOption", "UNFORMATTED_VALUE"),
+            ("dateTimeRenderOption", "FORMATTED_STRING"),
+            *[("ranges", r) for r in range_names],
+        ],
+        timeout=300,
+    )
+    resp.raise_for_status()
+    value_ranges = resp.json().get("valueRanges", [])
+
+    resources = []
+    used: dict[str, int] = {}
+    for range_name, value_range in zip(range_names, value_ranges):
+        records = _rows_to_records(cfg.name, range_name, value_range.get("values", []))
+        table = _range_table_name(range_name)
+        count = used.get(table, 0)
+        used[table] = count + 1
+        if count:
+            table = f"{table}_{count + 1}"
+        resources.append(dlt.resource(records, name=table))
+    return resources
 
 
 def _build_filesystem_source(cfg: PipelineConfig) -> Any:

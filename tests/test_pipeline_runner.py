@@ -13,9 +13,14 @@ import requests
 from dlt_worker import config
 from dlt_worker.pipeline_runner import (
     _build_filesystem_source,
+    _build_google_sheets_source,
     _build_rest_api_source,
     _build_sql_database_source,
     _count_rows,
+    _normalize_headers,
+    _range_table_name,
+    _rows_to_records,
+    _spreadsheet_id,
     _trigger_snapshot,
 )
 from dlt_worker.api_client import PipelineConfig
@@ -342,6 +347,237 @@ class TestBuildFilesystemSource:
 
         with pytest.raises(ValueError, match="missing required 'secret_access_key'"):
             _build_filesystem_source(cfg)
+
+
+class TestGoogleSheetsHelpers:
+    """Tests for the pure google_sheets helpers."""
+
+    def test_spreadsheet_id_from_url(self) -> None:
+        url = "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit#gid=0"
+        assert _spreadsheet_id(url) == "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+
+    def test_spreadsheet_id_passthrough(self) -> None:
+        assert _spreadsheet_id("1BxiMVs0XRA5nFMdKvBdBZ") == "1BxiMVs0XRA5nFMdKvBdBZ"
+
+    def test_range_table_name_with_a1_range(self) -> None:
+        assert _range_table_name("Orders 2024!A1:D") == "orders_2024"
+
+    def test_range_table_name_quoted_sheet(self) -> None:
+        assert _range_table_name("'My Sheet'!A:C") == "my_sheet"
+
+    def test_range_table_name_named_range(self) -> None:
+        assert _range_table_name("monthly_totals") == "monthly_totals"
+
+    def test_range_table_name_all_symbols_falls_back(self) -> None:
+        assert _range_table_name("!!!") == "sheet"
+
+    def test_normalize_headers(self) -> None:
+        assert _normalize_headers(["Name", "", "Name", None, 42]) == [
+            "Name",
+            "col_2",
+            "Name_2",
+            "col_4",
+            "42",
+        ]
+
+    def test_rows_to_records_pads_and_skips_empty(self) -> None:
+        rows = [
+            ["id", "name", "amount"],
+            [1, "a", 10],
+            ["", "", ""],  # fully empty -> skipped
+            [2, "b"],  # short -> padded with None
+            [3, "c", 30, "extra"],  # long -> extra cell dropped
+        ]
+        assert _rows_to_records("p", "Sheet1", rows) == [
+            {"id": 1, "name": "a", "amount": 10},
+            {"id": 2, "name": "b", "amount": None},
+            {"id": 3, "name": "c", "amount": 30},
+        ]
+
+    def test_rows_to_records_keeps_falsy_cells(self) -> None:
+        rows = [["id", "flag"], [0, False]]
+        assert _rows_to_records("p", "Sheet1", rows) == [{"id": 0, "flag": False}]
+
+    def test_rows_to_records_header_only_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="dlt_worker.pipeline_runner"):
+            assert _rows_to_records("p", "Sheet1", [["id"]]) == []
+        assert "no data rows" in caplog.text
+
+
+@patch("google.auth.transport.requests.AuthorizedSession")
+@patch("google.oauth2.service_account.Credentials.from_service_account_info")
+class TestBuildGoogleSheetsSource:
+    """Tests for _build_google_sheets_source (Sheets API mocked)."""
+
+    KEY = {
+        "type": "service_account",
+        "client_email": "pipe@proj.iam.gserviceaccount.com",
+        "private_key": "-----BEGIN PRIVATE KEY-----\nMII\n-----END PRIVATE KEY-----\n",
+    }
+
+    def _sheets_config(self, **overrides: Any) -> PipelineConfig:
+        defaults: dict[str, Any] = {
+            "id": "p1",
+            "name": "test-sheets-pipeline",
+            "source_type": "google_sheets",
+            "source_config": {
+                "spreadsheet_url_or_id": "1BxiMVs0XRA5nFMdKvBdBZ",
+                "range_names": ["Orders"],
+            },
+            "source_credentials": {"service_account_key": self.KEY},
+            "dataset_name": "raw",
+            "schedule": None,
+            "write_disposition": "replace",
+            "enabled": True,
+        }
+        defaults.update(overrides)
+        return PipelineConfig(**defaults)
+
+    @staticmethod
+    def _response(payload: dict[str, Any]) -> MagicMock:
+        resp = MagicMock()
+        resp.json.return_value = payload
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_explicit_ranges(
+        self, mock_creds: MagicMock, mock_session_cls: MagicMock
+    ) -> None:
+        """With range_names set, only batchGet is called; one resource per range."""
+        session = mock_session_cls.return_value
+        session.get.return_value = self._response(
+            {
+                "valueRanges": [
+                    {"values": [["id", "name"], [1, "a"], [2, "b"]]},
+                ],
+            }
+        )
+
+        resources = _build_google_sheets_source(self._sheets_config())
+
+        mock_creds.assert_called_once()
+        assert mock_creds.call_args.args[0] == self.KEY
+        session.get.assert_called_once()
+        url = session.get.call_args.args[0]
+        assert url.endswith("/1BxiMVs0XRA5nFMdKvBdBZ/values:batchGet")
+        params = session.get.call_args.kwargs["params"]
+        assert ("ranges", "Orders") in params
+
+        assert len(resources) == 1
+        assert resources[0].name == "orders"
+        assert list(resources[0]) == [
+            {"id": 1, "name": "a"},
+            {"id": 2, "name": "b"},
+        ]
+
+    def test_default_ranges_from_sheet_tabs(
+        self, mock_creds: MagicMock, mock_session_cls: MagicMock
+    ) -> None:
+        """Without range_names, sheet tabs are discovered via spreadsheet metadata."""
+        session = mock_session_cls.return_value
+        session.get.side_effect = [
+            self._response(
+                {
+                    "sheets": [
+                        {"properties": {"title": "Orders"}},
+                        {"properties": {"title": "Customers"}},
+                    ]
+                }
+            ),
+            self._response(
+                {
+                    "valueRanges": [
+                        {"values": [["id"], [1]]},
+                        {"values": [["id"], [9]]},
+                    ],
+                }
+            ),
+        ]
+        cfg = self._sheets_config(
+            source_config={"spreadsheet_url_or_id": "1BxiMVs0XRA5nFMdKvBdBZ"},
+        )
+
+        resources = _build_google_sheets_source(cfg)
+
+        assert [r.name for r in resources] == ["orders", "customers"]
+        batch_params = session.get.call_args_list[1].kwargs["params"]
+        assert ("ranges", "Orders") in batch_params
+        assert ("ranges", "Customers") in batch_params
+
+    def test_string_encoded_key(
+        self, mock_creds: MagicMock, mock_session_cls: MagicMock
+    ) -> None:
+        """A JSON-string service_account_key is decoded before use."""
+        import json
+
+        session = mock_session_cls.return_value
+        session.get.return_value = self._response(
+            {"valueRanges": [{"values": [["id"], [1]]}]}
+        )
+        cfg = self._sheets_config(
+            source_credentials={"service_account_key": json.dumps(self.KEY)},
+        )
+
+        _build_google_sheets_source(cfg)
+
+        assert mock_creds.call_args.args[0] == self.KEY
+
+    def test_duplicate_table_names_get_suffix(
+        self, mock_creds: MagicMock, mock_session_cls: MagicMock
+    ) -> None:
+        """Two ranges on the same tab yield distinct resource names."""
+        session = mock_session_cls.return_value
+        session.get.return_value = self._response(
+            {
+                "valueRanges": [
+                    {"values": [["id"], [1]]},
+                    {"values": [["id"], [2]]},
+                ],
+            }
+        )
+        cfg = self._sheets_config(
+            source_config={
+                "spreadsheet_url_or_id": "1BxiMVs0XRA5nFMdKvBdBZ",
+                "range_names": ["Orders!A1:D", "Orders!F1:H"],
+            },
+        )
+
+        resources = _build_google_sheets_source(cfg)
+
+        assert [r.name for r in resources] == ["orders", "orders_2"]
+
+    def test_missing_spreadsheet_raises(
+        self, mock_creds: MagicMock, mock_session_cls: MagicMock
+    ) -> None:
+        cfg = self._sheets_config(source_config={"range_names": ["Orders"]})
+
+        with pytest.raises(
+            ValueError, match="missing required 'spreadsheet_url_or_id'"
+        ):
+            _build_google_sheets_source(cfg)
+
+    def test_missing_service_account_key_raises(
+        self, mock_creds: MagicMock, mock_session_cls: MagicMock
+    ) -> None:
+        cfg = self._sheets_config(source_credentials={})
+
+        with pytest.raises(ValueError, match="missing required 'service_account_key'"):
+            _build_google_sheets_source(cfg)
+
+    def test_empty_spreadsheet_raises(
+        self, mock_creds: MagicMock, mock_session_cls: MagicMock
+    ) -> None:
+        """A spreadsheet with no tabs fails loudly instead of loading nothing."""
+        session = mock_session_cls.return_value
+        session.get.return_value = self._response({"sheets": []})
+        cfg = self._sheets_config(
+            source_config={"spreadsheet_url_or_id": "1BxiMVs0XRA5nFMdKvBdBZ"},
+        )
+
+        with pytest.raises(ValueError, match="no sheets to load"):
+            _build_google_sheets_source(cfg)
 
 
 @patch("dlt.sources.rest_api.rest_api_source")
