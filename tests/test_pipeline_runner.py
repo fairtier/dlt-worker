@@ -739,6 +739,70 @@ class TestBuildRestApiSource:
         endpoint = call_config["resources"][0]["endpoint"]
         assert "paginator" not in endpoint
 
+    def test_no_incremental(self, mock_rest: MagicMock) -> None:
+        """Without any incremental config, resources carry no incremental key."""
+        cfg = self._rest_cfg()
+
+        _build_rest_api_source(cfg)
+
+        call_config = mock_rest.call_args[0][0]
+        assert "incremental" not in call_config["resources"][0]
+
+    def test_source_level_incremental_applies_to_all_resources(
+        self, mock_rest: MagicMock
+    ) -> None:
+        """A top-level source_config.incremental (platform_api's shape) is applied
+        to every resource, each with its own incremental instance."""
+        cfg = _make_config(
+            source_type="rest_api",
+            source_config={
+                "base_url": "https://api.example.com",
+                "resources": [
+                    {"name": "posts", "endpoint": "/posts"},
+                    {"name": "users", "endpoint": "/users"},
+                ],
+                "incremental": {"cursor_path": "id"},
+            },
+            source_credentials={},
+        )
+
+        _build_rest_api_source(cfg)
+
+        resources = mock_rest.call_args[0][0]["resources"]
+        incs = [r["incremental"] for r in resources]
+        for inc in incs:
+            assert isinstance(inc, dlt.sources.incremental)
+            assert inc.cursor_path == "id"
+        # Distinct instances so cursor state is not shared across resources.
+        assert incs[0] is not incs[1]
+
+    def test_resource_incremental_overrides_source_level(
+        self, mock_rest: MagicMock
+    ) -> None:
+        """A per-resource incremental wins over the source-level default."""
+        cfg = _make_config(
+            source_type="rest_api",
+            source_config={
+                "base_url": "https://api.example.com",
+                "resources": [
+                    {
+                        "name": "posts",
+                        "endpoint": "/posts",
+                        "incremental": {"cursor_path": "updated_at"},
+                    },
+                    {"name": "users", "endpoint": "/users"},
+                ],
+                "incremental": {"cursor_path": "id"},
+            },
+            source_credentials={},
+        )
+
+        _build_rest_api_source(cfg)
+
+        resources = mock_rest.call_args[0][0]["resources"]
+        assert resources[0]["incremental"].cursor_path == "updated_at"
+        assert resources[1]["incremental"].cursor_path == "id"
+
 
 class TestTriggerSnapshot:
     """Tests for _trigger_snapshot."""

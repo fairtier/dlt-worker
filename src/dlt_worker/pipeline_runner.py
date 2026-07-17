@@ -155,6 +155,13 @@ def _build_rest_api_source(cfg: PipelineConfig) -> Any:
             cfg.source_credentials["headers"]
         )
 
+    # A source-level `incremental` (the shape platform_api validates and the
+    # Console emits — a single top-level object, not per-endpoint) applies to
+    # every resource; a per-resource `incremental` overrides it for that
+    # resource. A fresh dlt.sources.incremental is built per resource below so
+    # they never share cursor state.
+    source_incremental = cfg.source_config.get("incremental")
+
     # Build resource definitions
     resources = []
     for res_cfg in cfg.source_config.get("resources", []):
@@ -172,8 +179,8 @@ def _build_rest_api_source(cfg: PipelineConfig) -> Any:
             resource_def["primary_key"] = res_cfg["primary_key"]
         if "write_disposition" in res_cfg:
             resource_def["write_disposition"] = res_cfg["write_disposition"]
-        if "incremental" in res_cfg:
-            inc = res_cfg["incremental"]
+        inc = res_cfg.get("incremental", source_incremental)
+        if inc:
             resource_def["incremental"] = dlt.sources.incremental(
                 cursor_path=inc["cursor_path"],
                 initial_value=inc.get("initial_value"),
