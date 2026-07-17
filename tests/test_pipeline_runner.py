@@ -19,6 +19,7 @@ from dlt_worker.pipeline_runner import (
     _count_rows,
     _normalize_headers,
     _range_table_name,
+    _reader_for,
     _rows_to_records,
     _spreadsheet_id,
     _trigger_snapshot,
@@ -970,3 +971,41 @@ class TestCountRows:
             "job1": [{"table_metrics": {}}],
         }
         assert _count_rows(normalize_info) == 0
+
+
+class TestReaderFor:
+    """_reader_for picks the right dlt filesystem reader per extension.
+
+    These tests actually *call* the readers' import path (unlike the mocked
+    filesystem-source tests), which is what catches missing runtime deps like
+    pandas — the gap that let file-drop CSV ship broken in 0.0.6.
+    """
+
+    def test_csv_uses_read_csv_no_kwargs(self) -> None:
+        from dlt.sources.filesystem import read_csv
+
+        reader, kwargs = _reader_for("p", "uploads/1/data.csv")
+        assert reader is read_csv
+        assert kwargs == {}
+
+    def test_tsv_uses_read_csv_tab_sep(self) -> None:
+        from dlt.sources.filesystem import read_csv
+
+        reader, kwargs = _reader_for("p", "uploads/1/data.tsv")
+        assert reader is read_csv
+        assert kwargs == {"sep": "\t"}
+
+    def test_parquet_and_jsonl(self) -> None:
+        from dlt.sources.filesystem import read_jsonl, read_parquet
+
+        assert _reader_for("p", "a.parquet")[0] is read_parquet
+        assert _reader_for("p", "a.jsonl")[0] is read_jsonl
+        assert _reader_for("p", "a.ndjson")[0] is read_jsonl
+
+    def test_unsupported_extension_raises(self) -> None:
+        with pytest.raises(ValueError, match="unsupported file type"):
+            _reader_for("p", "a.xlsx")
+
+    def test_csv_reader_dependency_is_importable(self) -> None:
+        """read_csv parses via pandas — guard the packaging regression."""
+        import pandas  # noqa: F401

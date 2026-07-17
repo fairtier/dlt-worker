@@ -1,12 +1,16 @@
 [project]
 name = "dlt-worker"
-version = "0.0.6"
+version = "0.0.7"
 description = "Worker that polls the FairTier API for pipeline configurations and runs them via dlt"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "dlt[pyiceberg,filesystem,s3,parquet]>=1.5",
+    # dlt.sources.filesystem.read_csv parses CSV/TSV via pandas; the dlt
+    # filesystem extra does NOT pull it in, so file-drop CSV uploads crash at
+    # runtime with ModuleNotFoundError without this explicit dep.
+    "pandas>=2",
     "google-auth>=2.35",
     "pyiceberg[pyarrow]>=0.10",
     "requests>=2.32",
