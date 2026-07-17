@@ -31,6 +31,24 @@ logger = logging.getLogger(__name__)
 _shutdown = False
 
 
+def _configure_logging() -> None:
+    """Configure root logging at INFO, taking over from dlt.
+
+    force=True is essential: importing dlt (transitively, at module load)
+    installs a root StreamHandler and sets the root level to WARNING. Without
+    force, basicConfig is a no-op when a handler already exists, so the root
+    level stays WARNING and every INFO log the worker emits (startup, "Running
+    pipeline: X", run outcomes) is silently dropped — only ERRORs (e.g. a
+    pipeline crash) get through, which is why file-drop failures were invisible
+    in central Loki. force=True re-owns the root config at INFO.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+
+
 def _handle_signal(signum: int, _frame: object) -> None:
     global _shutdown
     logger.info("Received signal %d, shutting down gracefully...", signum)
@@ -61,10 +79,7 @@ def run() -> None:
     """Main loop: poll for work, run pipelines, report results."""
     config.load()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _configure_logging()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)

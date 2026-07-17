@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -334,3 +335,45 @@ class TestRunDueTransformations:
             schedule="*/5 * * * *", last_run_at=now - timedelta(minutes=6)
         )
         assert _should_run(cfg, now) is True
+
+
+class TestConfigureLogging:
+    """_configure_logging must win over dlt's root-logger setup.
+
+    Importing dlt installs a root StreamHandler and sets the root level to
+    WARNING. A plain logging.basicConfig(level=INFO) is then a no-op (a handler
+    already exists), so the worker's INFO logs (startup, "Running pipeline",
+    outcomes) were silently dropped and only ERRORs reached Loki. This guards
+    the force=True fix.
+    """
+
+    def _reset_root(self) -> tuple[int, list[Any]]:
+        root = logging.getLogger()
+        saved = (root.level, root.handlers[:])
+        return saved
+
+    def _restore_root(self, saved: tuple[int, list[Any]]) -> None:
+        root = logging.getLogger()
+        root.setLevel(saved[0])
+        root.handlers[:] = saved[1]
+
+    def test_info_flows_despite_preexisting_warning_root(self) -> None:
+        saved = self._reset_root()
+        try:
+            # Simulate what `import dlt` leaves behind: a root handler + WARNING.
+            root = logging.getLogger()
+            root.handlers[:] = [logging.StreamHandler()]
+            root.setLevel(logging.WARNING)
+
+            # A plain basicConfig would be a no-op here (handler present) —
+            # root stays WARNING and INFO is disabled. Confirm that baseline...
+            logging.basicConfig(level=logging.INFO)
+            assert root.level == logging.WARNING
+            assert not logging.getLogger("dlt_worker.main").isEnabledFor(logging.INFO)
+
+            # ...then _configure_logging (force=True) must re-own it at INFO.
+            main._configure_logging()
+            assert root.level == logging.INFO
+            assert logging.getLogger("dlt_worker.main").isEnabledFor(logging.INFO)
+        finally:
+            self._restore_root(saved)
