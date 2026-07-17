@@ -740,19 +740,20 @@ class TestBuildRestApiSource:
         assert "paginator" not in endpoint
 
     def test_no_incremental(self, mock_rest: MagicMock) -> None:
-        """Without any incremental config, resources carry no incremental key."""
+        """Without any incremental config, the endpoint carries no incremental key."""
         cfg = self._rest_cfg()
 
         _build_rest_api_source(cfg)
 
-        call_config = mock_rest.call_args[0][0]
-        assert "incremental" not in call_config["resources"][0]
+        resource = mock_rest.call_args[0][0]["resources"][0]
+        assert "incremental" not in resource
+        assert "incremental" not in resource["endpoint"]
 
     def test_source_level_incremental_applies_to_all_resources(
         self, mock_rest: MagicMock
     ) -> None:
         """A top-level source_config.incremental (platform_api's shape) is applied
-        to every resource, each with its own incremental instance."""
+        to every resource, as a config dict UNDER endpoint (dlt's shape)."""
         cfg = _make_config(
             source_type="rest_api",
             source_config={
@@ -761,7 +762,7 @@ class TestBuildRestApiSource:
                     {"name": "posts", "endpoint": "/posts"},
                     {"name": "users", "endpoint": "/users"},
                 ],
-                "incremental": {"cursor_path": "id"},
+                "incremental": {"cursor_path": "id", "initial_value": 10},
             },
             source_credentials={},
         )
@@ -769,12 +770,24 @@ class TestBuildRestApiSource:
         _build_rest_api_source(cfg)
 
         resources = mock_rest.call_args[0][0]["resources"]
-        incs = [r["incremental"] for r in resources]
-        for inc in incs:
-            assert isinstance(inc, dlt.sources.incremental)
-            assert inc.cursor_path == "id"
-        # Distinct instances so cursor state is not shared across resources.
-        assert incs[0] is not incs[1]
+        for r in resources:
+            # Incremental lives under endpoint, not at the resource level.
+            assert "incremental" not in r
+            assert r["endpoint"]["incremental"] == {
+                "cursor_path": "id",
+                "initial_value": 10,
+            }
+
+    def test_incremental_omits_initial_value_when_absent(
+        self, mock_rest: MagicMock
+    ) -> None:
+        """Without initial_value the config dict carries only cursor_path."""
+        cfg = self._rest_cfg(incremental={"cursor_path": "id"})
+
+        _build_rest_api_source(cfg)
+
+        endpoint = mock_rest.call_args[0][0]["resources"][0]["endpoint"]
+        assert endpoint["incremental"] == {"cursor_path": "id"}
 
     def test_resource_incremental_overrides_source_level(
         self, mock_rest: MagicMock
@@ -800,8 +813,44 @@ class TestBuildRestApiSource:
         _build_rest_api_source(cfg)
 
         resources = mock_rest.call_args[0][0]["resources"]
-        assert resources[0]["incremental"].cursor_path == "updated_at"
-        assert resources[1]["incremental"].cursor_path == "id"
+        assert resources[0]["endpoint"]["incremental"]["cursor_path"] == "updated_at"
+        assert resources[1]["endpoint"]["incremental"]["cursor_path"] == "id"
+
+
+class TestBuildRestApiSourceReal:
+    """Unmocked construction tests — exercise dlt's own config validation, which
+    the mocked TestBuildRestApiSource cannot (a mocked rest_api_source validates
+    nothing, so a bad config shape passes there but fails at runtime)."""
+
+    def test_source_level_incremental_is_accepted_by_dlt(self) -> None:
+        """A source-level incremental must build a real rest_api_source without
+        raising — guards the resource-level placement dlt rejects with
+        'received unexpected fields {incremental}' (found live on fokume)."""
+        cfg = _make_config(
+            source_type="rest_api",
+            source_config={
+                "base_url": "https://api.example.com",
+                "resources": [{"name": "posts", "endpoint": "/posts"}],
+                "incremental": {"cursor_path": "id"},
+            },
+            source_credentials={},
+        )
+
+        source = _build_rest_api_source(cfg)
+        assert source is not None
+
+    def test_plain_rest_api_source_builds(self) -> None:
+        """Sanity: a no-incremental config also builds."""
+        cfg = _make_config(
+            source_type="rest_api",
+            source_config={
+                "base_url": "https://api.example.com",
+                "resources": [{"name": "posts", "endpoint": "/posts"}],
+            },
+            source_credentials={},
+        )
+
+        assert _build_rest_api_source(cfg) is not None
 
 
 class TestTriggerSnapshot:

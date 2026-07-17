@@ -181,10 +181,14 @@ def _build_rest_api_source(cfg: PipelineConfig) -> Any:
             resource_def["write_disposition"] = res_cfg["write_disposition"]
         inc = res_cfg.get("incremental", source_incremental)
         if inc:
-            resource_def["incremental"] = dlt.sources.incremental(
-                cursor_path=inc["cursor_path"],
-                initial_value=inc.get("initial_value"),
-            )
+            # dlt rest_api takes incremental as a config dict UNDER `endpoint`
+            # (Endpoint.incremental: IncrementalConfig) — an Incremental object,
+            # or `incremental` at the resource level, is rejected by
+            # EndpointResource validation ("received unexpected fields").
+            inc_cfg: dict[str, Any] = {"cursor_path": inc["cursor_path"]}
+            if inc.get("initial_value") is not None:
+                inc_cfg["initial_value"] = inc["initial_value"]
+            resource_def["endpoint"]["incremental"] = inc_cfg
         resources.append(resource_def)
 
     return rest_api_source(
