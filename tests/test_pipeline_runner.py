@@ -22,7 +22,7 @@ from dlt_worker.pipeline_runner import (
     _reader_for,
     _rows_to_records,
     _spreadsheet_id,
-    _trigger_snapshot,
+    trigger_snapshot,
 )
 from dlt_worker.api_client import PipelineConfig
 
@@ -854,7 +854,7 @@ class TestBuildRestApiSourceReal:
 
 
 class TestTriggerSnapshot:
-    """Tests for _trigger_snapshot."""
+    """Tests for trigger_snapshot."""
 
     SNAPSHOT_URL = "http://localhost:9999/snapshot"
 
@@ -873,7 +873,7 @@ class TestTriggerSnapshot:
         mock_post.return_value.raise_for_status = MagicMock()
 
         with caplog.at_level(logging.INFO, logger="dlt_worker.pipeline_runner"):
-            _trigger_snapshot("my-pipeline")
+            trigger_snapshot("my-pipeline")
 
         mock_post.assert_called_once_with(
             self.SNAPSHOT_URL,
@@ -892,7 +892,7 @@ class TestTriggerSnapshot:
         mock_post.return_value.raise_for_status = MagicMock()
 
         with caplog.at_level(logging.INFO, logger="dlt_worker.pipeline_runner"):
-            _trigger_snapshot("my-pipeline")
+            trigger_snapshot("my-pipeline")
 
         assert "snapshot unchanged" in caplog.text
 
@@ -904,7 +904,7 @@ class TestTriggerSnapshot:
         mock_post.side_effect = requests.ConnectionError("sidecar down")
 
         with caplog.at_level(logging.WARNING, logger="dlt_worker.pipeline_runner"):
-            _trigger_snapshot("my-pipeline")
+            trigger_snapshot("my-pipeline")
 
         assert "failed to trigger snapshot webhook" in caplog.text
 
@@ -916,7 +916,7 @@ class TestTriggerSnapshot:
         mock_post.return_value.raise_for_status.side_effect = requests.HTTPError("500")
 
         with caplog.at_level(logging.WARNING, logger="dlt_worker.pipeline_runner"):
-            _trigger_snapshot("my-pipeline")
+            trigger_snapshot("my-pipeline")
 
         assert "failed to trigger snapshot webhook" in caplog.text
 
@@ -928,7 +928,7 @@ class TestTriggerSnapshot:
         """No HTTP call when SNAPSHOT_URL is empty."""
         config.SNAPSHOT_URL = ""
 
-        _trigger_snapshot("my-pipeline")
+        trigger_snapshot("my-pipeline")
 
         mock_post.assert_not_called()
 

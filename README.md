@@ -4,15 +4,17 @@
 [![Coverage](https://fairtier.github.io/dlt-worker/badges/coverage.svg)](https://github.com/fairtier/dlt-worker/actions)
 [![License](https://img.shields.io/github/license/fairtier/dlt-worker)](LICENSE)
 
-Worker that polls a control plane for pipeline configurations and runs them via [dlt](https://dlthub.com/), writing Iceberg tables to S3-compatible storage.
+Worker that runs declarative data pipelines via [dlt](https://dlthub.com/), writing Iceberg tables to S3-compatible storage. Pipeline definitions come either from a control plane poll (legacy mode) or from local YAML files kept in sync by a git sidecar (files mode).
 
 ## How it works
 
-1. Polls a control plane on a configurable interval for pipeline definitions
-2. Evaluates cron schedules (or manual triggers) to decide which pipelines to run
+1. Reads pipeline definitions — from `$PIPELINES_DIR/pipelines/*.yaml` when `PIPELINES_DIR` is set (files mode), otherwise from a control plane poll
+2. Evaluates cron schedules (or manual triggers) to decide which pipelines to run; in files mode the worker owns `last_run_at` locally (`scheduler.json` in the state dir), so scheduling keeps working when the control plane is unreachable
 3. Runs each due pipeline using [dlt](https://dlthub.com/) with Iceberg table format
-4. Reports results (rows loaded, errors) back to the control plane
+4. Reports results (rows loaded, errors) back to the control plane (best-effort)
 5. Exposes a `/healthz` endpoint for Kubernetes readiness probes
+
+In files mode the control plane poll is still made every tick, but only manual ("Run now") triggers and source credentials are consumed from it — definitions, schedules, and enablement come from the files. Credentials are cached in memory only, so a pipeline whose credentials were seen at least once keeps running through a control plane outage.
 
 ## Quick start
 
@@ -56,6 +58,7 @@ All configuration is via environment variables.
 | `PIPELINE_MAX_RETRIES`      | `2`          | Max retry attempts per pipeline on failure                                            |
 | `PIPELINE_RETRY_BASE_DELAY` | `30`         | Base delay in seconds for exponential backoff                                         |
 | `SNAPSHOT_URL`              | _(empty)_    | URL to trigger a state snapshot sidecar after each pipeline run (disabled when empty) |
+| `PIPELINES_DIR`             | _(empty)_    | Files mode: checkout root holding `pipelines/*.yaml` definitions; unset = poll the control plane for definitions (legacy) |
 | `OIDC_CLIENT_ID`            | _(empty)_    | OIDC client ID for Lakekeeper catalog auth **and** FairTier API bearer auth           |
 | `OIDC_CLIENT_SECRET`        | _(empty)_    | OIDC client secret for Lakekeeper catalog auth **and** FairTier API bearer auth       |
 | `OIDC_TOKEN_URL`            | _(empty)_    | OIDC token endpoint for Lakekeeper catalog auth **and** FairTier API bearer auth      |

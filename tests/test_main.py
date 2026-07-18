@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from dlt_worker import config, main
 from dlt_worker.main import _should_run
+from dlt_worker.scheduler_state import SchedulerState
 from dlt_worker.api_client import (
     PipelineConfig,
     PipelineRunReport,
@@ -239,6 +243,269 @@ class TestRunWithRetry:
 
         report = client.report_pipeline_run.call_args[0][0]
         assert report.run_id == "run-123"
+
+
+# --- files mode (_run_due_pipelines_files) ---
+
+
+def _write_pipeline_yaml(
+    pipelines_dir: Path, filename: str, pipeline_id: str, **overrides: Any
+) -> None:
+    fields: dict[str, Any] = {
+        "id": pipeline_id,
+        "name": filename.removesuffix(".yaml"),
+        "source_type": "sql_database",
+        "source_config": {"tables": ["orders"]},
+        "dataset_name": "raw",
+        "schedule": "*/5 * * * *",
+        "enabled": True,
+    }
+    fields.update(overrides)
+    lines = []
+    for key, value in fields.items():
+        if value is None:
+            continue  # rendered files omit empty fields (yaml omitempty)
+        if isinstance(value, dict):
+            lines.append(f"{key}:")
+            for k, v in value.items():
+                lines.append(f"  {k}: {v}")
+        elif isinstance(value, bool):
+            lines.append(f"{key}: {str(value).lower()}")
+        else:
+            lines.append(f"{key}: {value!r}")
+    (pipelines_dir / "pipelines" / filename).write_text("\n".join(lines) + "\n")
+
+
+class TestRunDuePipelinesFiles:
+    """Files mode: definitions/schedules from the checkout, triggers and
+    credentials from the poll, last_run_at worker-owned."""
+
+    @pytest.fixture(autouse=True)
+    def _files_mode(self, tmp_path: Path) -> Any:
+        self.checkout = tmp_path / "checkout"
+        (self.checkout / "pipelines").mkdir(parents=True)
+        self.state_dir = tmp_path / "state"
+        self.state_dir.mkdir()
+        config.PIPELINES_DIR = str(self.checkout)
+        config.DLT_STATE_DIR = str(self.state_dir)
+        main._shutdown = False
+        main._creds_cache.clear()
+        yield
+        config.PIPELINES_DIR = ""
+        main._creds_cache.clear()
+
+    def _client(self, polled: list[PipelineConfig] | None) -> MagicMock:
+        client = MagicMock()
+        client.try_get_pipeline_configs.return_value = polled
+        client.report_pipeline_run.return_value = True
+        return client
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_dispatcher_uses_files_mode(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """With PIPELINES_DIR set, definitions come from files — the
+        legacy full-truth accessor is never consulted."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
+        client = self._client([])
+
+        main._run_due_pipelines(client)
+
+        client.try_get_pipeline_configs.assert_called_once()
+        client.get_pipeline_configs.assert_not_called()
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_central_down_scheduled_run_fires_with_cached_creds(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """The Phase 2 acceptance property: a due run fires during a
+        central outage using in-memory-cached credentials."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        cfg = _make_config(id="p1")
+        mock_run.return_value = _success_report(cfg)
+
+        # First tick: central up, credentials get cached, run fires.
+        api_cfg = _make_config(id="p1", source_credentials={"key": "s3cr3t"})
+        client = self._client([api_cfg])
+        succeeded = main._run_due_pipelines(client)
+        assert succeeded == {"p1"}
+
+        # Second tick: central down, schedule due again after 6 minutes.
+        state = SchedulerState.load(str(self.state_dir))
+        state.record("p1", datetime.now(timezone.utc) - timedelta(minutes=6))
+        down = self._client(None)
+        succeeded = main._run_due_pipelines(down)
+
+        assert succeeded == {"p1"}
+        ran_cfg = mock_run.call_args[0][0]
+        assert ran_cfg.source_credentials == {"key": "s3cr3t"}
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_central_down_no_cached_creds_skips_gracefully(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        client = self._client(None)
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == set()
+        mock_run.assert_not_called()
+        # Not recorded — the run retries as soon as credentials appear.
+        assert SchedulerState.load(str(self.state_dir)).get("p1") is None
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_trigger_now_joined_by_id(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
+        cfg = _make_config(id="p1")
+        mock_run.return_value = _success_report(cfg)
+        api_cfg = _make_config(id="p1", trigger_now=True, pending_run_id="run-9")
+        client = self._client([api_cfg])
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == {"p1"}
+        # The pending run id flows into the "running" report.
+        running = client.report_pipeline_run.call_args_list[0][0][0]
+        assert running.status == "running"
+        assert running.run_id == "run-9"
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_polled_definitions_ignored(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """File truth wins: a file-disabled pipeline does not run even if
+        the poll says enabled + triggered (worker-parity semantics)."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", enabled=False)
+        api_cfg = _make_config(id="p1", enabled=True, trigger_now=True)
+        client = self._client([api_cfg])
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == set()
+        mock_run.assert_not_called()
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_migration_seeds_api_last_run_at_once(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """A pipeline unknown to scheduler.json adopts central's
+        last_run_at instead of re-firing as "never ran"."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        recent = datetime.now(timezone.utc) - timedelta(minutes=1)
+        api_cfg = _make_config(id="p1", last_run_at=recent)
+        client = self._client([api_cfg])
+
+        succeeded = main._run_due_pipelines(client)
+
+        # Ran 1 minute ago on a */5 schedule — not due, and now seeded.
+        assert succeeded == set()
+        mock_run.assert_not_called()
+        assert SchedulerState.load(str(self.state_dir)).get("p1") == recent
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_local_state_wins_over_polled_last_run_at(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """Once seeded, central's last_run_at is ignored (worker owns it)."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        state = SchedulerState.load(str(self.state_dir))
+        state.record("p1", datetime.now(timezone.utc) - timedelta(minutes=1))
+        stale = datetime.now(timezone.utc) - timedelta(hours=2)
+        client = self._client([_make_config(id="p1", last_run_at=stale)])
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == set()
+        mock_run.assert_not_called()
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_success_recorded_failure_not(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        config.PIPELINE_MAX_RETRIES = 0
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
+        _write_pipeline_yaml(self.checkout, "sales.yaml", "p2", schedule=None)
+        ok = _make_config(id="p1")
+        bad = _make_config(id="p2")
+        mock_run.side_effect = lambda cfg: (
+            _success_report(ok) if cfg.id == "p1" else _failure_report(bad)
+        )
+        client = self._client(
+            [
+                _make_config(id="p1", trigger_now=True),
+                _make_config(id="p2", trigger_now=True),
+            ]
+        )
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == {"p1"}
+        state = SchedulerState.load(str(self.state_dir))
+        assert state.get("p1") is not None
+        assert state.get("p2") is None  # failure re-fires, like legacy mode
+        mock_snapshot.assert_called_once()  # only for the success
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_prune_on_file_removal(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        state = SchedulerState.load(str(self.state_dir))
+        state.record("p1", datetime.now(timezone.utc))
+        state.record("gone", datetime.now(timezone.utc))
+        client = self._client([])
+
+        main._run_due_pipelines(client)
+
+        reloaded = SchedulerState.load(str(self.state_dir))
+        assert reloaded.get("p1") is not None
+        assert reloaded.get("gone") is None
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_prune_suppressed_on_bad_file(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """A transiently broken file must not lose its last_run_at."""
+        (self.checkout / "pipelines" / "broken.yaml").write_text("id: [unclosed\n")
+        state = SchedulerState.load(str(self.state_dir))
+        kept = datetime.now(timezone.utc)
+        state.record("p-broken", kept)
+        client = self._client([])
+
+        main._run_due_pipelines(client)
+
+        assert SchedulerState.load(str(self.state_dir)).get("p-broken") == kept
+
+    @patch("dlt_worker.main.run_pipeline")
+    def test_legacy_mode_untouched(self, mock_run: MagicMock) -> None:
+        """PIPELINES_DIR unset = 0.0.11 behavior: poll is full truth and
+        scheduler.json is never created."""
+        config.PIPELINES_DIR = ""
+        cfg = _make_config(id="p1", trigger_now=True)
+        mock_run.return_value = _success_report(cfg)
+        client = MagicMock()
+        client.get_pipeline_configs.return_value = [cfg]
+        client.report_pipeline_run.return_value = True
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == {"p1"}
+        client.get_pipeline_configs.assert_called_once()
+        client.try_get_pipeline_configs.assert_not_called()
+        assert not (self.state_dir / "scheduler.json").exists()
 
 
 # --- transformation scheduling ---

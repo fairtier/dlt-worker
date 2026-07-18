@@ -70,7 +70,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
 
         logger.info("Pipeline %s completed: %d rows loaded", cfg.name, rows_loaded)
 
-        _trigger_snapshot(cfg.name)
+        trigger_snapshot(cfg.name)
 
         return PipelineRunReport(
             pipeline_id=cfg.id,
@@ -91,7 +91,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
         )
 
 
-def _trigger_snapshot(pipeline_name: str) -> None:
+def trigger_snapshot(pipeline_name: str) -> None:
     """POST to a configured webhook after each successful pipeline run. Best-effort.
 
     Designed for use with a state-snapshot sidecar (e.g. snapshot-sidecar) but

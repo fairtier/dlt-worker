@@ -176,7 +176,17 @@ class APIClient:
         self._last_check_at = datetime.now(timezone.utc).isoformat()
 
     def get_pipeline_configs(self) -> list[PipelineConfig]:
-        """Fetch all enabled pipeline configs for this customer."""
+        """Fetch all enabled pipeline configs for this customer.
+
+        Legacy-mode entry point: a fetch failure is indistinguishable from
+        "no pipelines" (empty list). Files mode needs the distinction —
+        use try_get_pipeline_configs there.
+        """
+        configs = self.try_get_pipeline_configs()
+        return configs if configs is not None else []
+
+    def try_get_pipeline_configs(self) -> list[PipelineConfig] | None:
+        """Fetch pipeline configs, or None when the FairTier API is unreachable."""
         url = f"{self.base_url}/pipeline.v1.PipelineService/GetPipelineConfigs"
         try:
             resp = self._post(url, {"customerSlug": self.customer_slug})
@@ -184,7 +194,7 @@ class APIClient:
         except requests.RequestException as e:
             logger.exception("Failed to fetch pipeline configs")
             self._mark_unhealthy(e)
-            return []
+            return None
 
         self._mark_healthy()
 

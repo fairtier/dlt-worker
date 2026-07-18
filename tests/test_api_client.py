@@ -137,6 +137,28 @@ class TestGetPipelineConfigs:
         assert "refused" in details["last_error"]
 
 
+class TestTryGetPipelineConfigs:
+    """try_get_pipeline_configs distinguishes "no pipelines" from
+    "unreachable" — files mode needs that to decide between empty state
+    and cached credentials."""
+
+    def test_returns_list_on_success(self) -> None:
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response({"pipelines": []})
+
+        assert client.try_get_pipeline_configs() == []
+
+    def test_returns_none_on_connection_error(self) -> None:
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.side_effect = requests.ConnectionError("refused")
+
+        assert client.try_get_pipeline_configs() is None
+        healthy, _ = client.health_status()
+        assert healthy is False
+
+
 class TestReportPipelineRun:
     """Tests for APIClient.report_pipeline_run."""
 

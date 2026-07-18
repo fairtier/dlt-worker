@@ -32,6 +32,11 @@ HEALTHZ_PORT: int = 8080
 PIPELINE_MAX_RETRIES: int = 2
 PIPELINE_RETRY_BASE_DELAY: int = 30
 SNAPSHOT_URL: str = ""
+# Files mode: when set, pipeline definitions and schedules are read from
+# <PIPELINES_DIR>/pipelines/*.yaml (a checkout kept in sync by a sidecar)
+# and the API poll shrinks to triggers + credentials. Unset = legacy mode,
+# the poll is the full source of truth. This is the rollback lever.
+PIPELINES_DIR: str = ""
 
 # AWS / S3
 AWS_ACCESS_KEY_ID: str = ""
@@ -61,6 +66,7 @@ def load() -> None:
     global CUSTOMER_SLUG, FAIRTIER_API_URL, LAKEKEEPER_URL
     global POLL_INTERVAL_SECONDS, DLT_STATE_DIR, HEALTHZ_PORT
     global PIPELINE_MAX_RETRIES, PIPELINE_RETRY_BASE_DELAY, SNAPSHOT_URL
+    global PIPELINES_DIR
     global \
         AWS_ACCESS_KEY_ID, \
         AWS_SECRET_ACCESS_KEY, \
@@ -80,6 +86,7 @@ def load() -> None:
     PIPELINE_MAX_RETRIES = int(os.environ.get("PIPELINE_MAX_RETRIES", "2"))
     PIPELINE_RETRY_BASE_DELAY = int(os.environ.get("PIPELINE_RETRY_BASE_DELAY", "30"))
     SNAPSHOT_URL = os.environ.get("SNAPSHOT_URL", "")
+    PIPELINES_DIR = os.environ.get("PIPELINES_DIR", "")
 
     AWS_ACCESS_KEY_ID = _require("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = _require("AWS_SECRET_ACCESS_KEY")

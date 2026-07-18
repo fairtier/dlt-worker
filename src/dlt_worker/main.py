@@ -11,12 +11,15 @@ import logging
 import signal
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 from croniter import croniter
 
 from dlt_worker import config
 from dlt_worker.health import start_health_server
-from dlt_worker.pipeline_runner import run_pipeline
+from dlt_worker.pipeline_files import load_pipeline_configs
+from dlt_worker.pipeline_runner import run_pipeline, trigger_snapshot
+from dlt_worker.scheduler_state import SchedulerState
 from dlt_worker.transformation_runner import run_transformation
 from dlt_worker.api_client import (
     PipelineConfig,
@@ -29,6 +32,13 @@ logger = logging.getLogger(__name__)
 
 # Shutdown flag
 _shutdown = False
+
+# Files mode: last-known source credentials per pipeline id, refreshed on
+# every successful poll. In-memory ONLY — credentials must never touch
+# disk (that is Phase 3's encrypted-repo job) and must never be logged.
+# Never shrunk: a pipeline briefly absent from one poll response keeps its
+# last-known credentials for the next central outage.
+_creds_cache: dict[str, dict[str, Any]] = {}
 
 
 def _configure_logging() -> None:
@@ -128,6 +138,43 @@ def _poll_and_run(client: APIClient) -> None:
 
 def _run_due_pipelines(client: APIClient) -> set[str]:
     """Run all due pipelines. Returns the ids of pipelines that succeeded."""
+    if config.PIPELINES_DIR:
+        return _run_due_pipelines_files(client)
+    return _run_due_pipelines_api(client)
+
+
+def _execute_pipeline(
+    cfg: PipelineConfig, now: datetime, client: APIClient
+) -> PipelineRunReport | None:
+    """Run one due pipeline and return its final report."""
+    logger.info("Running pipeline: %s (%s)", cfg.name, cfg.source_type)
+
+    run_id = cfg.pending_run_id
+
+    # Mark triggered run as "running" before execution.
+    # If the update fails (network blip, run already cleaned up),
+    # fall back to creating a new run row.
+    if run_id:
+        ok = client.report_pipeline_run(
+            PipelineRunReport(
+                pipeline_id=cfg.id,
+                status="running",
+                started_at=now.isoformat(),
+                completed_at="",
+                run_id=run_id,
+            )
+        )
+        if not ok:
+            logger.warning(
+                "Failed to mark run %s as running, will create new run", run_id
+            )
+            run_id = ""
+
+    return _run_with_retry(cfg, run_id, client)
+
+
+def _run_due_pipelines_api(client: APIClient) -> set[str]:
+    """Legacy mode: the API poll is the full source of truth."""
     succeeded: set[str] = set()
 
     configs = client.get_pipeline_configs()
@@ -142,32 +189,95 @@ def _run_due_pipelines(client: APIClient) -> set[str]:
         if not _should_run(cfg, now):
             continue
 
-        logger.info("Running pipeline: %s (%s)", cfg.name, cfg.source_type)
-
-        run_id = cfg.pending_run_id
-
-        # Mark triggered run as "running" before execution.
-        # If the update fails (network blip, run already cleaned up),
-        # fall back to creating a new run row.
-        if run_id:
-            ok = client.report_pipeline_run(
-                PipelineRunReport(
-                    pipeline_id=cfg.id,
-                    status="running",
-                    started_at=now.isoformat(),
-                    completed_at="",
-                    run_id=run_id,
-                )
-            )
-            if not ok:
-                logger.warning(
-                    "Failed to mark run %s as running, will create new run", run_id
-                )
-                run_id = ""
-
-        report = _run_with_retry(cfg, run_id, client)
+        report = _execute_pipeline(cfg, now, client)
         if report is not None and report.status == "success":
             succeeded.add(cfg.id)
+
+    return succeeded
+
+
+def _run_due_pipelines_files(client: APIClient) -> set[str]:
+    """Files mode: definitions and schedules come from the pipelines
+    checkout; the poll is consumed only for Run-now triggers and source
+    credentials. A central outage degrades (no history, no triggers,
+    possibly no credentials) instead of stopping scheduled ingestion.
+    """
+    succeeded: set[str] = set()
+
+    files = load_pipeline_configs(config.PIPELINES_DIR)
+    file_ids = {c.id for c in files.configs}
+    state = SchedulerState.load(config.DLT_STATE_DIR)
+
+    polled = client.try_get_pipeline_configs()
+    by_id: dict[str, PipelineConfig] = {}
+    if polled is None:
+        logger.warning(
+            "FairTier API unreachable — scheduling from files, "
+            "credentials from in-memory cache"
+        )
+    else:
+        for p in polled:
+            by_id[p.id] = p
+            _creds_cache[p.id] = p.source_credentials
+            if p.pending_run_id and p.id not in file_ids:
+                logger.warning(
+                    "Pending run for pipeline %s has no definition file yet "
+                    "(mirror lag?) — will fire once the file lands",
+                    p.id,
+                )
+
+    # Drop scheduler entries for deleted pipelines — but never on a
+    # partial read: a transiently broken file must not lose its
+    # last_run_at and re-fire on repair.
+    if not files.had_errors:
+        state.prune(file_ids)
+
+    now = datetime.now(timezone.utc)
+
+    for cfg in files.configs:
+        if _shutdown:
+            break
+
+        api_cfg = by_id.get(cfg.id)
+
+        # One-time migration: adopt central's last_run_at so existing
+        # pipelines don't re-fire on the first files-mode tick.
+        if cfg.id not in state and api_cfg is not None and api_cfg.last_run_at:
+            state.seed(cfg.id, api_cfg.last_run_at)
+        cfg.last_run_at = state.get(cfg.id)
+
+        # Triggers are the only definition-adjacent data taken from the
+        # poll; polled schedule/enabled/definitions are ignored.
+        if api_cfg is not None:
+            cfg.trigger_now = api_cfg.trigger_now
+            cfg.pending_run_id = api_cfg.pending_run_id
+
+        if not _should_run(cfg, now):
+            continue
+
+        if cfg.id in _creds_cache:
+            # A cached {} is a valid "known credential-less" entry.
+            cfg.source_credentials = _creds_cache[cfg.id]
+        elif polled is None:
+            logger.warning(
+                "Skipping pipeline %s: no cached credentials and the "
+                "FairTier API is unreachable — retrying next tick",
+                cfg.name,
+            )
+            continue
+
+        report = _execute_pipeline(cfg, now, client)
+        if report is not None and report.status == "success":
+            succeeded.add(cfg.id)
+            # Record the run *start* time, mirroring central semantics
+            # (last_run_at = created_at of the last success). Success-only:
+            # a failing scheduled pipeline keeps re-firing, exactly as in
+            # legacy mode.
+            state.record(cfg.id, now)
+            # Extra best-effort snapshot so scheduler.json lands in the
+            # post-run commit instead of waiting for the autosave window
+            # (a crash in between would re-fire the run once).
+            trigger_snapshot(cfg.name)
 
     return succeeded
 
