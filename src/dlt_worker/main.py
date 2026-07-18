@@ -335,7 +335,7 @@ def _run_with_retry(
 
     Returns the final run report."""
     max_attempts = config.PIPELINE_MAX_RETRIES + 1
-    last_report: PipelineRunReport | None = None
+    report: PipelineRunReport | None = None
 
     for attempt in range(max_attempts):
         report = run_pipeline(cfg)
@@ -353,7 +353,6 @@ def _run_with_retry(
             return report
 
         # Intermediate failure — log and wait before retrying.
-        last_report = report
         delay = config.PIPELINE_RETRY_BASE_DELAY * (2**attempt)
         logger.warning(
             "Pipeline %s failed (attempt %d/%d), retrying in %ds: %s",
@@ -367,13 +366,13 @@ def _run_with_retry(
         for _ in range(delay):
             if _shutdown:
                 # Shutting down — report the last failure and bail out.
-                if not client.report_pipeline_run(last_report):
+                if not client.report_pipeline_run(report):
                     logger.error(
                         "Failed to report result for pipeline %s (run_id=%s)",
                         cfg.id,
                         run_id,
                     )
-                return last_report
+                return report
             time.sleep(1)
 
-    return last_report
+    return report
