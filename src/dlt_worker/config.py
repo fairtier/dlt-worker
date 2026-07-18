@@ -37,6 +37,12 @@ SNAPSHOT_URL: str = ""
 # and the API poll shrinks to triggers + credentials. Unset = legacy mode,
 # the poll is the full source of truth. This is the rollback lever.
 PIPELINES_DIR: str = ""
+# Age credentials (files mode): path to the box age identity file (the
+# dlt-age Secret mount). When set, pipelines/<name>.credentials.age files
+# in the checkout are decrypted and take precedence over polled
+# credentials. Unset = credentials come from the poll only (0.1.0
+# behavior). This is the Phase-3 rollback lever.
+AGE_KEY_FILE: str = ""
 
 # AWS / S3
 AWS_ACCESS_KEY_ID: str = ""
@@ -66,7 +72,7 @@ def load() -> None:
     global CUSTOMER_SLUG, FAIRTIER_API_URL, LAKEKEEPER_URL
     global POLL_INTERVAL_SECONDS, DLT_STATE_DIR, HEALTHZ_PORT
     global PIPELINE_MAX_RETRIES, PIPELINE_RETRY_BASE_DELAY, SNAPSHOT_URL
-    global PIPELINES_DIR
+    global PIPELINES_DIR, AGE_KEY_FILE
     global \
         AWS_ACCESS_KEY_ID, \
         AWS_SECRET_ACCESS_KEY, \
@@ -87,6 +93,7 @@ def load() -> None:
     PIPELINE_RETRY_BASE_DELAY = int(os.environ.get("PIPELINE_RETRY_BASE_DELAY", "30"))
     SNAPSHOT_URL = os.environ.get("SNAPSHOT_URL", "")
     PIPELINES_DIR = os.environ.get("PIPELINES_DIR", "")
+    AGE_KEY_FILE = os.environ.get("AGE_KEY_FILE", "")
 
     AWS_ACCESS_KEY_ID = _require("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = _require("AWS_SECRET_ACCESS_KEY")

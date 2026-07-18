@@ -35,9 +35,10 @@ _shutdown = False
 
 # Files mode: last-known source credentials per pipeline id, refreshed on
 # every successful poll. In-memory ONLY — credentials must never touch
-# disk (that is Phase 3's encrypted-repo job) and must never be logged.
-# Never shrunk: a pipeline briefly absent from one poll response keeps its
-# last-known credentials for the next central outage.
+# disk unencrypted and must never be logged. Never shrunk: a pipeline
+# briefly absent from one poll response keeps its last-known credentials
+# for the next central outage. Fallback only: credentials decrypted from
+# the checkout's .credentials.age files take precedence.
 _creds_cache: dict[str, dict[str, Any]] = {}
 
 
@@ -204,7 +205,7 @@ def _run_due_pipelines_files(client: APIClient) -> set[str]:
     """
     succeeded: set[str] = set()
 
-    files = load_pipeline_configs(config.PIPELINES_DIR)
+    files = load_pipeline_configs(config.PIPELINES_DIR, config.AGE_KEY_FILE)
     file_ids = {c.id for c in files.configs}
     state = SchedulerState.load(config.DLT_STATE_DIR)
 
@@ -213,7 +214,7 @@ def _run_due_pipelines_files(client: APIClient) -> set[str]:
     if polled is None:
         logger.warning(
             "FairTier API unreachable — scheduling from files, "
-            "credentials from in-memory cache"
+            "credentials from .credentials.age files or the in-memory cache"
         )
     else:
         for p in polled:
@@ -255,13 +256,17 @@ def _run_due_pipelines_files(client: APIClient) -> set[str]:
         if not _should_run(cfg, now):
             continue
 
-        if cfg.id in _creds_cache:
+        if cfg.has_file_credentials:
+            # Decrypted from the checkout — git truth wins; no fallback.
+            pass
+        elif cfg.id in _creds_cache:
             # A cached {} is a valid "known credential-less" entry.
             cfg.source_credentials = _creds_cache[cfg.id]
         elif polled is None:
             logger.warning(
-                "Skipping pipeline %s: no cached credentials and the "
-                "FairTier API is unreachable — retrying next tick",
+                "Skipping pipeline %s: no credential file, no cached "
+                "credentials, and the FairTier API is unreachable — "
+                "retrying next tick",
                 cfg.name,
             )
             continue

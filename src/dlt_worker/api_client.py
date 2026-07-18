@@ -45,6 +45,10 @@ class PipelineConfig:
     trigger_now: bool = False
     pending_run_id: str = ""
     last_run_at: datetime | None = None
+    # Files mode: True when source_credentials were decrypted from the
+    # pipeline's .credentials.age file in the checkout (git truth). Such a
+    # config never falls back to poll/cached credentials.
+    has_file_credentials: bool = False
 
 
 @dataclass

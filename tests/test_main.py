@@ -288,10 +288,12 @@ class TestRunDuePipelinesFiles:
         self.state_dir.mkdir()
         config.PIPELINES_DIR = str(self.checkout)
         config.DLT_STATE_DIR = str(self.state_dir)
+        config.AGE_KEY_FILE = ""
         main._shutdown = False
         main._creds_cache.clear()
         yield
         config.PIPELINES_DIR = ""
+        config.AGE_KEY_FILE = ""
         main._creds_cache.clear()
 
     def _client(self, polled: list[PipelineConfig] | None) -> MagicMock:
@@ -455,6 +457,90 @@ class TestRunDuePipelinesFiles:
         assert state.get("p1") is not None
         assert state.get("p2") is None  # failure re-fires, like legacy mode
         mock_snapshot.assert_called_once()  # only for the success
+
+    # --- age credential files (Phase 3) ---
+
+    def _age_key(self, creds_by_stem: dict[str, dict[str, Any]]) -> None:
+        """Enable file credentials: keypair + encrypted files per stem."""
+        import json
+
+        import pyrage
+
+        identity = pyrage.x25519.Identity.generate()
+        key_file = self.checkout.parent / "key.txt"
+        key_file.write_text(f"{identity}\n")
+        config.AGE_KEY_FILE = str(key_file)
+        for stem, creds in creds_by_stem.items():
+            ciphertext = pyrage.encrypt(
+                json.dumps(creds).encode(), [identity.to_public()]
+            )
+            (self.checkout / "pipelines" / f"{stem}.credentials.age").write_bytes(
+                ciphertext
+            )
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_fresh_process_central_down_runs_from_credential_file(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """The Phase 3 acceptance property: a fresh worker process (empty
+        credential cache) fires a due run during a central outage using
+        credentials decrypted from the checkout."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        self._age_key({"orders": {"password": "fr0m-f1le"}})
+        cfg = _make_config(id="p1")
+        mock_run.return_value = _success_report(cfg)
+        assert main._creds_cache == {}  # fresh process, nothing cached
+        client = self._client(None)  # central down
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == {"p1"}
+        ran_cfg = mock_run.call_args[0][0]
+        assert ran_cfg.source_credentials == {"password": "fr0m-f1le"}
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_file_credentials_win_over_polled(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """Git truth wins: polled/cached credentials are not consulted for
+        a pipeline whose credential file decrypted."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
+        self._age_key({"orders": {"password": "fr0m-f1le"}})
+        cfg = _make_config(id="p1")
+        mock_run.return_value = _success_report(cfg)
+        api_cfg = _make_config(
+            id="p1", trigger_now=True, source_credentials={"password": "stale"}
+        )
+        client = self._client([api_cfg])
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == {"p1"}
+        ran_cfg = mock_run.call_args[0][0]
+        assert ran_cfg.source_credentials == {"password": "fr0m-f1le"}
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline")
+    def test_no_credential_file_keeps_cache_fallback(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """A pipeline without a credential file keeps the 0.1.0 behavior:
+        cached credentials during an outage, skip when nothing is known."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        _write_pipeline_yaml(self.checkout, "sales.yaml", "p2")
+        self._age_key({"orders": {"password": "fr0m-f1le"}})  # p1 only
+        ok1, ok2 = _make_config(id="p1"), _make_config(id="p2")
+        mock_run.side_effect = lambda cfg: (
+            _success_report(ok1) if cfg.id == "p1" else _success_report(ok2)
+        )
+        client = self._client(None)  # central down, empty cache
+
+        succeeded = main._run_due_pipelines(client)
+
+        # p1 runs from its file; p2 has no file, no cache → skipped.
+        assert succeeded == {"p1"}
 
     @patch("dlt_worker.main.trigger_snapshot")
     @patch("dlt_worker.main.run_pipeline")

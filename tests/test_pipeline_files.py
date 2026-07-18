@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import textwrap
 from pathlib import Path
+from typing import Any
 
+import pyrage
+
+from dlt_worker import pipeline_files
 from dlt_worker.pipeline_files import load_pipeline_configs
 
 _FULL_YAML = """\
@@ -152,3 +159,152 @@ def test_name_falls_back_to_file_stem(tmp_path: Path) -> None:
     result = load_pipeline_configs(str(tmp_path))
 
     assert result.configs[0].name == "fallback"
+
+
+# --- age credential files ---
+
+
+def _keypair(tmp_path: Path) -> tuple[Path, pyrage.x25519.Recipient]:
+    """A box identity file (the dlt-age Secret mount) + its recipient."""
+    identity = pyrage.x25519.Identity.generate()
+    recipient = identity.to_public()
+    key_file = tmp_path / "key.txt"
+    key_file.write_text(
+        f"# created: 2026-07-18T00:00:00+00:00\n# public key: {recipient}\n{identity}\n"
+    )
+    return key_file, recipient
+
+
+def _armor(ciphertext: bytes) -> bytes:
+    b64 = base64.b64encode(ciphertext).decode()
+    return (
+        "-----BEGIN AGE ENCRYPTED FILE-----\n"
+        + "\n".join(textwrap.wrap(b64, 64))
+        + "\n-----END AGE ENCRYPTED FILE-----\n"
+    ).encode()
+
+
+def _write_creds(
+    d: Path, stem: str, recipient: pyrage.x25519.Recipient, creds: Any
+) -> None:
+    ciphertext = pyrage.encrypt(json.dumps(creds).encode(), [recipient])
+    (d / f"{stem}.credentials.age").write_bytes(_armor(ciphertext))
+
+
+def test_decrypts_armored_credential_file(tmp_path: Path) -> None:
+    d = _checkout(tmp_path)
+    key_file, recipient = _keypair(tmp_path)
+    (d / "orders.yaml").write_text(_FULL_YAML)
+    _write_creds(d, "orders", recipient, {"password": "s3cr3t"})
+
+    result = load_pipeline_configs(str(tmp_path), str(key_file))
+
+    assert result.had_errors is False
+    cfg = result.configs[0]
+    assert cfg.source_credentials == {"password": "s3cr3t"}
+    assert cfg.has_file_credentials is True
+
+
+def test_decrypts_binary_credential_file(tmp_path: Path) -> None:
+    d = _checkout(tmp_path)
+    key_file, recipient = _keypair(tmp_path)
+    (d / "orders.yaml").write_text(_FULL_YAML)
+    ciphertext = pyrage.encrypt(json.dumps({"k": "v"}).encode(), [recipient])
+    (d / "orders.credentials.age").write_bytes(ciphertext)
+
+    result = load_pipeline_configs(str(tmp_path), str(key_file))
+
+    assert result.configs[0].source_credentials == {"k": "v"}
+    assert result.configs[0].has_file_credentials is True
+
+
+def test_missing_credential_file_leaves_poll_semantics(tmp_path: Path) -> None:
+    d = _checkout(tmp_path)
+    key_file, _ = _keypair(tmp_path)
+    (d / "orders.yaml").write_text(_FULL_YAML)
+
+    result = load_pipeline_configs(str(tmp_path), str(key_file))
+
+    assert result.had_errors is False
+    assert result.configs[0].source_credentials == {}
+    assert result.configs[0].has_file_credentials is False
+
+
+def test_wrong_key_falls_back_without_errors(tmp_path: Path) -> None:
+    d = _checkout(tmp_path)
+    key_file, _ = _keypair(tmp_path)
+    other = pyrage.x25519.Identity.generate().to_public()
+    (d / "orders.yaml").write_text(_FULL_YAML)
+    _write_creds(d, "orders", other, {"password": "s3cr3t"})
+
+    result = load_pipeline_configs(str(tmp_path), str(key_file))
+
+    # Broken credential file must not mark the definition broken.
+    assert result.had_errors is False
+    assert result.configs[0].source_credentials == {}
+    assert result.configs[0].has_file_credentials is False
+
+
+def test_garbage_credential_file_falls_back(tmp_path: Path) -> None:
+    d = _checkout(tmp_path)
+    key_file, _ = _keypair(tmp_path)
+    (d / "orders.yaml").write_text(_FULL_YAML)
+    (d / "orders.credentials.age").write_bytes(b"not age data at all")
+
+    result = load_pipeline_configs(str(tmp_path), str(key_file))
+
+    assert result.had_errors is False
+    assert result.configs[0].has_file_credentials is False
+
+
+def test_truncated_armor_falls_back(tmp_path: Path) -> None:
+    d = _checkout(tmp_path)
+    key_file, recipient = _keypair(tmp_path)
+    (d / "orders.yaml").write_text(_FULL_YAML)
+    ciphertext = pyrage.encrypt(b"{}", [recipient])
+    armored = _armor(ciphertext)
+    (d / "orders.credentials.age").write_bytes(armored[: len(armored) // 2])
+
+    result = load_pipeline_configs(str(tmp_path), str(key_file))
+
+    assert result.had_errors is False
+    assert result.configs[0].has_file_credentials is False
+
+
+def test_non_object_credentials_fall_back(tmp_path: Path) -> None:
+    d = _checkout(tmp_path)
+    key_file, recipient = _keypair(tmp_path)
+    (d / "orders.yaml").write_text(_FULL_YAML)
+    _write_creds(d, "orders", recipient, ["not", "a", "dict"])
+
+    result = load_pipeline_configs(str(tmp_path), str(key_file))
+
+    assert result.had_errors is False
+    assert result.configs[0].has_file_credentials is False
+
+
+def test_no_key_file_ignores_credential_files(tmp_path: Path) -> None:
+    d = _checkout(tmp_path)
+    _, recipient = _keypair(tmp_path)
+    (d / "orders.yaml").write_text(_FULL_YAML)
+    _write_creds(d, "orders", recipient, {"password": "s3cr3t"})
+
+    result = load_pipeline_configs(str(tmp_path))
+
+    assert result.configs[0].source_credentials == {}
+    assert result.configs[0].has_file_credentials is False
+
+
+def test_unreadable_identity_degrades_and_warns_once(tmp_path: Path) -> None:
+    d = _checkout(tmp_path)
+    _, recipient = _keypair(tmp_path)
+    (d / "orders.yaml").write_text(_FULL_YAML)
+    _write_creds(d, "orders", recipient, {"password": "s3cr3t"})
+    pipeline_files._identity_warned = False
+
+    missing = str(tmp_path / "nope" / "key.txt")
+    result = load_pipeline_configs(str(tmp_path), missing)
+
+    assert result.had_errors is False
+    assert result.configs[0].has_file_credentials is False
+    assert pipeline_files._identity_warned is True

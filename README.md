@@ -16,6 +16,8 @@ Worker that runs declarative data pipelines via [dlt](https://dlthub.com/), writ
 
 In files mode the control plane poll is still made every tick, but only manual ("Run now") triggers and source credentials are consumed from it — definitions, schedules, and enablement come from the files. Credentials are cached in memory only, so a pipeline whose credentials were seen at least once keeps running through a control plane outage.
 
+When `AGE_KEY_FILE` additionally points at an [age](https://age-encryption.org/) identity file, source credentials are read from `pipelines/<name>.credentials.age` in the checkout (armored age ciphertext of the credentials JSON, encrypted to this worker's public key) and take precedence over polled credentials. A pipeline with a credential file then runs fully control-plane-independent — even a fresh worker process during an outage. A missing or undecryptable credential file degrades that one pipeline to polled/cached credentials. The companion `python -m dlt_worker.agekey <outdir>` command generates the keypair (used by the box seed job).
+
 ## Quick start
 
 ```bash
@@ -59,6 +61,7 @@ All configuration is via environment variables.
 | `PIPELINE_RETRY_BASE_DELAY` | `30`         | Base delay in seconds for exponential backoff                                         |
 | `SNAPSHOT_URL`              | _(empty)_    | URL to trigger a state snapshot sidecar after each pipeline run (disabled when empty) |
 | `PIPELINES_DIR`             | _(empty)_    | Files mode: checkout root holding `pipelines/*.yaml` definitions; unset = poll the control plane for definitions (legacy) |
+| `AGE_KEY_FILE`              | _(empty)_    | Files mode: path to the age identity file for decrypting `pipelines/*.credentials.age`; unset = credentials come from the poll only |
 | `OIDC_CLIENT_ID`            | _(empty)_    | OIDC client ID for Lakekeeper catalog auth **and** FairTier API bearer auth           |
 | `OIDC_CLIENT_SECRET`        | _(empty)_    | OIDC client secret for Lakekeeper catalog auth **and** FairTier API bearer auth       |
 | `OIDC_TOKEN_URL`            | _(empty)_    | OIDC token endpoint for Lakekeeper catalog auth **and** FairTier API bearer auth      |
