@@ -626,7 +626,8 @@ class TestBuildFilesystemTables:
         globs = [c.kwargs["file_glob"] for c in mock_fs.call_args_list]
         assert globs == ["orders.csv", "users.parquet", "events.jsonl"]
         mock_read_csv.assert_called_once_with()
-        mock_read_parquet.assert_called_once_with()
+        # Parquet takes dlt's Arrow-native fast path (skips the slow normalize).
+        mock_read_parquet.assert_called_once_with(use_pyarrow=True, chunksize=100_000)
         mock_read_jsonl.assert_called_once_with()
         # Each piped resource is named after its table.
         piped = mock_fs.return_value.__or__.return_value
@@ -1114,6 +1115,14 @@ class TestReaderFor:
         assert _reader_for("p", "a.parquet")[0] is read_parquet
         assert _reader_for("p", "a.jsonl")[0] is read_jsonl
         assert _reader_for("p", "a.ndjson")[0] is read_jsonl
+
+    def test_parquet_uses_arrow_fast_path(self) -> None:
+        """Parquet must yield native pyarrow batches so dlt skips the slow
+        row-by-row normalize. Without use_pyarrow, dlt converts every batch to
+        Python dicts (batch.to_pylist()) — a multi-minute bulk load became
+        seconds once this was set. Guard the regression."""
+        _, kwargs = _reader_for("p", "uploads/1/trips.parquet")
+        assert kwargs == {"use_pyarrow": True, "chunksize": 100_000}
 
     def test_unsupported_extension_raises(self) -> None:
         with pytest.raises(ValueError, match="unsupported file type"):

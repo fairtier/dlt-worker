@@ -410,7 +410,13 @@ def _reader_for(pipeline_name: str, file_glob: str) -> tuple[Any, dict[str, Any]
     if lower.endswith(".tsv"):
         return read_csv, {"sep": "\t"}
     if lower.endswith(".parquet"):
-        return read_parquet, {}
+        # Yield native pyarrow RecordBatches (use_pyarrow) rather than Python
+        # lists of dicts, so dlt takes its Arrow-native path and skips the
+        # single-threaded, row-by-row normalize — the bottleneck that made a
+        # few-million-row parquet backfill take many minutes on the box's one
+        # core. Larger batches cut per-batch overhead. Parquet is already typed
+        # columnar data, so nothing is lost by keeping it in Arrow.
+        return read_parquet, {"use_pyarrow": True, "chunksize": 100_000}
     if lower.endswith((".jsonl", ".ndjson")):
         return read_jsonl, {}
     raise ValueError(
