@@ -15,7 +15,7 @@ from typing import Any
 
 from croniter import croniter
 
-from dlt_worker import config
+from dlt_worker import config, iceberg_stream
 from dlt_worker.health import start_health_server
 from dlt_worker.pipeline_files import load_pipeline_configs
 from dlt_worker.pipeline_runner import run_pipeline, trigger_snapshot
@@ -91,6 +91,9 @@ def run() -> None:
     config.load()
 
     _configure_logging()
+
+    if config.ICEBERG_LOAD_CHUNK_ROWS > 0:
+        iceberg_stream.apply(config.ICEBERG_LOAD_CHUNK_ROWS)
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)

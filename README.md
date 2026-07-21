@@ -62,6 +62,7 @@ All configuration is via environment variables.
 | `SNAPSHOT_URL`              | _(empty)_    | URL to trigger a state snapshot sidecar after each pipeline run (disabled when empty) |
 | `PIPELINES_DIR`             | _(empty)_    | Files mode: checkout root holding `pipelines/*.yaml` definitions; unset = poll the control plane for definitions (legacy) |
 | `AGE_KEY_FILE`              | _(empty)_    | Files mode: path to the age identity file for decrypting `pipelines/*.credentials.age`; unset = credentials come from the poll only |
+| `ICEBERG_LOAD_CHUNK_ROWS`   | `200000`     | Rows per chunked Iceberg append — bounds peak memory during the load stage so large loads stream instead of materializing in RAM; `0` restores dlt's load-everything behavior |
 | `OIDC_CLIENT_ID`            | _(empty)_    | OIDC client ID for Lakekeeper catalog auth **and** FairTier API bearer auth           |
 | `OIDC_CLIENT_SECRET`        | _(empty)_    | OIDC client secret for Lakekeeper catalog auth **and** FairTier API bearer auth       |
 | `OIDC_TOKEN_URL`            | _(empty)_    | OIDC token endpoint for Lakekeeper catalog auth **and** FairTier API bearer auth      |

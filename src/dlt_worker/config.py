@@ -43,6 +43,10 @@ PIPELINES_DIR: str = ""
 # credentials. Unset = credentials come from the poll only (0.1.0
 # behavior). This is the Phase-3 rollback lever.
 AGE_KEY_FILE: str = ""
+# Rows per chunked Iceberg append (see iceberg_stream.py). Bounds the
+# worker's peak memory during the load stage; 0 disables the streamed
+# patch and restores dlt's materialize-everything behavior.
+ICEBERG_LOAD_CHUNK_ROWS: int = 200_000
 
 # AWS / S3
 AWS_ACCESS_KEY_ID: str = ""
@@ -72,7 +76,7 @@ def load() -> None:
     global CUSTOMER_SLUG, FAIRTIER_API_URL, LAKEKEEPER_URL
     global POLL_INTERVAL_SECONDS, DLT_STATE_DIR, HEALTHZ_PORT
     global PIPELINE_MAX_RETRIES, PIPELINE_RETRY_BASE_DELAY, SNAPSHOT_URL
-    global PIPELINES_DIR, AGE_KEY_FILE
+    global PIPELINES_DIR, AGE_KEY_FILE, ICEBERG_LOAD_CHUNK_ROWS
     global \
         AWS_ACCESS_KEY_ID, \
         AWS_SECRET_ACCESS_KEY, \
@@ -94,6 +98,7 @@ def load() -> None:
     SNAPSHOT_URL = os.environ.get("SNAPSHOT_URL", "")
     PIPELINES_DIR = os.environ.get("PIPELINES_DIR", "")
     AGE_KEY_FILE = os.environ.get("AGE_KEY_FILE", "")
+    ICEBERG_LOAD_CHUNK_ROWS = int(os.environ.get("ICEBERG_LOAD_CHUNK_ROWS", "200000"))
 
     AWS_ACCESS_KEY_ID = _require("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = _require("AWS_SECRET_ACCESS_KEY")
