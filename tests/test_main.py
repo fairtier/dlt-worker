@@ -401,14 +401,21 @@ class TestRunDuePipelinesFiles:
     ) -> None:
         """A pipeline unknown to scheduler.json adopts central's
         last_run_at instead of re-firing as "never ran"."""
-        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
-        recent = datetime.now(timezone.utc) - timedelta(minutes=1)
+        # The next cron fire must stay in the future for the duration of the
+        # test no matter when it runs: the fixed */5 schedule used before
+        # made this fail whenever the suite ran in the minute right after a
+        # 5-minute boundary (the pipeline really was due then). An hourly
+        # schedule anchored ~30 minutes away from "now" cannot come due.
+        now = datetime.now(timezone.utc)
+        schedule = f"{(now.minute + 30) % 60} * * * *"
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=schedule)
+        recent = now - timedelta(minutes=1)
         api_cfg = _make_config(id="p1", last_run_at=recent)
         client = self._client([api_cfg])
 
         succeeded = main._run_due_pipelines(client)
 
-        # Ran 1 minute ago on a */5 schedule — not due, and now seeded.
+        # Ran 1 minute ago, next fire ~30 minutes out — not due, now seeded.
         assert succeeded == set()
         mock_run.assert_not_called()
         assert SchedulerState.load(str(self.state_dir)).get("p1") == recent
@@ -419,10 +426,15 @@ class TestRunDuePipelinesFiles:
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
         """Once seeded, central's last_run_at is ignored (worker owns it)."""
-        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        # Anchored-away hourly schedule for the same reason as in
+        # test_migration_seeds_api_last_run_at_once: a fixed */5 schedule is
+        # genuinely due right after every 5-minute wall-clock boundary.
+        now = datetime.now(timezone.utc)
+        schedule = f"{(now.minute + 30) % 60} * * * *"
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=schedule)
         state = SchedulerState.load(str(self.state_dir))
-        state.record("p1", datetime.now(timezone.utc) - timedelta(minutes=1))
-        stale = datetime.now(timezone.utc) - timedelta(hours=2)
+        state.record("p1", now - timedelta(minutes=1))
+        stale = now - timedelta(hours=2)
         client = self._client([_make_config(id="p1", last_run_at=stale)])
 
         succeeded = main._run_due_pipelines(client)
