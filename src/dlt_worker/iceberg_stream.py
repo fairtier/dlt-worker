@@ -18,6 +18,7 @@ to the original implementation unchanged.
 
 from __future__ import annotations
 
+import gc
 import logging
 from typing import Any, Callable
 
@@ -96,11 +97,36 @@ def _streamed_run(job: Any, original_run: Callable[..., None], chunk_rows: int) 
         txn.append(ensure_iceberg_compatible_arrow_data(chunk))
         total_rows += chunk.num_rows
         chunks += 1
+        rows = chunk.num_rows
+        del chunk
+        # Arrow's default pool retains freed buffers; on a memory-limited
+        # worker the RSS would otherwise ratchet up across chunks.
+        pa.default_memory_pool().release_unused()
+        gc.collect()
+        logger.info(
+            "Iceberg streamed load: chunk %d (%d rows, %d total) appended to %s"
+            " [arrow allocated: %d]",
+            chunks,
+            rows,
+            total_rows,
+            job.load_table_name,
+            pa.total_allocated_bytes(),
+        )
 
     # batch_size caps what the scanner materializes per batch; the explicit
     # slicing below guarantees the bound even for sources that emit their
-    # batches as stored (in-memory datasets, oversized row groups).
-    for batch in ds.to_batches(batch_size=chunk_rows):
+    # batches as stored (in-memory datasets, oversized row groups). Readahead
+    # MUST be off: the default scanner prefetches up to 16 batches (plus 4
+    # fragments) in background threads, and local reads outpace the
+    # append-to-object-storage writes by so much that the prefetch queue
+    # quietly re-materializes most of the dataset in memory.
+    scanner = ds.scanner(
+        batch_size=chunk_rows,
+        batch_readahead=0,
+        fragment_readahead=0,
+        use_threads=False,
+    )
+    for batch in scanner.to_batches():
         for start in range(0, batch.num_rows, chunk_rows):
             piece = batch.slice(start, chunk_rows)
             buf.append(piece)
