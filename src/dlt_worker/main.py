@@ -93,7 +93,9 @@ def run() -> None:
     _configure_logging()
 
     if config.ICEBERG_LOAD_CHUNK_ROWS > 0:
-        iceberg_stream.apply(config.ICEBERG_LOAD_CHUNK_ROWS)
+        iceberg_stream.apply(
+            config.ICEBERG_LOAD_CHUNK_ROWS, config.ICEBERG_LOAD_COMMIT_EVERY
+        )
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)

@@ -47,6 +47,13 @@ AGE_KEY_FILE: str = ""
 # worker's peak memory during the load stage; 0 disables the streamed
 # patch and restores dlt's materialize-everything behavior.
 ICEBERG_LOAD_CHUNK_ROWS: int = 200_000
+# Commit the streamed Iceberg load every N appends (see iceberg_stream.py).
+# PyIceberg holds every appended data file's metadata in the open transaction
+# until commit; across hundreds of chunks that alone can OOM a small worker,
+# so we flush to a real snapshot periodically. 0 = single atomic commit at the
+# end (pre-0.2.5 behavior). Snapshot expiry in the maintenance CronJob reaps
+# the extra snapshots.
+ICEBERG_LOAD_COMMIT_EVERY: int = 20
 # Rows per parquet row group for dlt's intermediate extract/normalize files.
 # Bounds the worker's peak memory *before* the load stage: normalize rewrites
 # one row group at a time, so an uncapped row group (dlt lets pyarrow default
@@ -87,6 +94,7 @@ def load() -> None:
     global POLL_INTERVAL_SECONDS, DLT_STATE_DIR, HEALTHZ_PORT
     global PIPELINE_MAX_RETRIES, PIPELINE_RETRY_BASE_DELAY, SNAPSHOT_URL
     global PIPELINES_DIR, AGE_KEY_FILE, ICEBERG_LOAD_CHUNK_ROWS
+    global ICEBERG_LOAD_COMMIT_EVERY
     global DATA_WRITER_CHUNK_ROWS
     global \
         AWS_ACCESS_KEY_ID, \
@@ -110,6 +118,7 @@ def load() -> None:
     PIPELINES_DIR = os.environ.get("PIPELINES_DIR", "")
     AGE_KEY_FILE = os.environ.get("AGE_KEY_FILE", "")
     ICEBERG_LOAD_CHUNK_ROWS = int(os.environ.get("ICEBERG_LOAD_CHUNK_ROWS", "200000"))
+    ICEBERG_LOAD_COMMIT_EVERY = int(os.environ.get("ICEBERG_LOAD_COMMIT_EVERY", "20"))
     DATA_WRITER_CHUNK_ROWS = int(os.environ.get("DATA_WRITER_CHUNK_ROWS", "100000"))
 
     AWS_ACCESS_KEY_ID = _require("AWS_ACCESS_KEY_ID")
