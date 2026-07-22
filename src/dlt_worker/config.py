@@ -47,6 +47,16 @@ AGE_KEY_FILE: str = ""
 # worker's peak memory during the load stage; 0 disables the streamed
 # patch and restores dlt's materialize-everything behavior.
 ICEBERG_LOAD_CHUNK_ROWS: int = 200_000
+# Rows per parquet row group for dlt's intermediate extract/normalize files.
+# Bounds the worker's peak memory *before* the load stage: normalize rewrites
+# one row group at a time, so an uncapped row group (dlt lets pyarrow default
+# to ~1M rows) is read whole into RAM — enough to OOM a small worker before the
+# (already-bounded) load stage runs. Capping it makes normalize's per-read a
+# function of this value, not the dataset size. Matches the filesystem reader's
+# chunksize so the whole Arrow pipeline flows in uniform chunks. 0 disables the
+# bound and restores dlt defaults. See iceberg_stream.py for the matching
+# load-stage bound.
+DATA_WRITER_CHUNK_ROWS: int = 100_000
 
 # AWS / S3
 AWS_ACCESS_KEY_ID: str = ""
@@ -77,6 +87,7 @@ def load() -> None:
     global POLL_INTERVAL_SECONDS, DLT_STATE_DIR, HEALTHZ_PORT
     global PIPELINE_MAX_RETRIES, PIPELINE_RETRY_BASE_DELAY, SNAPSHOT_URL
     global PIPELINES_DIR, AGE_KEY_FILE, ICEBERG_LOAD_CHUNK_ROWS
+    global DATA_WRITER_CHUNK_ROWS
     global \
         AWS_ACCESS_KEY_ID, \
         AWS_SECRET_ACCESS_KEY, \
@@ -99,6 +110,7 @@ def load() -> None:
     PIPELINES_DIR = os.environ.get("PIPELINES_DIR", "")
     AGE_KEY_FILE = os.environ.get("AGE_KEY_FILE", "")
     ICEBERG_LOAD_CHUNK_ROWS = int(os.environ.get("ICEBERG_LOAD_CHUNK_ROWS", "200000"))
+    DATA_WRITER_CHUNK_ROWS = int(os.environ.get("DATA_WRITER_CHUNK_ROWS", "100000"))
 
     AWS_ACCESS_KEY_ID = _require("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = _require("AWS_SECRET_ACCESS_KEY")
@@ -136,6 +148,26 @@ def load() -> None:
     os.environ.setdefault(
         "DESTINATION__FILESYSTEM__CREDENTIALS__REGION_NAME", AWS_REGION
     )
+
+    # Bound extract- and normalize-stage memory so peak RSS is a function of
+    # the chunk size, not the dataset size. Without this a source that yields a
+    # large Arrow table makes dlt write a single million-row parquet row group,
+    # and normalize (which rewrites one row group at a time) reads that whole
+    # group into RAM — enough to OOM a small worker before the load stage even
+    # starts. Capping the parquet row-group size makes normalize's per-read (and
+    # the load scanner's) working set a function of the cap, not the data size.
+    # This is the GLOBAL `data_writer` section on purpose: the extract writer
+    # resolves its parquet config under `sources.*` and falls back to the global
+    # section — a stage-scoped `EXTRACT__`/`NORMALIZE__` prefix is silently
+    # ignored there (verified against dlt 1.22). We deliberately leave
+    # buffer_max_items at dlt's default (5000): raising it would only *increase*
+    # memory for row/dict sources, and the row-group cap already bounds the
+    # Arrow path. setdefault so an explicit dlt env override still wins. See
+    # iceberg_stream.py for the matching load-stage bound.
+    if DATA_WRITER_CHUNK_ROWS > 0:
+        os.environ.setdefault(
+            "DATA_WRITER__ROW_GROUP_SIZE", str(DATA_WRITER_CHUNK_ROWS)
+        )
 
     # Iceberg REST catalog config — dlt requires a single JSON env var for
     # dict-typed config (individual __-nested env vars are not resolved).

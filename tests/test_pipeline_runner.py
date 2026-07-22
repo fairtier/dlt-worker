@@ -627,7 +627,9 @@ class TestBuildFilesystemTables:
         assert globs == ["orders.csv", "users.parquet", "events.jsonl"]
         mock_read_csv.assert_called_once_with()
         # Parquet takes dlt's Arrow-native fast path (skips the slow normalize).
-        mock_read_parquet.assert_called_once_with(use_pyarrow=True, chunksize=100_000)
+        mock_read_parquet.assert_called_once_with(
+            use_pyarrow=True, chunksize=config.DATA_WRITER_CHUNK_ROWS
+        )
         mock_read_jsonl.assert_called_once_with()
         # Each piped resource is named after its table.
         piped = mock_fs.return_value.__or__.return_value
@@ -1122,7 +1124,11 @@ class TestReaderFor:
         Python dicts (batch.to_pylist()) — a multi-minute bulk load became
         seconds once this was set. Guard the regression."""
         _, kwargs = _reader_for("p", "uploads/1/trips.parquet")
-        assert kwargs == {"use_pyarrow": True, "chunksize": 100_000}
+        # chunksize is aligned to the configured row-group cap (default 100k).
+        assert kwargs == {
+            "use_pyarrow": True,
+            "chunksize": config.DATA_WRITER_CHUNK_ROWS,
+        }
 
     def test_unsupported_extension_raises(self) -> None:
         with pytest.raises(ValueError, match="unsupported file type"):

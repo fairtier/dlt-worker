@@ -416,7 +416,13 @@ def _reader_for(pipeline_name: str, file_glob: str) -> tuple[Any, dict[str, Any]
         # few-million-row parquet backfill take many minutes on the box's one
         # core. Larger batches cut per-batch overhead. Parquet is already typed
         # columnar data, so nothing is lost by keeping it in Arrow.
-        return read_parquet, {"use_pyarrow": True, "chunksize": 100_000}
+        #
+        # chunksize == the downstream row-group cap so the whole Arrow pipeline
+        # flows in uniform, memory-bounded chunks (see config.DATA_WRITER_CHUNK_ROWS
+        # / iceberg_stream.py). Fall back to a bounded default when the row-group
+        # cap is disabled (0): the reader must stay bounded regardless.
+        chunk = config.DATA_WRITER_CHUNK_ROWS or 100_000
+        return read_parquet, {"use_pyarrow": True, "chunksize": chunk}
     if lower.endswith((".jsonl", ".ndjson")):
         return read_jsonl, {}
     raise ValueError(
