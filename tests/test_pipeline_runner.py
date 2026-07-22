@@ -559,12 +559,56 @@ class TestBuildGoogleSheetsSource:
         ):
             _build_google_sheets_source(cfg)
 
-    def test_missing_service_account_key_raises(
+    def test_missing_credentials_raises(
         self, mock_creds: MagicMock, mock_session_cls: MagicMock
     ) -> None:
         cfg = self._sheets_config(source_credentials={})
 
-        with pytest.raises(ValueError, match="missing required 'service_account_key'"):
+        with pytest.raises(
+            ValueError, match="missing required 'oauth' or 'service_account_key'"
+        ):
+            _build_google_sheets_source(cfg)
+
+    @patch("google.oauth2.credentials.Credentials")
+    def test_oauth_credentials(
+        self,
+        mock_oauth_creds: MagicMock,
+        mock_creds: MagicMock,
+        mock_session_cls: MagicMock,
+    ) -> None:
+        """OAuth creds build a refreshable user credential, not a service account."""
+        session = mock_session_cls.return_value
+        session.get.return_value = self._response(
+            {"valueRanges": [{"values": [["id"], [1]]}]}
+        )
+        cfg = self._sheets_config(
+            source_credentials={
+                "oauth": {
+                    "client_id": "cid",
+                    "client_secret": "csecret",
+                    "refresh_token": "rtok",
+                }
+            },
+        )
+
+        _build_google_sheets_source(cfg)
+
+        mock_creds.assert_not_called()
+        mock_oauth_creds.assert_called_once()
+        kwargs = mock_oauth_creds.call_args.kwargs
+        assert kwargs["refresh_token"] == "rtok"
+        assert kwargs["client_id"] == "cid"
+        assert kwargs["client_secret"] == "csecret"
+        assert mock_oauth_creds.call_args.args[0] is None
+
+    def test_oauth_missing_field_raises(
+        self, mock_creds: MagicMock, mock_session_cls: MagicMock
+    ) -> None:
+        cfg = self._sheets_config(
+            source_credentials={"oauth": {"client_id": "cid"}},
+        )
+
+        with pytest.raises(ValueError, match="oauth missing required"):
             _build_google_sheets_source(cfg)
 
     def test_empty_spreadsheet_raises(

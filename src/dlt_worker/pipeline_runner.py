@@ -320,17 +320,63 @@ def _rows_to_records(
     return records
 
 
+def _google_sheets_credentials(cfg: PipelineConfig) -> Any:
+    """Build read-only Sheets credentials from either OAuth or a service-account
+    key. Exactly one of the two credential methods must be present.
+    """
+    oauth = cfg.source_credentials.get("oauth")
+    key_info = cfg.source_credentials.get("service_account_key")
+
+    if oauth:
+        from google.oauth2.credentials import Credentials as OAuthCredentials
+
+        missing = [
+            k for k in ("client_id", "client_secret", "refresh_token") if not oauth.get(k)
+        ]
+        if missing:
+            raise ValueError(
+                f"Pipeline {cfg.name!r}: source_credentials oauth missing "
+                f"required {', '.join(missing)!r}"
+            )
+        # token=None forces AuthorizedSession to mint an access token from the
+        # refresh token on the first request.
+        return OAuthCredentials(
+            None,
+            refresh_token=oauth["refresh_token"],
+            client_id=oauth["client_id"],
+            client_secret=oauth["client_secret"],
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=[_SHEETS_SCOPE],
+        )
+
+    if key_info:
+        from google.oauth2.service_account import Credentials
+
+        if isinstance(key_info, str):
+            key_info = json.loads(key_info)
+        return Credentials.from_service_account_info(key_info, scopes=[_SHEETS_SCOPE])
+
+    raise ValueError(
+        f"Pipeline {cfg.name!r}: source_credentials missing required "
+        "'oauth' or 'service_account_key'"
+    )
+
+
 def _build_google_sheets_source(cfg: PipelineConfig) -> Any:
     """Read spreadsheet ranges via the Sheets API into one resource per range.
 
     source_config: spreadsheet_url_or_id (required), range_names (optional —
     tab names, "Tab!A1:D" ranges, or named ranges; defaults to every tab).
-    source_credentials: service_account_key — the GCP service-account key JSON
-    (object or string); the spreadsheet must be shared read-only with the
-    key's client_email. The first row of each range is the header row.
+    source_credentials carries exactly one method:
+      - oauth: a delegated-user grant from the "Sign in with Google" flow —
+        {client_id, client_secret, refresh_token}; the FairTier API injects the
+        central client pair before serving. The easy path for ordinary users.
+      - service_account_key: the GCP service-account key JSON (object or
+        string); the spreadsheet must be shared read-only with the key's
+        client_email. The advanced/automation path.
+    The first row of each range is the header row.
     """
     from google.auth.transport.requests import AuthorizedSession
-    from google.oauth2.service_account import Credentials
 
     src_cfg = cfg.source_config
 
@@ -342,18 +388,7 @@ def _build_google_sheets_source(cfg: PipelineConfig) -> Any:
             "'spreadsheet_url_or_id'"
         ) from None
 
-    key_info = cfg.source_credentials.get("service_account_key")
-    if not key_info:
-        raise ValueError(
-            f"Pipeline {cfg.name!r}: source_credentials missing required "
-            "'service_account_key'"
-        )
-    if isinstance(key_info, str):
-        key_info = json.loads(key_info)
-
-    credentials = Credentials.from_service_account_info(
-        key_info, scopes=[_SHEETS_SCOPE]
-    )
+    credentials = _google_sheets_credentials(cfg)
     session = AuthorizedSession(credentials)
     base = f"{_SHEETS_API_BASE}/{_spreadsheet_id(spreadsheet)}"
 
