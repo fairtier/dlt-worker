@@ -24,6 +24,14 @@ metadata drop plus streamed appends avoids entirely. Table creation and the
 merge/upsert path (which needs the full table for its join) are delegated
 to the original implementation unchanged.
 
+Before appending, any *required* table column the incoming data doesn't
+provide is relaxed to optional (metadata-only, always forward-compatible):
+tables created by dlt's row-by-row normalize carry required
+``_dlt_load_id``/``_dlt_id`` columns that the Arrow-native read path never
+populates, and PyIceberg rejects such appends outright — an error dlt then
+retries as if transient. Any schema rejection that still occurs is raised
+as a terminal destination error rather than left to dlt's retry loop.
+
 Every append is bracketed by an RSS + wall-clock log line. A single 200k-row
 append taking minutes or the RSS climbing across chunks are the two ways this
 load can still OOM a small box; the trace makes which one it is unambiguous
@@ -104,7 +112,10 @@ def _streamed_run(
     chunk_rows: int,
     commit_every: int,
 ) -> None:
-    from dlt.common.destination.exceptions import DestinationUndefinedEntity
+    from dlt.common.destination.exceptions import (
+        DestinationTerminalException,
+        DestinationUndefinedEntity,
+    )
     from dlt.common.libs.pyarrow import pyarrow as pa
     from dlt.common.libs.pyiceberg import ensure_iceberg_compatible_arrow_data
     from pyiceberg.expressions import AlwaysTrue
@@ -173,6 +184,28 @@ def _streamed_run(
             "iceberg", job.load_table_name, schema=ds.schema
         )
 
+    # Required table columns the incoming data doesn't provide can never be
+    # satisfied by an append — PyIceberg rejects every write outright, and dlt
+    # retries the rejection as if it were transient. It happens for real: a
+    # table created by dlt's row-by-row normalize has required _dlt_load_id /
+    # _dlt_id columns, but the Arrow-native read path (v0.2.1) doesn't add
+    # them, so every later load of that table is rejected. Relaxing the
+    # columns to optional is metadata-only and always forward-compatible.
+    data_names = set(ds.schema.names)
+    missing_required = [
+        f.name for f in table.schema().fields if f.required and f.name not in data_names
+    ]
+    if missing_required:
+        logger.warning(
+            "Iceberg streamed load: required column(s) %s of %s are missing from"
+            " the incoming data; making them optional so the load can proceed",
+            ", ".join(missing_required),
+            job.load_table_name,
+        )
+        with table.update_schema() as update:
+            for name in missing_required:
+                update.make_column_optional(name)
+
     txn = table.transaction()
     pending = False  # the current txn holds uncommitted appends
 
@@ -200,7 +233,17 @@ def _streamed_run(
             _rss_mb(),
         )
         started = time.monotonic()
-        txn.append(ensure_iceberg_compatible_arrow_data(chunk))
+        try:
+            txn.append(ensure_iceberg_compatible_arrow_data(chunk))
+        except ValueError as exc:
+            # PyIceberg rejects schema-incompatible data with a bare
+            # ValueError, which dlt's load treats as transient — the job is
+            # retried with backoff and an unfixable mismatch turns into an
+            # hours-long silent "hang". Deterministic rejection is terminal.
+            raise DestinationTerminalException(
+                f"Iceberg streamed load: schema-incompatible append to"
+                f" {job.load_table_name}: {exc}"
+            ) from exc
         total_rows += rows
         pending = True
         del chunk

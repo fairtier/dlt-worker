@@ -1,6 +1,6 @@
 [project]
 name = "dlt-worker"
-version = "0.2.6"
+version = "0.2.7"
 description = "Worker that runs dlt pipelines from file-based definitions (or the FairTier API) on a schedule"
 readme = "README.md"
 license = "Apache-2.0"

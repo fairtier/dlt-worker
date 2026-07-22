@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pyarrow.dataset
+import pytest
 
-from dlt.common.destination.exceptions import DestinationUndefinedEntity
+from dlt.common.destination.exceptions import (
+    DestinationTerminalException,
+    DestinationUndefinedEntity,
+)
 
 from dlt_worker import iceberg_stream
 
@@ -24,12 +29,15 @@ def _arrow_dataset(num_rows: int) -> Any:
 
 
 class _FakeTxn:
-    def __init__(self) -> None:
+    def __init__(self, append_error: Exception | None = None) -> None:
         self.appended: list[pa.Table] = []
         self.committed = False
+        self._append_error = append_error
 
     def append(self, df: pa.Table) -> None:
         assert not self.committed, "append after commit — stale transaction reused"
+        if self._append_error is not None:
+            raise self._append_error
         self.appended.append(df)
 
     def commit_transaction(self) -> None:
@@ -37,18 +45,52 @@ class _FakeTxn:
         self.committed = True
 
 
+class _FakeUpdateSchema:
+    def __init__(self, table: "_FakeTable") -> None:
+        self._table = table
+
+    def __enter__(self) -> "_FakeUpdateSchema":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        pass
+
+    def make_column_optional(self, name: str) -> None:
+        field = next(f for f in self._table.fields if f.name == name)
+        assert field.required, f"make_column_optional on already-optional {name}"
+        field.required = False
+        self._table.relaxed.append(name)
+
+
 class _FakeTable:
     """A fresh transaction on every transaction() call (mirrors PyIceberg) so
     the periodic commit — which reopens a transaction after each interim
     commit — is exercised faithfully. `delete` is the standalone truncate the
-    replace path commits before any appends."""
+    replace path commits before any appends. `fields` is the table schema as
+    (name, required) pairs; defaults to the _arrow_dataset columns, optional."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        fields: list[tuple[str, bool]] | None = None,
+        append_error: Exception | None = None,
+    ) -> None:
         self.txns: list[_FakeTxn] = []
         self.deletes: list[Any] = []
+        self.fields = [
+            SimpleNamespace(name=n, required=r)
+            for n, r in (fields or [("id", False), ("name", False)])
+        ]
+        self.relaxed: list[str] = []
+        self._append_error = append_error
+
+    def schema(self) -> Any:
+        return SimpleNamespace(fields=self.fields)
+
+    def update_schema(self) -> _FakeUpdateSchema:
+        return _FakeUpdateSchema(self)
 
     def transaction(self) -> _FakeTxn:
-        txn = _FakeTxn()
+        txn = _FakeTxn(self._append_error)
         self.txns.append(txn)
         return txn
 
@@ -63,10 +105,16 @@ class _FakeJob:
 
     load_table_name = "yellow_trips"
 
-    def __init__(self, disposition: str, num_rows: int) -> None:
+    def __init__(
+        self,
+        disposition: str,
+        num_rows: int,
+        table_fields: list[tuple[str, bool]] | None = None,
+        append_error: Exception | None = None,
+    ) -> None:
         self._load_table = {"write_disposition": disposition}
         self._ds = _arrow_dataset(num_rows)
-        self.table = _FakeTable()
+        self.table = _FakeTable(table_fields, append_error)
         self._job_client = MagicMock()
         self._job_client.load_open_table.return_value = self.table
 
@@ -162,6 +210,61 @@ def test_replace_of_empty_dataset_still_truncates() -> None:
     assert len(job.deletes) == 1
     assert not job.appended
     assert job.commit_count == 0
+
+
+def test_missing_required_columns_relaxed_to_optional() -> None:
+    # The live-box failure: yellow_trips was created by dlt's row-by-row
+    # normalize with required _dlt_load_id/_dlt_id, but the Arrow-native read
+    # path doesn't produce those columns — PyIceberg rejected every append.
+    job = _FakeJob(
+        "append",
+        num_rows=500,
+        table_fields=[
+            ("id", False),
+            ("name", False),
+            ("_dlt_load_id", True),
+            ("_dlt_id", True),
+        ],
+    )
+    original = MagicMock()
+
+    iceberg_stream._streamed_run(job, original, chunk_rows=1_000, commit_every=20)
+
+    assert sorted(job.table.relaxed) == ["_dlt_id", "_dlt_load_id"]
+    assert all(not f.required for f in job.table.fields)
+    assert sum(t.num_rows for t in job.appended) == 500
+    assert job.all_committed
+
+
+def test_required_columns_present_in_data_left_alone() -> None:
+    # Required columns the data DOES provide must stay required.
+    job = _FakeJob(
+        "append",
+        num_rows=500,
+        table_fields=[("id", True), ("name", True)],
+    )
+    original = MagicMock()
+
+    iceberg_stream._streamed_run(job, original, chunk_rows=1_000, commit_every=20)
+
+    assert job.table.relaxed == []
+    assert all(f.required for f in job.table.fields)
+    assert sum(t.num_rows for t in job.appended) == 500
+
+
+def test_schema_rejected_append_is_terminal() -> None:
+    # PyIceberg signals incompatible data with a bare ValueError; dlt would
+    # retry that forever. The streamed path must convert it to a terminal
+    # destination error so the run fails visibly.
+    job = _FakeJob(
+        "append", num_rows=500, append_error=ValueError("Mismatch in fields")
+    )
+    original = MagicMock()
+
+    with pytest.raises(DestinationTerminalException, match="Mismatch in fields"):
+        iceberg_stream._streamed_run(job, original, chunk_rows=1_000, commit_every=20)
+
+    original.assert_not_called()
 
 
 def test_merge_delegates_to_original() -> None:
