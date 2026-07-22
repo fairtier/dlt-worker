@@ -285,13 +285,31 @@ def _streamed_run(
     # MUST be off: the default scanner prefetches up to 16 batches (plus 4
     # fragments) in background threads, and local reads outpace the
     # append-to-object-storage writes by so much that the prefetch queue
-    # quietly re-materializes most of the dataset in memory.
-    scanner = ds.scanner(
+    # quietly re-materializes most of the dataset in memory. pre_buffer MUST
+    # also be off: the parquet default coalesces and CACHES column-chunk
+    # ranges as the scan advances through a fragment and holds them until the
+    # fragment is exhausted, so the Arrow pool grows monotonically toward the
+    # load-package file's size no matter how small the batches are (measured:
+    # ~4MB retained per 200k-row chunk of taxi data; killed the 41M-row
+    # Minimal-tier run at chunk 100 with 487MB of pool). With it off the pool
+    # stays flat at ~one batch. Non-parquet datasets ignore the option.
+    scanner_kwargs: dict[str, Any] = dict(
         batch_size=chunk_rows,
         batch_readahead=0,
         fragment_readahead=0,
         use_threads=False,
     )
+    try:
+        import pyarrow.dataset as pads
+
+        scanner = ds.scanner(
+            fragment_scan_options=pads.ParquetFragmentScanOptions(pre_buffer=False),
+            **scanner_kwargs,
+        )
+    except (TypeError, ValueError):
+        # Exotic dataset/format that rejects parquet scan options — the
+        # memory-growth fix doesn't apply there, streaming still does.
+        scanner = ds.scanner(**scanner_kwargs)
     for batch in scanner.to_batches():
         for start in range(0, batch.num_rows, chunk_rows):
             piece = batch.slice(start, chunk_rows)
