@@ -26,67 +26,75 @@ def _arrow_dataset(num_rows: int) -> Any:
 class _FakeTxn:
     def __init__(self) -> None:
         self.appended: list[pa.Table] = []
-        self.deletes: list[Any] = []
         self.committed = False
 
     def append(self, df: pa.Table) -> None:
         assert not self.committed, "append after commit — stale transaction reused"
         self.appended.append(df)
 
-    def delete(self, delete_filter: Any) -> None:
-        assert not self.appended, "replace must truncate before appending"
-        self.deletes.append(delete_filter)
-
     def commit_transaction(self) -> None:
         assert not self.committed, "double commit"
         self.committed = True
 
 
+class _FakeTable:
+    """A fresh transaction on every transaction() call (mirrors PyIceberg) so
+    the periodic commit — which reopens a transaction after each interim
+    commit — is exercised faithfully. `delete` is the standalone truncate the
+    replace path commits before any appends."""
+
+    def __init__(self) -> None:
+        self.txns: list[_FakeTxn] = []
+        self.deletes: list[Any] = []
+
+    def transaction(self) -> _FakeTxn:
+        txn = _FakeTxn()
+        self.txns.append(txn)
+        return txn
+
+    def delete(self, delete_filter: Any) -> None:
+        # truncate must land before any append transaction is opened
+        assert not self.txns, "replace truncate must precede the append stream"
+        self.deletes.append(delete_filter)
+
+
 class _FakeJob:
-    """Just the attributes _streamed_run touches. A fresh transaction is handed
-    out on every table.transaction() call (mirrors PyIceberg) so the periodic
-    commit — which starts a new transaction after each interim commit — is
-    exercised faithfully."""
+    """Just the attributes _streamed_run touches."""
 
     load_table_name = "yellow_trips"
 
     def __init__(self, disposition: str, num_rows: int) -> None:
         self._load_table = {"write_disposition": disposition}
         self._ds = _arrow_dataset(num_rows)
-        self.txns: list[_FakeTxn] = []
-        table = MagicMock()
-        table.transaction.side_effect = self._new_txn
+        self.table = _FakeTable()
         self._job_client = MagicMock()
-        self._job_client.load_open_table.return_value = table
-
-    def _new_txn(self) -> _FakeTxn:
-        txn = _FakeTxn()
-        self.txns.append(txn)
-        return txn
+        self._job_client.load_open_table.return_value = self.table
 
     @property
     def arrow_dataset(self) -> Any:
         return self._ds
 
-    # --- aggregate helpers across all transactions -----------------------
+    # --- aggregate helpers ----------------------------------------------
+    @property
+    def txns(self) -> list[_FakeTxn]:
+        return self.table.txns
+
     @property
     def appended(self) -> list[pa.Table]:
-        return [t for txn in self.txns for t in txn.appended]
+        return [t for txn in self.table.txns for t in txn.appended]
 
     @property
     def deletes(self) -> list[Any]:
-        return [d for txn in self.txns for d in txn.deletes]
+        return self.table.deletes
 
     @property
     def commit_count(self) -> int:
-        return sum(1 for txn in self.txns if txn.committed)
+        return sum(1 for txn in self.table.txns if txn.committed)
 
     @property
     def all_committed(self) -> bool:
-        # every transaction that received work must have been committed
-        return all(
-            txn.committed for txn in self.txns if txn.appended or txn.deletes
-        )
+        # every transaction that received appends must have been committed
+        return all(txn.committed for txn in self.table.txns if txn.appended)
 
 
 def test_append_streams_in_chunks() -> None:
@@ -149,9 +157,11 @@ def test_replace_of_empty_dataset_still_truncates() -> None:
 
     iceberg_stream._streamed_run(job, original, chunk_rows=1_000, commit_every=20)
 
+    # the standalone truncate empties the table; no append transaction is
+    # committed because there is nothing to append.
     assert len(job.deletes) == 1
     assert not job.appended
-    assert job.commit_count == 1
+    assert job.commit_count == 0
 
 
 def test_merge_delegates_to_original() -> None:

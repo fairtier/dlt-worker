@@ -14,7 +14,13 @@ writes data files eagerly on every ``append``; we commit every
 accumulated snapshot/manifest state — which grows with the number of
 appends, not the chunk size — can never itself outgrow the worker. Peak
 memory is therefore one chunk plus at most ``commit_every`` chunks' worth of
-file metadata, regardless of dataset size. Table creation and the
+file metadata, regardless of dataset size.
+
+``replace`` truncates the table in its OWN committed transaction first, then
+streams the new rows as plain appends. Truncating *inside* the append
+transaction is what makes PyIceberg take its copy-on-write delete path,
+loading the existing table into RAM to filter it — the OOM that a whole-table
+metadata drop plus streamed appends avoids entirely. Table creation and the
 merge/upsert path (which needs the full table for its join) are delegated
 to the original implementation unchanged.
 
@@ -141,12 +147,34 @@ def _streamed_run(
         _rss_mb(),
     )
 
-    txn = table.transaction()
-    pending = False  # the current txn holds uncommitted work (delete/appends)
     if disposition == "replace":
-        # Truncate up front; this must be committed even if no rows follow.
-        txn.delete(delete_filter=AlwaysTrue())
-        pending = True
+        # Truncate in its OWN committed transaction, never mixed with the
+        # appends below. A delete-all combined with appends in one transaction
+        # drives PyIceberg down its copy-on-write rewrite path — it loads the
+        # *existing* table's data files into memory to filter them (see
+        # Table.delete: `rewrites_needed` -> ArrowScan.to_table per file),
+        # which OOM-kills a small worker on a non-trivial table. On its own,
+        # a whole-table delete drops files by metadata. Truncate-then-append
+        # also makes the append path here identical to the plain-append case.
+        trunc_started = time.monotonic()
+        logger.info(
+            "Iceberg streamed load: truncating %s for replace [rss=%dMB]",
+            job.load_table_name,
+            _rss_mb(),
+        )
+        table.delete(delete_filter=AlwaysTrue())
+        logger.info(
+            "Iceberg streamed load: truncated in %.1fs [rss=%dMB]",
+            time.monotonic() - trunc_started,
+            _rss_mb(),
+        )
+        # Re-open on the now-empty table so the appends build on a clean base.
+        table = job._job_client.load_open_table(
+            "iceberg", job.load_table_name, schema=ds.schema
+        )
+
+    txn = table.transaction()
+    pending = False  # the current txn holds uncommitted appends
 
     buf: list[Any] = []
     buf_rows = 0
