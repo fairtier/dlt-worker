@@ -331,7 +331,9 @@ def _google_sheets_credentials(cfg: PipelineConfig) -> Any:
         from google.oauth2.credentials import Credentials as OAuthCredentials
 
         missing = [
-            k for k in ("client_id", "client_secret", "refresh_token") if not oauth.get(k)
+            k
+            for k in ("client_id", "client_secret", "refresh_token")
+            if not oauth.get(k)
         ]
         if missing:
             raise ValueError(
