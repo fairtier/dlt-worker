@@ -128,7 +128,7 @@ class TestRunWithRetry:
         config.PIPELINE_RETRY_BASE_DELAY = 30
         main._shutdown = False
 
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_success_first_attempt(self, mock_run: MagicMock) -> None:
         """No retry when first attempt succeeds."""
         cfg = _make_config()
@@ -143,7 +143,7 @@ class TestRunWithRetry:
         assert client.report_pipeline_run.call_args[0][0].status == "success"
 
     @patch("dlt_worker.main.time.sleep")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_fail_then_succeed(
         self, mock_run: MagicMock, mock_sleep: MagicMock
     ) -> None:
@@ -161,7 +161,7 @@ class TestRunWithRetry:
         assert client.report_pipeline_run.call_args[0][0].status == "success"
 
     @patch("dlt_worker.main.time.sleep")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_all_attempts_fail(
         self, mock_run: MagicMock, mock_sleep: MagicMock
     ) -> None:
@@ -179,7 +179,7 @@ class TestRunWithRetry:
         assert client.report_pipeline_run.call_args[0][0].status == "failed"
 
     @patch("dlt_worker.main.time.sleep")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_shutdown_during_retry_wait(
         self,
         mock_run: MagicMock,
@@ -210,7 +210,7 @@ class TestRunWithRetry:
         assert client.report_pipeline_run.call_args[0][0].status == "failed"
 
     @patch("dlt_worker.main.time.sleep")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_exponential_backoff_delays(
         self,
         mock_run: MagicMock,
@@ -229,7 +229,7 @@ class TestRunWithRetry:
         assert mock_sleep.call_count == 30
 
     @patch("dlt_worker.main.time.sleep")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_run_id_propagated(
         self, mock_run: MagicMock, mock_sleep: MagicMock
     ) -> None:
@@ -303,7 +303,7 @@ class TestRunDuePipelinesFiles:
         return client
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_dispatcher_uses_files_mode(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -318,7 +318,7 @@ class TestRunDuePipelinesFiles:
         client.get_pipeline_configs.assert_not_called()
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_central_down_scheduled_run_fires_with_cached_creds(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -345,7 +345,7 @@ class TestRunDuePipelinesFiles:
         assert ran_cfg.source_credentials == {"key": "s3cr3t"}
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_central_down_no_cached_creds_skips_gracefully(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -360,7 +360,7 @@ class TestRunDuePipelinesFiles:
         assert SchedulerState.load(str(self.state_dir)).get("p1") is None
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_trigger_now_joined_by_id(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -379,7 +379,7 @@ class TestRunDuePipelinesFiles:
         assert running.run_id == "run-9"
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_polled_definitions_ignored(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -395,7 +395,7 @@ class TestRunDuePipelinesFiles:
         mock_run.assert_not_called()
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_migration_seeds_api_last_run_at_once(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -421,7 +421,7 @@ class TestRunDuePipelinesFiles:
         assert SchedulerState.load(str(self.state_dir)).get("p1") == recent
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_local_state_wins_over_polled_last_run_at(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -443,7 +443,7 @@ class TestRunDuePipelinesFiles:
         mock_run.assert_not_called()
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_success_recorded_failure_not(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -491,7 +491,7 @@ class TestRunDuePipelinesFiles:
             )
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_fresh_process_central_down_runs_from_credential_file(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -512,7 +512,7 @@ class TestRunDuePipelinesFiles:
         assert ran_cfg.source_credentials == {"password": "fr0m-f1le"}
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_file_credentials_win_over_polled(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -534,7 +534,7 @@ class TestRunDuePipelinesFiles:
         assert ran_cfg.source_credentials == {"password": "fr0m-f1le"}
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_no_credential_file_keeps_cache_fallback(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -555,7 +555,7 @@ class TestRunDuePipelinesFiles:
         assert succeeded == {"p1"}
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_prune_on_file_removal(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -572,7 +572,7 @@ class TestRunDuePipelinesFiles:
         assert reloaded.get("gone") is None
 
     @patch("dlt_worker.main.trigger_snapshot")
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_prune_suppressed_on_bad_file(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
@@ -587,7 +587,7 @@ class TestRunDuePipelinesFiles:
 
         assert SchedulerState.load(str(self.state_dir)).get("p-broken") == kept
 
-    @patch("dlt_worker.main.run_pipeline")
+    @patch("dlt_worker.main.run_pipeline_isolated")
     def test_legacy_mode_untouched(self, mock_run: MagicMock) -> None:
         """PIPELINES_DIR unset = 0.0.11 behavior: poll is full truth and
         scheduler.json is never created."""

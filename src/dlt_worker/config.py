@@ -54,6 +54,13 @@ ICEBERG_LOAD_CHUNK_ROWS: int = 200_000
 # end (pre-0.2.5 behavior). Snapshot expiry in the maintenance CronJob reaps
 # the extra snapshots.
 ICEBERG_LOAD_COMMIT_EVERY: int = 20
+# Run each pipeline in a short-lived spawned subprocess (see
+# run_isolation.py). A big dlt run leaves ~1 GB resident (Arrow buffers,
+# dlt caches, allocator free lists) that Python never returns to the OS —
+# process exit does. Also contains OOM kills to the run: the kernel kills
+# the child, the worker reports a failed run and lives on. 0/false = run
+# in-process (pre-0.3.0 behavior). This is the rollback lever.
+PIPELINE_SUBPROCESS: bool = True
 # Rows per parquet row group for dlt's intermediate extract/normalize files.
 # Bounds the worker's peak memory *before* the load stage: normalize rewrites
 # one row group at a time, so an uncapped row group (dlt lets pyarrow default
@@ -95,6 +102,7 @@ def load() -> None:
     global PIPELINE_MAX_RETRIES, PIPELINE_RETRY_BASE_DELAY, SNAPSHOT_URL
     global PIPELINES_DIR, AGE_KEY_FILE, ICEBERG_LOAD_CHUNK_ROWS
     global ICEBERG_LOAD_COMMIT_EVERY
+    global PIPELINE_SUBPROCESS
     global DATA_WRITER_CHUNK_ROWS
     global \
         AWS_ACCESS_KEY_ID, \
@@ -119,6 +127,11 @@ def load() -> None:
     AGE_KEY_FILE = os.environ.get("AGE_KEY_FILE", "")
     ICEBERG_LOAD_CHUNK_ROWS = int(os.environ.get("ICEBERG_LOAD_CHUNK_ROWS", "200000"))
     ICEBERG_LOAD_COMMIT_EVERY = int(os.environ.get("ICEBERG_LOAD_COMMIT_EVERY", "20"))
+    PIPELINE_SUBPROCESS = os.environ.get("PIPELINE_SUBPROCESS", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
     DATA_WRITER_CHUNK_ROWS = int(os.environ.get("DATA_WRITER_CHUNK_ROWS", "100000"))
 
     AWS_ACCESS_KEY_ID = _require("AWS_ACCESS_KEY_ID")

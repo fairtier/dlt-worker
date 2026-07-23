@@ -18,7 +18,8 @@ from croniter import croniter
 from dlt_worker import config, iceberg_stream
 from dlt_worker.health import start_health_server
 from dlt_worker.pipeline_files import load_pipeline_configs
-from dlt_worker.pipeline_runner import run_pipeline, trigger_snapshot
+from dlt_worker.pipeline_runner import trigger_snapshot
+from dlt_worker.run_isolation import run_pipeline_isolated
 from dlt_worker.scheduler_state import SchedulerState
 from dlt_worker.transformation_runner import run_transformation
 from dlt_worker.api_client import (
@@ -348,7 +349,7 @@ def _run_with_retry(
     report: PipelineRunReport | None = None
 
     for attempt in range(max_attempts):
-        report = run_pipeline(cfg)
+        report = run_pipeline_isolated(cfg)
         if run_id:
             report.run_id = run_id
 
