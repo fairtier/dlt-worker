@@ -274,6 +274,34 @@ def _spreadsheet_id(url_or_id: str) -> str:
     return m.group(1) if m else url_or_id
 
 
+def _raise_for_sheets_status(resp: Any, pipeline_name: str) -> None:
+    """Like resp.raise_for_status(), but surface the Sheets API error message.
+
+    requests' default HTTPError includes only the status + URL, discarding the
+    JSON body where Google explains *why* (e.g. "Unable to parse range:
+    Sheet1!A1:D" when a range names a tab that doesn't exist). Re-raise as a
+    ValueError carrying that message so the failure is actionable.
+    """
+    if resp.ok:
+        return
+    message = ""
+    try:
+        message = resp.json().get("error", {}).get("message", "")
+    except ValueError:
+        message = (resp.text or "").strip()
+    detail = f": {message}" if message else ""
+    hint = ""
+    if "unable to parse range" in message.lower():
+        hint = (
+            " — check that each range's tab name exists in the spreadsheet "
+            "(tab names are case-sensitive; clear range_names to load every tab)"
+        )
+    raise ValueError(
+        f"Pipeline {pipeline_name!r}: Google Sheets API returned "
+        f"{resp.status_code}{detail}{hint}"
+    )
+
+
 def _range_table_name(range_name: str) -> str:
     """Derive a table name from a range: "Orders 2024!A1:D" -> "orders_2024"."""
     sheet = range_name.split("!", 1)[0].strip().strip("'")
@@ -399,7 +427,7 @@ def _build_google_sheets_source(cfg: PipelineConfig) -> Any:
         resp = session.get(
             base, params={"fields": "sheets.properties.title"}, timeout=60
         )
-        resp.raise_for_status()
+        _raise_for_sheets_status(resp, cfg.name)
         range_names = [s["properties"]["title"] for s in resp.json().get("sheets", [])]
     if not range_names:
         raise ValueError(f"Pipeline {cfg.name!r}: spreadsheet has no sheets to load")
@@ -416,7 +444,7 @@ def _build_google_sheets_source(cfg: PipelineConfig) -> Any:
         ],
         timeout=300,
     )
-    resp.raise_for_status()
+    _raise_for_sheets_status(resp, cfg.name)
     value_ranges = resp.json().get("valueRanges", [])
 
     resources = []

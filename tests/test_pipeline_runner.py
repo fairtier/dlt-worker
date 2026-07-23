@@ -437,9 +437,11 @@ class TestBuildGoogleSheetsSource:
         return PipelineConfig(**defaults)
 
     @staticmethod
-    def _response(payload: dict[str, Any]) -> MagicMock:
+    def _response(payload: dict[str, Any], status_code: int = 200) -> MagicMock:
         resp = MagicMock()
         resp.json.return_value = payload
+        resp.status_code = status_code
+        resp.ok = 200 <= status_code < 300
         resp.raise_for_status = MagicMock()
         return resp
 
@@ -506,6 +508,33 @@ class TestBuildGoogleSheetsSource:
         batch_params = session.get.call_args_list[1].kwargs["params"]
         assert ("ranges", "Orders") in batch_params
         assert ("ranges", "Customers") in batch_params
+
+    def test_bad_range_surfaces_api_message(
+        self, mock_creds: MagicMock, mock_session_cls: MagicMock
+    ) -> None:
+        """A 400 from batchGet surfaces Google's message + a tab-name hint."""
+        session = mock_session_cls.return_value
+        session.get.return_value = self._response(
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Unable to parse range: Sheet1!A1:D",
+                    "status": "INVALID_ARGUMENT",
+                }
+            },
+            status_code=400,
+        )
+        cfg = self._sheets_config(
+            source_config={
+                "spreadsheet_url_or_id": "1BxiMVs0XRA5nFMdKvBdBZ",
+                "range_names": ["Sheet1!A1:D"],
+            },
+        )
+
+        with pytest.raises(ValueError, match="Unable to parse range: Sheet1!A1:D"):
+            _build_google_sheets_source(cfg)
+        with pytest.raises(ValueError, match="tab name"):
+            _build_google_sheets_source(cfg)
 
     def test_string_encoded_key(
         self, mock_creds: MagicMock, mock_session_cls: MagicMock
