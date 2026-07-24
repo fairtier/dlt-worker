@@ -10,12 +10,13 @@ from __future__ import annotations
 import logging
 import signal
 import time
+import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from croniter import croniter
 
-from dlt_worker import config, iceberg_stream
+from dlt_worker import config, iceberg_stream, workspace_db
 from dlt_worker.health import start_health_server
 from dlt_worker.pipeline_files import load_pipeline_configs
 from dlt_worker.pipeline_runner import trigger_snapshot
@@ -33,6 +34,21 @@ logger = logging.getLogger(__name__)
 
 # Shutdown flag
 _shutdown = False
+
+# Local-first run recording (WORKSPACE_DB_URL) — None means off.
+_recorder: workspace_db.WorkspaceRecorder | None = None
+
+# Central run-report retries when local-first recording is active: the
+# local row is the record, central is only the Console cache — retry a
+# few times, then log-and-continue. Never applies without the recorder
+# (the central row is the only record then, but retrying can't help a
+# run that already finished — keep the legacy single attempt).
+_CENTRAL_REPORT_ATTEMPTS = 3
+_CENTRAL_REPORT_RETRY_DELAY = 5
+
+# Seconds between local stale-run sweeps (finalizing orphaned rows the
+# central stuck-run sweep cannot see).
+_STALE_SWEEP_INTERVAL = 3600
 
 # Files mode: last-known source credentials per pipeline id, refreshed on
 # every successful poll. In-memory ONLY — credentials must never touch
@@ -89,9 +105,16 @@ def _should_run(cfg: PipelineConfig | TransformationConfig, now: datetime) -> bo
 
 def run() -> None:
     """Main loop: poll for work, run pipelines, report results."""
+    global _recorder
+
     config.load()
 
     _configure_logging()
+
+    _recorder = workspace_db.from_env()
+    if _recorder:
+        logger.info("Local-first run recording enabled (workspace database)")
+        _recorder.finalize_stale_runs()
 
     if config.ICEBERG_LOAD_CHUNK_ROWS > 0:
         iceberg_stream.apply(
@@ -123,11 +146,16 @@ def run() -> None:
         config.POLL_INTERVAL_SECONDS,
     )
 
+    last_sweep = time.monotonic()
     while not _shutdown:
         try:
             _poll_and_run(client)
         except Exception:
             logger.exception("Unexpected error in poll loop")
+
+        if _recorder and time.monotonic() - last_sweep >= _STALE_SWEEP_INTERVAL:
+            _recorder.finalize_stale_runs()
+            last_sweep = time.monotonic()
 
         # Sleep in small increments to respond to shutdown quickly.
         for _ in range(config.POLL_INTERVAL_SECONDS):
@@ -158,6 +186,13 @@ def _execute_pipeline(
 
     run_id = cfg.pending_run_id
 
+    # Local-first: the run exists in the workspace database before it
+    # starts — under the central pending id when there is one (one run,
+    # one identity in both stores), else a worker-generated UUID.
+    local_run_id = cfg.pending_run_id or str(uuid.uuid4())
+    if _recorder:
+        _recorder.record_pipeline_run_start(local_run_id, cfg.id, now)
+
     # Mark triggered run as "running" before execution.
     # If the update fails (network blip, run already cleaned up),
     # fall back to creating a new run row.
@@ -177,7 +212,7 @@ def _execute_pipeline(
             )
             run_id = ""
 
-    return _run_with_retry(cfg, run_id, client)
+    return _run_with_retry(cfg, run_id, local_run_id, client)
 
 
 def _run_due_pipelines_api(client: APIClient) -> set[str]:
@@ -330,17 +365,26 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
 
         logger.info("Running transformation: %s", cfg.name)
 
-        report = run_transformation(cfg)
-        if not client.report_transformation_run(report):
-            logger.error(
-                "Failed to report result for transformation %s (run_id=%s)",
-                cfg.id,
-                report.run_id,
+        # Local-first: same identity rules as pipelines (central pending
+        # id when triggered, else a worker-generated UUID).
+        local_run_id = cfg.pending_run_id or str(uuid.uuid4())
+        if _recorder:
+            _recorder.record_transformation_run_start(
+                local_run_id, cfg.id, datetime.now(timezone.utc)
             )
+
+        report = run_transformation(cfg)
+
+        if _recorder:
+            _recorder.record_transformation_run_end(local_run_id, report)
+        _report_run_central(
+            lambda report=report: client.report_transformation_run(report),
+            f"transformation {report.transformation_id} (run_id={report.run_id})",
+        )
 
 
 def _run_with_retry(
-    cfg: PipelineConfig, run_id: str, client: APIClient
+    cfg: PipelineConfig, run_id: str, local_run_id: str, client: APIClient
 ) -> PipelineRunReport | None:
     """Run a pipeline with exponential-backoff retries on failure.
 
@@ -354,13 +398,8 @@ def _run_with_retry(
             report.run_id = run_id
 
         if report.status == "success" or attempt == max_attempts - 1:
-            # Success, or final attempt — report and return.
-            if not client.report_pipeline_run(report):
-                logger.error(
-                    "Failed to report final result for pipeline %s (run_id=%s)",
-                    cfg.id,
-                    run_id,
-                )
+            # Success, or final attempt — record and return.
+            _finalize_pipeline_run(report, local_run_id, client)
             return report
 
         # Intermediate failure — log and wait before retrying.
@@ -376,14 +415,43 @@ def _run_with_retry(
 
         for _ in range(delay):
             if _shutdown:
-                # Shutting down — report the last failure and bail out.
-                if not client.report_pipeline_run(report):
-                    logger.error(
-                        "Failed to report result for pipeline %s (run_id=%s)",
-                        cfg.id,
-                        run_id,
-                    )
+                # Shutting down — record the last failure and bail out.
+                _finalize_pipeline_run(report, local_run_id, client)
                 return report
             time.sleep(1)
 
     return report
+
+
+def _finalize_pipeline_run(
+    report: PipelineRunReport, local_run_id: str, client: APIClient
+) -> None:
+    """Record the finished run locally first, then report centrally."""
+    if _recorder:
+        _recorder.record_pipeline_run_end(local_run_id, report)
+    _report_run_central(
+        lambda: client.report_pipeline_run(report),
+        f"pipeline {report.pipeline_id} (run_id={report.run_id})",
+    )
+
+
+def _report_run_central(send: Callable[[], bool], desc: str) -> None:
+    """Report a finished run to the FairTier API, best-effort.
+
+    With local-first recording active the local row is already the
+    record, so a central failure only costs Console freshness: retry a
+    bounded number of times with short pauses, then log-and-continue —
+    never block the run loop for long, never fail the run. Without the
+    recorder this stays a single attempt (legacy behavior).
+    """
+    attempts = _CENTRAL_REPORT_ATTEMPTS if _recorder else 1
+    for attempt in range(attempts):
+        if send():
+            return
+        if _shutdown or attempt + 1 == attempts:
+            break
+        for _ in range(_CENTRAL_REPORT_RETRY_DELAY):
+            if _shutdown:
+                break
+            time.sleep(1)
+    logger.error("Failed to report final result for %s", desc)

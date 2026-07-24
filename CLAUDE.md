@@ -47,6 +47,7 @@ src/dlt_worker/       # Application source
   pipeline_runner.py  # dlt pipeline execution
   run_isolation.py    # Subprocess-per-run: releases post-run memory, contains OOM kills
   transformation_runner.py  # dbt transformation execution (git clone + dbt build)
+  workspace_db.py     # Local-first run recording into the workspace Postgres database
   api_client.py  # FairTier API HTTP client
 tests/                # pytest test suite
 ```

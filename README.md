@@ -11,12 +11,14 @@ Worker that runs declarative data pipelines via [dlt](https://dlthub.com/), writ
 1. Reads pipeline definitions — from `$PIPELINES_DIR/pipelines/*.yaml` when `PIPELINES_DIR` is set (files mode), otherwise from a control plane poll
 2. Evaluates cron schedules (or manual triggers) to decide which pipelines to run; in files mode the worker owns `last_run_at` locally (`scheduler.json` in the state dir), so scheduling keeps working when the control plane is unreachable
 3. Runs each due pipeline using [dlt](https://dlthub.com/) with Iceberg table format
-4. Reports results (rows loaded, errors) back to the control plane (best-effort)
+4. Records the run in a local `workspace` Postgres database first when `WORKSPACE_DB_URL` is set (local-first mode), then reports results (rows loaded, errors) back to the control plane (best-effort)
 5. Exposes a `/healthz` endpoint for Kubernetes readiness probes
 
 In files mode the control plane poll is still made every tick, but only manual ("Run now") triggers and source credentials are consumed from it — definitions, schedules, and enablement come from the files. Credentials are cached in memory only, so a pipeline whose credentials were seen at least once keeps running through a control plane outage.
 
 When `AGE_KEY_FILE` additionally points at an [age](https://age-encryption.org/) identity file, source credentials are read from `pipelines/<name>.credentials.age` in the checkout (armored age ciphertext of the credentials JSON, encrypted to this worker's public key) and take precedence over polled credentials. A pipeline with a credential file then runs fully control-plane-independent — even a fresh worker process during an outage. A missing or undecryptable credential file degrades that one pipeline to polled/cached credentials. The companion `python -m dlt_worker.agekey <outdir>` command generates the keypair (used by the box seed job).
+
+When `WORKSPACE_DB_URL` is set (local-first run recording), every pipeline and transformation run is written to that Postgres database — a `running` row before execution, the outcome after — and the control plane report becomes strictly best-effort (a few bounded retries, then log-and-continue). The local row is the record; the central one is only a cache. A run picked up from a central "Run now" trigger reuses the trigger's run id locally, so the same run has one identity in both stores. The worker never migrates that schema (it's owned by the deployment) and writes explicit column lists only; on startup and hourly it finalizes its own orphaned `running` rows older than 2 hours (a crashed worker's leftovers). Combined with files mode and age credential files, ingestion, scheduling, and run history all keep working with no control plane at all.
 
 ## Quick start
 
@@ -62,6 +64,7 @@ All configuration is via environment variables.
 | `SNAPSHOT_URL`              | _(empty)_    | URL to trigger a state snapshot sidecar after each pipeline run (disabled when empty) |
 | `PIPELINES_DIR`             | _(empty)_    | Files mode: checkout root holding `pipelines/*.yaml` definitions; unset = poll the control plane for definitions (legacy) |
 | `AGE_KEY_FILE`              | _(empty)_    | Files mode: path to the age identity file for decrypting `pipelines/*.credentials.age`; unset = credentials come from the poll only |
+| `WORKSPACE_DB_URL`          | _(empty)_    | Postgres DSN of the local `workspace` database for local-first run recording — every run is recorded there first and the control plane report becomes best-effort (bounded retries); unset = central-only reporting |
 | `ICEBERG_LOAD_CHUNK_ROWS`   | `200000`     | Rows per chunked Iceberg append — bounds peak memory during the load stage so large loads stream instead of materializing in RAM; `0` restores dlt's load-everything behavior |
 | `ICEBERG_LOAD_COMMIT_EVERY` | `20`         | Commit the streamed Iceberg load every N appends — PyIceberg holds each appended data file's metadata in the open transaction until commit, so across hundreds of chunks that alone can OOM a small worker; `0` keeps a single atomic commit at the end. Extra snapshots are reaped by the maintenance CronJob's snapshot expiry |
 | `DATA_WRITER_CHUNK_ROWS`    | `100000`     | Rows per parquet row group for dlt's intermediate extract/normalize files (sets the global `DATA_WRITER__ROW_GROUP_SIZE`) — bounds peak memory *before* the load stage, since normalize rewrites one row group at a time; `0` restores dlt's default (unbounded row groups) |

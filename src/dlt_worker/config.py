@@ -61,6 +61,12 @@ ICEBERG_LOAD_COMMIT_EVERY: int = 20
 # the child, the worker reports a failed run and lives on. 0/false = run
 # in-process (pre-0.3.0 behavior). This is the rollback lever.
 PIPELINE_SUBPROCESS: bool = True
+# Local-first run recording: Postgres DSN of the box-local `workspace`
+# database (see workspace_db.py). When set, every run is recorded there
+# first and the FairTier API report becomes best-effort. Unset = feature
+# off (central-only reporting, pre-0.4.0 behavior). This is the rollback
+# lever.
+WORKSPACE_DB_URL: str = ""
 # Rows per parquet row group for dlt's intermediate extract/normalize files.
 # Bounds the worker's peak memory *before* the load stage: normalize rewrites
 # one row group at a time, so an uncapped row group (dlt lets pyarrow default
@@ -103,6 +109,7 @@ def load() -> None:
     global PIPELINES_DIR, AGE_KEY_FILE, ICEBERG_LOAD_CHUNK_ROWS
     global ICEBERG_LOAD_COMMIT_EVERY
     global PIPELINE_SUBPROCESS
+    global WORKSPACE_DB_URL
     global DATA_WRITER_CHUNK_ROWS
     global \
         AWS_ACCESS_KEY_ID, \
@@ -132,6 +139,7 @@ def load() -> None:
         "false",
         "no",
     )
+    WORKSPACE_DB_URL = os.environ.get("WORKSPACE_DB_URL", "")
     DATA_WRITER_CHUNK_ROWS = int(os.environ.get("DATA_WRITER_CHUNK_ROWS", "100000"))
 
     AWS_ACCESS_KEY_ID = _require("AWS_ACCESS_KEY_ID")

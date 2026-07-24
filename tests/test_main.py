@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,7 @@ class TestRunWithRetry:
         config.PIPELINE_MAX_RETRIES = 2
         config.PIPELINE_RETRY_BASE_DELAY = 30
         main._shutdown = False
+        main._recorder = None
 
     @patch("dlt_worker.main.run_pipeline_isolated")
     def test_success_first_attempt(self, mock_run: MagicMock) -> None:
@@ -136,7 +138,7 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "", client)
+        main._run_with_retry(cfg, "", "local-1", client)
 
         mock_run.assert_called_once()
         client.report_pipeline_run.assert_called_once()
@@ -153,7 +155,7 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "", client)
+        main._run_with_retry(cfg, "", "local-1", client)
 
         assert mock_run.call_count == 2
         # Only the success report is sent
@@ -171,7 +173,7 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "", client)
+        main._run_with_retry(cfg, "", "local-1", client)
 
         # 1 initial + 2 retries = 3 attempts
         assert mock_run.call_count == 3
@@ -202,7 +204,7 @@ class TestRunWithRetry:
 
         mock_sleep.side_effect = trigger_shutdown
 
-        main._run_with_retry(cfg, "", client)
+        main._run_with_retry(cfg, "", "local-1", client)
 
         # Only 1 attempt — shutdown happens during backoff wait
         assert mock_run.call_count == 1
@@ -223,7 +225,7 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "", client)
+        main._run_with_retry(cfg, "", "local-1", client)
 
         # 3 attempts, 2 backoff waits: 10*2^0=10s, 10*2^1=20s → 30 sleep(1) calls
         assert mock_sleep.call_count == 30
@@ -239,7 +241,7 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "run-123", client)
+        main._run_with_retry(cfg, "run-123", "run-123", client)
 
         report = client.report_pipeline_run.call_args[0][0]
         assert report.run_id == "run-123"
@@ -700,6 +702,121 @@ class TestRunDueTransformations:
             schedule="*/5 * * * *", last_run_at=now - timedelta(minutes=6)
         )
         assert _should_run(cfg, now) is True
+
+
+# --- local-first run recording (WORKSPACE_DB_URL) ---
+
+
+class TestLocalFirstRecording:
+    """With a recorder active, every run lands in the workspace database
+    before and after execution, and central reporting degrades to
+    bounded-retry best-effort — the local row is the record."""
+
+    def setup_method(self) -> None:
+        config.PIPELINE_MAX_RETRIES = 0
+        main._shutdown = False
+        self.recorder = MagicMock()
+        main._recorder = self.recorder
+
+    def teardown_method(self) -> None:
+        main._recorder = None
+
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_pipeline_recorded_start_and_end(self, mock_run: MagicMock) -> None:
+        cfg = _make_config(trigger_now=True)
+        mock_run.return_value = _success_report(cfg)
+        client = MagicMock()
+        client.report_pipeline_run.return_value = True
+
+        now = datetime.now(timezone.utc)
+        main._execute_pipeline(cfg, now, client)
+
+        rec = self.recorder
+        rec.record_pipeline_run_start.assert_called_once()
+        run_id, pipeline_id, started_at = rec.record_pipeline_run_start.call_args[0]
+        assert pipeline_id == cfg.id
+        assert started_at == now
+        rec.record_pipeline_run_end.assert_called_once()
+        end_run_id, end_report = rec.record_pipeline_run_end.call_args[0]
+        assert end_run_id == run_id  # one identity from start to end
+        assert end_report.status == "success"
+
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_pending_run_id_reused_as_local_id(self, mock_run: MagicMock) -> None:
+        """A central Run-now id becomes the local row id too — the same
+        run has one identity in both stores."""
+        cfg = _make_config(trigger_now=True, pending_run_id="run-42")
+        mock_run.return_value = _success_report(cfg)
+        client = MagicMock()
+        client.report_pipeline_run.return_value = True
+
+        main._execute_pipeline(cfg, datetime.now(timezone.utc), client)
+
+        assert self.recorder.record_pipeline_run_start.call_args[0][0] == "run-42"
+
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_scheduled_run_gets_generated_uuid(self, mock_run: MagicMock) -> None:
+        cfg = _make_config(trigger_now=True)
+        mock_run.return_value = _success_report(cfg)
+        client = MagicMock()
+        client.report_pipeline_run.return_value = True
+
+        main._execute_pipeline(cfg, datetime.now(timezone.utc), client)
+
+        run_id = self.recorder.record_pipeline_run_start.call_args[0][0]
+        uuid.UUID(run_id)  # raises if not a valid worker-generated UUID
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_central_report_retried_best_effort(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """A central report failure is retried a bounded number of times
+        and never fails the run — the local row is already written."""
+        cfg = _make_config()
+        mock_run.return_value = _success_report(cfg)
+        client = MagicMock()
+        client.report_pipeline_run.return_value = False
+
+        report = main._run_with_retry(cfg, "", "local-1", client)
+
+        assert report is not None and report.status == "success"
+        assert client.report_pipeline_run.call_count == main._CENTRAL_REPORT_ATTEMPTS
+        self.recorder.record_pipeline_run_end.assert_called_once()
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_central_report_single_shot_without_recorder(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """WORKSPACE_DB_URL unset = today's behavior: one attempt."""
+        main._recorder = None
+        cfg = _make_config()
+        mock_run.return_value = _success_report(cfg)
+        client = MagicMock()
+        client.report_pipeline_run.return_value = False
+
+        main._run_with_retry(cfg, "", "local-1", client)
+
+        client.report_pipeline_run.assert_called_once()
+
+    @patch("dlt_worker.main.run_transformation")
+    def test_transformation_recorded_start_and_end(self, mock_run: MagicMock) -> None:
+        cfg = _make_tconfig(trigger_now=True, pending_run_id="run-7")
+        client = MagicMock()
+        client.get_transformation_configs.return_value = [cfg]
+        client.report_transformation_run.return_value = True
+        mock_run.return_value = _transformation_report()
+
+        main._run_due_transformations(client, succeeded_pipelines=set())
+
+        rec = self.recorder
+        rec.record_transformation_run_start.assert_called_once()
+        assert rec.record_transformation_run_start.call_args[0][0] == "run-7"
+        rec.record_transformation_run_end.assert_called_once()
+        run_id, report = rec.record_transformation_run_end.call_args[0]
+        assert run_id == "run-7"
+        assert report.status == "success"
 
 
 class TestConfigureLogging:
