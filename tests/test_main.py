@@ -720,6 +720,36 @@ class TestRunDuePipelinesFiles:
         # Not recorded — the run retries once credentials appear.
         assert SchedulerState.load(str(self.state_dir)).get("p1") is None
 
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_creds_cache_evicts_pipelines_deleted_everywhere(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """S6: credentials of a deleted pipeline must not linger in memory
+        for the process lifetime — evicted once the id is gone from both a
+        successful poll and an error-free file set. Absence from just the
+        poll keeps the entry (outage resilience)."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
+        _write_pipeline_yaml(self.checkout, "sales.yaml", "p2", schedule=None)
+        client = self._client(
+            [
+                _make_config(id="p1", source_credentials={"k": "1"}),
+                _make_config(id="p2", source_credentials={"k": "2"}),
+            ]
+        )
+        main._run_due_pipelines(client)
+        assert set(main._creds_cache) == {"p1", "p2"}
+
+        # p2 absent from the poll but its file remains: entry kept.
+        client = self._client([_make_config(id="p1", source_credentials={"k": "1"})])
+        main._run_due_pipelines(client)
+        assert set(main._creds_cache) == {"p1", "p2"}
+
+        # p2 deleted from files too: entry evicted.
+        (self.checkout / "pipelines" / "sales.yaml").unlink()
+        main._run_due_pipelines(client)
+        assert set(main._creds_cache) == {"p1"}
+
 
 # --- transformation scheduling ---
 

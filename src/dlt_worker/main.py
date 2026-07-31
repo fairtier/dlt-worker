@@ -52,10 +52,13 @@ _STALE_SWEEP_INTERVAL = 3600
 
 # Files mode: last-known source credentials per pipeline id, refreshed on
 # every successful poll. In-memory ONLY — credentials must never touch
-# disk unencrypted and must never be logged. Never shrunk: a pipeline
-# briefly absent from one poll response keeps its last-known credentials
-# for the next central outage. Fallback only: credentials decrypted from
-# the checkout's .credentials.age files take precedence.
+# disk unencrypted and must never be logged. A pipeline briefly absent
+# from one poll response keeps its last-known credentials for the next
+# central outage; entries are evicted only once the pipeline is gone from
+# both a successful poll and an error-free file set (deleted for real —
+# its credentials must not linger for the process lifetime). Fallback
+# only: credentials decrypted from the checkout's .credentials.age files
+# take precedence.
 _creds_cache: dict[str, dict[str, Any]] = {}
 
 # Failure-aware backoff: start time of the last *failed* run per config id
@@ -324,6 +327,14 @@ def _run_due_pipelines_files(client: APIClient) -> set[str]:
     # last_run_at and re-fire on repair.
     if not files.had_errors:
         state.prune(file_ids)
+        # Same standard of proof for cached credentials: evict only when
+        # the pipeline is gone from this error-free file set AND from a
+        # successful poll. Absence from just one poll keeps the entry for
+        # the next outage.
+        if polled is not None:
+            for stale_id in list(_creds_cache):
+                if stale_id not in file_ids and stale_id not in by_id:
+                    del _creds_cache[stale_id]
 
     now = datetime.now(timezone.utc)
 
