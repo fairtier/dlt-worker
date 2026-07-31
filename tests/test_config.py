@@ -121,3 +121,20 @@ def test_real_pipeline_row_groups_are_bounded(clean_env: None) -> None:
 
     assert files > 0, "no parquet produced — test wiring broken"
     assert max_rg <= cap, f"row group {max_rg} exceeds cap {cap}; normalize would OOM"
+
+
+def test_malformed_int_env_var_exits_cleanly(
+    clean_env: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B9: a typo'd integer env var must produce the clean FATAL message
+    _require gives, not a raw int() traceback."""
+    os.environ["POLL_INTERVAL_SECONDS"] = "sixty"
+
+    with pytest.raises(SystemExit) as exc_info:
+        config.load()
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "FATAL" in err
+    assert "POLL_INTERVAL_SECONDS" in err
+    assert "sixty" in err

@@ -20,6 +20,22 @@ def _require(name: str) -> str:
     return value
 
 
+def _int(name: str, default: int) -> int:
+    """Integer env var with the same clean FATAL a missing _require gives —
+    a typo'd value must not crash with a raw traceback."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"FATAL: environment variable {name} must be an integer, got {raw!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Worker config
 # ---------------------------------------------------------------------------
@@ -132,26 +148,24 @@ def load() -> None:
     CUSTOMER_SLUG = _require("CUSTOMER_SLUG")
     FAIRTIER_API_URL = _require("FAIRTIER_API_URL")
     LAKEKEEPER_URL = _require("LAKEKEEPER_URL")
-    POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
+    POLL_INTERVAL_SECONDS = _int("POLL_INTERVAL_SECONDS", 60)
     DLT_STATE_DIR = os.environ.get("DLT_STATE_DIR", "/dlt-state")
-    HEALTHZ_PORT = int(os.environ.get("HEALTHZ_PORT", "8080"))
-    PIPELINE_MAX_RETRIES = int(os.environ.get("PIPELINE_MAX_RETRIES", "2"))
-    PIPELINE_RETRY_BASE_DELAY = int(os.environ.get("PIPELINE_RETRY_BASE_DELAY", "30"))
+    HEALTHZ_PORT = _int("HEALTHZ_PORT", 8080)
+    PIPELINE_MAX_RETRIES = _int("PIPELINE_MAX_RETRIES", 2)
+    PIPELINE_RETRY_BASE_DELAY = _int("PIPELINE_RETRY_BASE_DELAY", 30)
     SNAPSHOT_URL = os.environ.get("SNAPSHOT_URL", "")
     PIPELINES_DIR = os.environ.get("PIPELINES_DIR", "")
     AGE_KEY_FILE = os.environ.get("AGE_KEY_FILE", "")
-    ICEBERG_LOAD_CHUNK_ROWS = int(os.environ.get("ICEBERG_LOAD_CHUNK_ROWS", "200000"))
-    ICEBERG_LOAD_COMMIT_EVERY = int(os.environ.get("ICEBERG_LOAD_COMMIT_EVERY", "20"))
+    ICEBERG_LOAD_CHUNK_ROWS = _int("ICEBERG_LOAD_CHUNK_ROWS", 200_000)
+    ICEBERG_LOAD_COMMIT_EVERY = _int("ICEBERG_LOAD_COMMIT_EVERY", 20)
     PIPELINE_SUBPROCESS = os.environ.get("PIPELINE_SUBPROCESS", "1").lower() not in (
         "0",
         "false",
         "no",
     )
-    PIPELINE_RUN_TIMEOUT_SECONDS = int(
-        os.environ.get("PIPELINE_RUN_TIMEOUT_SECONDS", "21600")
-    )
+    PIPELINE_RUN_TIMEOUT_SECONDS = _int("PIPELINE_RUN_TIMEOUT_SECONDS", 21_600)
     WORKSPACE_DB_URL = os.environ.get("WORKSPACE_DB_URL", "")
-    DATA_WRITER_CHUNK_ROWS = int(os.environ.get("DATA_WRITER_CHUNK_ROWS", "100000"))
+    DATA_WRITER_CHUNK_ROWS = _int("DATA_WRITER_CHUNK_ROWS", 100_000)
 
     AWS_ACCESS_KEY_ID = _require("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = _require("AWS_SECRET_ACCESS_KEY")
