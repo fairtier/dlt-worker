@@ -16,7 +16,7 @@ from dlt_worker.api_client import APIClient
 logger = logging.getLogger(__name__)
 
 
-def start_health_server(client: APIClient, port: int) -> None:
+def start_health_server(client: APIClient, port: int) -> HTTPServer:
     """Start the /healthz HTTP server in a daemon thread."""
 
     class Handler(BaseHTTPRequestHandler):
@@ -28,7 +28,15 @@ def start_health_server(client: APIClient, port: int) -> None:
 
             healthy, details = client.health_status()
             status = 200 if healthy else 503
-            body = json.dumps(details).encode()
+            # last_error is deliberately not echoed: the server binds on
+            # 0.0.0.0 and error strings can quote internal URLs and
+            # config details. The full error stays in the worker's logs.
+            body = json.dumps(
+                {
+                    "healthy": details["healthy"],
+                    "last_check_at": details["last_check_at"],
+                }
+            ).encode()
 
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -43,4 +51,5 @@ def start_health_server(client: APIClient, port: int) -> None:
     server = HTTPServer(("0.0.0.0", port), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    logger.info("Health server listening on :%d/healthz", port)
+    logger.info("Health server listening on :%d/healthz", server.server_port)
+    return server
