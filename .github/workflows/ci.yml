@@ -5,14 +5,18 @@ on:
     branches: [master]
   pull_request:
 
+# All third-party actions are pinned to commit SHAs: a moved tag or
+# branch must never inject code into this repo's workflows.
 jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
 
@@ -29,17 +33,62 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
 
       - name: Run tests
         run: uv run pytest -v --cov=dlt_worker --cov-report=term-missing --cov-report=json
 
-      - name: Update coverage badge
-        if: github.ref == format('refs/heads/{0}', 'master')
-        uses: Maoyao233/coverage-badge-action@upgrade-action-version # TODO: switch back to we-cli/coverage-badge-action@main once PR #8 is merged
+      - name: Upload coverage report
+        if: github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-json
+          path: coverage.json
+
+  # Separate job so the job that executes the test suite (arbitrary
+  # project code) never carries write permissions. The badge is built and
+  # pushed inline — no third-party action runs with the write token.
+  coverage-badge:
+    name: Coverage badge
+    needs: test
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: coverage-json
+
+      - name: Build and push badge to gh-pages
+        run: |
+          set -euo pipefail
+          COV=$(python3 -c 'import json; print(json.load(open("coverage.json"))["totals"]["percent_covered_display"])')
+          COLOR=$(python3 -c "print('green' if float('$COV') >= 95 else 'orange')")
+          npm i -g badgen-cli
+          badgen -j coverage -s "$COV%" -c "$COLOR" > "$RUNNER_TEMP/coverage.svg"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin gh-pages; then
+            git fetch origin gh-pages
+            git switch -C gh-pages FETCH_HEAD
+          else
+            git switch --orphan gh-pages
+          fi
+          mkdir -p badges
+          mv "$RUNNER_TEMP/coverage.svg" badges/coverage.svg
+          git add badges/coverage.svg
+          if git commit -m 'Update coverage badge [skip ci]'; then
+            git push origin gh-pages
+          else
+            echo "Badge unchanged — nothing to push."
+          fi

@@ -54,5 +54,5 @@ tests/                # pytest test suite
 
 ## CI/CD
 
-- **CI**: GitHub Actions runs `ruff check`, `ruff format`, `ty check`, and `pytest` (with coverage upload to Codecov) on push to master and PRs
+- **CI**: GitHub Actions runs `ruff check`, `ruff format`, `ty check`, and `pytest` on push to master and PRs; on master a separate job publishes a coverage badge to the `gh-pages` branch
 - **Release**: Tag `v*` triggers Docker build + push to GHCR (linux/amd64 + linux/arm64)
