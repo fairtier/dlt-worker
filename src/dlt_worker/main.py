@@ -248,12 +248,19 @@ def _run_due_pipelines_api(client: APIClient) -> set[str]:
     for cfg in configs:
         if _shutdown:
             break
-        if not _should_run(cfg, now):
-            continue
+        # One broken config must not abandon the rest of the tick.
+        try:
+            if not _should_run(cfg, now):
+                continue
 
-        report = _execute_pipeline(cfg, now, client)
-        if report is not None and report.status == "success":
-            succeeded.add(cfg.id)
+            report = _execute_pipeline(cfg, now, client)
+            if report is not None and report.status == "success":
+                succeeded.add(cfg.id)
+        except Exception:
+            logger.exception(
+                "Pipeline %s: tick processing failed — continuing with the rest",
+                cfg.name,
+            )
 
     return succeeded
 
@@ -299,53 +306,72 @@ def _run_due_pipelines_files(client: APIClient) -> set[str]:
     for cfg in files.configs:
         if _shutdown:
             break
-
-        api_cfg = by_id.get(cfg.id)
-
-        # One-time migration: adopt central's last_run_at so existing
-        # pipelines don't re-fire on the first files-mode tick.
-        if cfg.id not in state and api_cfg is not None and api_cfg.last_run_at:
-            state.seed(cfg.id, api_cfg.last_run_at)
-        cfg.last_run_at = state.get(cfg.id)
-
-        # Triggers are the only definition-adjacent data taken from the
-        # poll; polled schedule/enabled/definitions are ignored.
-        if api_cfg is not None:
-            cfg.trigger_now = api_cfg.trigger_now
-            cfg.pending_run_id = api_cfg.pending_run_id
-
-        if not _should_run(cfg, now):
-            continue
-
-        if cfg.has_file_credentials:
-            # Decrypted from the checkout — git truth wins; no fallback.
-            pass
-        elif cfg.id in _creds_cache:
-            # A cached {} is a valid "known credential-less" entry.
-            cfg.source_credentials = _creds_cache[cfg.id]
-        elif polled is None:
-            logger.warning(
-                "Skipping pipeline %s: no credential file, no cached "
-                "credentials, and the FairTier API is unreachable — "
-                "retrying next tick",
+        # One broken config must not abandon the rest of the tick.
+        try:
+            _process_file_pipeline(cfg, by_id, polled, state, now, client, succeeded)
+        except Exception:
+            logger.exception(
+                "Pipeline %s: tick processing failed — continuing with the rest",
                 cfg.name,
             )
-            continue
-
-        report = _execute_pipeline(cfg, now, client)
-        if report is not None and report.status == "success":
-            succeeded.add(cfg.id)
-            # Record the run *start* time, mirroring central semantics
-            # (last_run_at = created_at of the last success). Success-only:
-            # a failing scheduled pipeline keeps re-firing, exactly as in
-            # legacy mode.
-            state.record(cfg.id, now)
-            # Extra best-effort snapshot so scheduler.json lands in the
-            # post-run commit instead of waiting for the autosave window
-            # (a crash in between would re-fire the run once).
-            trigger_snapshot(cfg.name)
 
     return succeeded
+
+
+def _process_file_pipeline(
+    cfg: PipelineConfig,
+    by_id: dict[str, PipelineConfig],
+    polled: list[PipelineConfig] | None,
+    state: SchedulerState,
+    now: datetime,
+    client: APIClient,
+    succeeded: set[str],
+) -> None:
+    """Process one files-mode pipeline within a tick (schedule, run, record)."""
+    api_cfg = by_id.get(cfg.id)
+
+    # One-time migration: adopt central's last_run_at so existing
+    # pipelines don't re-fire on the first files-mode tick.
+    if cfg.id not in state and api_cfg is not None and api_cfg.last_run_at:
+        state.seed(cfg.id, api_cfg.last_run_at)
+    cfg.last_run_at = state.get(cfg.id)
+
+    # Triggers are the only definition-adjacent data taken from the
+    # poll; polled schedule/enabled/definitions are ignored.
+    if api_cfg is not None:
+        cfg.trigger_now = api_cfg.trigger_now
+        cfg.pending_run_id = api_cfg.pending_run_id
+
+    if not _should_run(cfg, now):
+        return
+
+    if cfg.has_file_credentials:
+        # Decrypted from the checkout — git truth wins; no fallback.
+        pass
+    elif cfg.id in _creds_cache:
+        # A cached {} is a valid "known credential-less" entry.
+        cfg.source_credentials = _creds_cache[cfg.id]
+    elif polled is None:
+        logger.warning(
+            "Skipping pipeline %s: no credential file, no cached "
+            "credentials, and the FairTier API is unreachable — "
+            "retrying next tick",
+            cfg.name,
+        )
+        return
+
+    report = _execute_pipeline(cfg, now, client)
+    if report is not None and report.status == "success":
+        succeeded.add(cfg.id)
+        # Record the run *start* time, mirroring central semantics
+        # (last_run_at = created_at of the last success). Success-only:
+        # a failing scheduled pipeline keeps re-firing, exactly as in
+        # legacy mode.
+        state.record(cfg.id, now)
+        # Extra best-effort snapshot so scheduler.json lands in the
+        # post-run commit instead of waiting for the autosave window
+        # (a crash in between would re-fire the run once).
+        trigger_snapshot(cfg.name)
 
 
 def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -> None:
@@ -374,33 +400,40 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
         if cfg.id in ran:
             continue
 
-        chained = bool(
-            cfg.enabled
-            and cfg.trigger_after_pipeline_id
-            and cfg.trigger_after_pipeline_id in succeeded_pipelines
-        )
-        if not (_should_run(cfg, now) or chained):
-            continue
-        ran.add(cfg.id)
-
-        logger.info("Running transformation: %s", cfg.name)
-
-        # Local-first: same identity rules as pipelines (central pending
-        # id when triggered, else a worker-generated UUID).
-        local_run_id = cfg.pending_run_id or str(uuid.uuid4())
-        if _recorder:
-            _recorder.record_transformation_run_start(
-                local_run_id, cfg.id, datetime.now(timezone.utc)
+        # One broken config must not abandon the rest of the tick.
+        try:
+            chained = bool(
+                cfg.enabled
+                and cfg.trigger_after_pipeline_id
+                and cfg.trigger_after_pipeline_id in succeeded_pipelines
             )
+            if not (_should_run(cfg, now) or chained):
+                continue
+            ran.add(cfg.id)
 
-        report = run_transformation(cfg)
+            logger.info("Running transformation: %s", cfg.name)
 
-        if _recorder:
-            _recorder.record_transformation_run_end(local_run_id, report)
-        _report_run_central(
-            lambda report=report: client.report_transformation_run(report),
-            f"transformation {report.transformation_id} (run_id={report.run_id})",
-        )
+            # Local-first: same identity rules as pipelines (central pending
+            # id when triggered, else a worker-generated UUID).
+            local_run_id = cfg.pending_run_id or str(uuid.uuid4())
+            if _recorder:
+                _recorder.record_transformation_run_start(
+                    local_run_id, cfg.id, datetime.now(timezone.utc)
+                )
+
+            report = run_transformation(cfg)
+
+            if _recorder:
+                _recorder.record_transformation_run_end(local_run_id, report)
+            _report_run_central(
+                lambda report=report: client.report_transformation_run(report),
+                f"transformation {report.transformation_id} (run_id={report.run_id})",
+            )
+        except Exception:
+            logger.exception(
+                "Transformation %s: tick processing failed — continuing with the rest",
+                cfg.name,
+            )
 
 
 def _run_with_retry(

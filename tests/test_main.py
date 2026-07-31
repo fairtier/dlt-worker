@@ -625,6 +625,29 @@ class TestRunDuePipelinesFiles:
         client.try_get_pipeline_configs.assert_not_called()
         assert not (self.state_dir / "scheduler.json").exists()
 
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_one_crashing_pipeline_does_not_stop_the_tick(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """B2b: an exception escaping one pipeline's processing is isolated
+        to that pipeline — later pipelines in the same tick still run."""
+        _write_pipeline_yaml(self.checkout, "a.yaml", "p1", trigger_now=None)
+        _write_pipeline_yaml(self.checkout, "b.yaml", "p2", trigger_now=None)
+        ok = _make_config(id="p2")
+
+        def run(cfg: PipelineConfig) -> PipelineRunReport:
+            if cfg.id == "p1":
+                raise RuntimeError("boom")
+            return _success_report(ok)
+
+        mock_run.side_effect = run
+        client = self._client([_make_config(id="p1"), _make_config(id="p2")])
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == {"p2"}
+
 
 # --- transformation scheduling ---
 
@@ -713,6 +736,29 @@ class TestRunDueTransformations:
         main._run_due_transformations(client, succeeded_pipelines=set())
 
         mock_run.assert_not_called()
+
+    @patch("dlt_worker.main.run_transformation")
+    def test_one_crashing_transformation_does_not_stop_the_tick(
+        self, mock_run: MagicMock
+    ) -> None:
+        """B2b: an exception escaping one transformation's processing must
+        not abandon the remaining transformations in the tick."""
+        bad = _make_tconfig(id="t1", trigger_now=True)
+        good = _make_tconfig(id="t2", trigger_now=True)
+        client = MagicMock()
+        client.get_transformation_configs.return_value = [bad, good]
+        client.report_transformation_run.return_value = True
+
+        def run(cfg: TransformationConfig) -> TransformationRunReport:
+            if cfg.id == "t1":
+                raise RuntimeError("boom")
+            return _transformation_report()
+
+        mock_run.side_effect = run
+
+        main._run_due_transformations(client, succeeded_pipelines=set())
+
+        assert mock_run.call_count == 2
 
     def test_should_run_works_for_transformations(self) -> None:
         now = datetime.now(timezone.utc)
