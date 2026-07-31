@@ -308,3 +308,18 @@ def test_unreadable_identity_degrades_and_warns_once(tmp_path: Path) -> None:
     assert result.had_errors is False
     assert result.configs[0].has_file_credentials is False
     assert pipeline_files._identity_warned is True
+
+
+def test_invalid_cron_schedule_is_a_broken_file(tmp_path: Path) -> None:
+    """B2: an invalid cron string is caught at load time — broken file,
+    had_errors set (suppresses scheduler-state pruning), rest keep loading."""
+    d = _checkout(tmp_path)
+    (d / "bad.yaml").write_text(
+        "id: p9\nsource_type: rest_api\ndataset_name: raw\nschedule: 'not a cron'\n"
+    )
+    (d / "orders.yaml").write_text(_FULL_YAML)
+
+    result = load_pipeline_configs(str(tmp_path))
+
+    assert result.had_errors is True
+    assert [c.id for c in result.configs] == ["p1"]

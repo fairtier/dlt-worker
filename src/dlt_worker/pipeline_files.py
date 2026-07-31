@@ -33,6 +33,8 @@ from dataclasses import dataclass
 import pyrage
 import yaml
 
+from croniter import croniter
+
 from dlt_worker.api_client import PipelineConfig
 
 logger = logging.getLogger(__name__)
@@ -191,6 +193,16 @@ def _load_one(path: str) -> PipelineConfig | None:
         logger.warning("Skipping pipeline file %s: source_config not a mapping", path)
         return None
 
+    # An invalid cron string is a broken file, caught here at load time —
+    # discovered at schedule time it would raise inside the tick loop
+    # instead of being isolated to this one pipeline.
+    schedule = str(data["schedule"]) if data.get("schedule") else None
+    if schedule is not None and not croniter.is_valid(schedule):
+        logger.warning(
+            "Skipping pipeline file %s: invalid cron schedule %r", path, schedule
+        )
+        return None
+
     # Defaults mirror the API mapping in api_client.get_pipeline_configs so
     # a pipeline behaves identically whichever transport delivered it.
     # Credentials arrive separately (the sibling .credentials.age file,
@@ -204,7 +216,7 @@ def _load_one(path: str) -> PipelineConfig | None:
         source_config=source_config,
         source_credentials={},
         dataset_name=str(data["dataset_name"]),
-        schedule=str(data["schedule"]) if data.get("schedule") else None,
+        schedule=schedule,
         write_disposition=data.get("write_disposition") or "append",
         merge_strategy=str(data.get("merge_strategy") or ""),
         enabled=bool(data.get("enabled", True)),

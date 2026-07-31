@@ -95,11 +95,31 @@ def _should_run(cfg: PipelineConfig | TransformationConfig, now: datetime) -> bo
     if not cfg.schedule:
         return False
 
+    # An invalid cron string must disable this one config, not raise into
+    # the tick loop and abandon every other pipeline (files mode validates
+    # at load, but central-delivered configs reach here unvalidated).
+    if not croniter.is_valid(cfg.schedule):
+        logger.warning(
+            "Config %s has an invalid cron schedule %r — skipping",
+            cfg.name,
+            cfg.schedule,
+        )
+        return False
+
     if cfg.last_run_at is None:
         return True  # never run before
 
-    cron = croniter(cfg.schedule, cfg.last_run_at)
-    next_run = cron.get_next(datetime)
+    # is_valid can't catch date-arithmetic failures (croniter errors
+    # subclass ValueError) — treat those as not-due too.
+    try:
+        next_run = croniter(cfg.schedule, cfg.last_run_at).get_next(datetime)
+    except ValueError:
+        logger.warning(
+            "Config %s: cron schedule %r failed to evaluate — skipping",
+            cfg.name,
+            cfg.schedule,
+        )
+        return False
     return now >= next_run
 
 

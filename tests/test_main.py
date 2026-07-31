@@ -92,6 +92,24 @@ def test_should_run_trigger_now() -> None:
     assert _should_run(cfg, now) is True
 
 
+def test_should_run_invalid_cron_returns_false() -> None:
+    """B2: an invalid cron string disables this one config instead of
+    raising into the tick loop and abandoning every other pipeline."""
+    cfg = _make_config(
+        schedule="not a cron",
+        last_run_at=datetime(2025, 6, 1, tzinfo=timezone.utc),
+    )
+    now = datetime.now(timezone.utc)
+    assert _should_run(cfg, now) is False
+
+
+def test_should_run_invalid_cron_never_run_before() -> None:
+    """Even a never-run config must not fire on an invalid schedule."""
+    cfg = _make_config(schedule="* * *", last_run_at=None)
+    now = datetime.now(timezone.utc)
+    assert _should_run(cfg, now) is False
+
+
 def test_should_run_trigger_now_disabled() -> None:
     cfg = _make_config(trigger_now=True, enabled=False)
     now = datetime.now(timezone.utc)
