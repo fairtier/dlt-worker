@@ -10,6 +10,7 @@ secret is needed.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import subprocess
 import tempfile
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote
 
 import yaml
 from dbt.cli.main import dbtRunner
@@ -161,21 +162,23 @@ def _resolve_repo(cfg: TransformationConfig) -> tuple[str, str, str]:
     )
 
 
-def _authenticated_url(url: str, username: str, token: str) -> str:
-    """Embed git credentials in the URL netloc (https://user:token@host/...)."""
-    if not username and not token:
-        return url
+def _git_auth_env(username: str, token: str) -> dict[str, str]:
+    """Git credentials as GIT_CONFIG_* env vars (http.extraheader Basic auth).
 
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    if parts.port:
-        host = f"{host}:{parts.port}"
-    userinfo = quote(username, safe="")
-    if token:
-        userinfo += f":{quote(token, safe='')}"
-    return urlunsplit(
-        (parts.scheme, f"{userinfo}@{host}", parts.path, parts.query, parts.fragment)
-    )
+    Credentials embedded in the clone URL would be readable in
+    /proc/<pid>/cmdline by anything sharing the PID namespace while the
+    clone runs, and git persists that URL in the checkout's .git/config
+    for the run's duration. A header delivered through the environment is
+    visible to neither.
+    """
+    if not username and not token:
+        return {}
+    basic = base64.b64encode(f"{username}:{token}".encode()).decode("ascii")
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraheader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
+    }
 
 
 def _sanitize(text: str, token: str) -> str:
@@ -189,20 +192,20 @@ def _sanitize(text: str, token: str) -> str:
 def _clone_repo(url: str, ref: str, username: str, token: str, dest: str) -> str:
     """Shallow-clone ref of url into dest. Returns the commit SHA.
 
-    Credentials are embedded in the clone URL, which is why the URL is
-    never logged and stderr is sanitized before it can reach a run report.
+    Credentials travel via the environment (see _git_auth_env), never
+    argv; stderr is still sanitized before it can reach a run report as a
+    second line of defense.
     """
-    clone_url = _authenticated_url(url, username, token)
+    env = {**os.environ, **_git_auth_env(username, token)}
     try:
         result = subprocess.run(
-            ["git", "clone", "--depth", "1", "--branch", ref, clone_url, dest],
+            ["git", "clone", "--depth", "1", "--branch", ref, url, dest],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
+            env=env,
         )
     except subprocess.TimeoutExpired:
-        # TimeoutExpired's message contains the full command (with the
-        # credentialed URL), so raise a clean error instead.
         raise RuntimeError(f"git clone timed out after {_GIT_TIMEOUT}s") from None
     if result.returncode != 0:
         raise RuntimeError(

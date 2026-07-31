@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import tempfile
@@ -15,7 +16,8 @@ import yaml
 from dlt_worker import config
 from dlt_worker.api_client import TransformationConfig
 from dlt_worker.transformation_runner import (
-    _authenticated_url,
+    _clone_repo,
+    _git_auth_env,
     _count_nodes,
     _read_profile_name,
     _resolve_repo,
@@ -76,21 +78,48 @@ def test_resolve_repo_unconfigured_raises(monkeypatch: pytest.MonkeyPatch) -> No
         _resolve_repo(_make_config())
 
 
-# --- _authenticated_url / _sanitize ---
+# --- _git_auth_env / _sanitize ---
 
 
-def test_authenticated_url_embeds_credentials() -> None:
-    url = _authenticated_url("https://git.example.com/x.git", "user", "tok")
-    assert url == "https://user:tok@git.example.com/x.git"
+def test_git_auth_env_builds_basic_auth_header() -> None:
+    """S2: credentials travel as an http.extraheader via GIT_CONFIG_* env
+    vars — never in argv (readable in /proc/<pid>/cmdline) and never
+    persisted to the checkout's .git/config."""
+    env = _git_auth_env("user", "t@k/1")
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "http.extraheader"
+    decoded = base64.b64decode(
+        env["GIT_CONFIG_VALUE_0"].removeprefix("Authorization: Basic ")
+    ).decode()
+    assert decoded == "user:t@k/1"
 
 
-def test_authenticated_url_preserves_port_and_quotes_token() -> None:
-    url = _authenticated_url("http://gitea:3000/x.git", "u", "t@k/1")
-    assert url == "http://u:t%40k%2F1@gitea:3000/x.git"
+def test_git_auth_env_without_credentials_is_empty() -> None:
+    assert _git_auth_env("", "") == {}
 
 
-def test_authenticated_url_without_credentials_is_unchanged() -> None:
-    assert _authenticated_url("https://git/x.git", "", "") == "https://git/x.git"
+def test_clone_repo_keeps_token_out_of_argv() -> None:
+    calls = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> Any:
+        calls.append((argv, kwargs))
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = "abc123\n"
+        result.stderr = ""
+        return result
+
+    with patch("dlt_worker.transformation_runner.subprocess.run", fake_run):
+        sha = _clone_repo(
+            "https://gitea/acme/dbt.git", "main", "user", "s3cret", "/tmp/x"
+        )
+
+    assert sha == "abc123"
+    clone_argv, clone_kwargs = calls[0]
+    assert all("s3cret" not in arg for arg in clone_argv)
+    assert "https://gitea/acme/dbt.git" in clone_argv
+    env = clone_kwargs["env"]
+    assert env["GIT_CONFIG_KEY_0"] == "http.extraheader"
 
 
 def test_sanitize_masks_raw_and_quoted_token() -> None:
