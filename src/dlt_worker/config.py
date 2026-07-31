@@ -61,6 +61,13 @@ ICEBERG_LOAD_COMMIT_EVERY: int = 20
 # the child, the worker reports a failed run and lives on. 0/false = run
 # in-process (pre-0.3.0 behavior). This is the rollback lever.
 PIPELINE_SUBPROCESS: bool = True
+# Wall-clock limit for one pipeline run attempt, in seconds. A run child
+# stuck in an un-timeouted network read would otherwise wedge the poll
+# loop forever (no schedules, no triggers) while /healthz stays green.
+# On expiry the child is terminated (then killed) and a failed run is
+# reported. Only enforced in subprocess mode — an in-process run
+# (PIPELINE_SUBPROCESS=0) cannot be safely interrupted. 0 disables.
+PIPELINE_RUN_TIMEOUT_SECONDS: int = 21_600
 # Local-first run recording: Postgres DSN of the box-local `workspace`
 # database (see workspace_db.py). When set, every run is recorded there
 # first and the FairTier API report becomes best-effort. Unset = feature
@@ -109,6 +116,7 @@ def load() -> None:
     global PIPELINES_DIR, AGE_KEY_FILE, ICEBERG_LOAD_CHUNK_ROWS
     global ICEBERG_LOAD_COMMIT_EVERY
     global PIPELINE_SUBPROCESS
+    global PIPELINE_RUN_TIMEOUT_SECONDS
     global WORKSPACE_DB_URL
     global DATA_WRITER_CHUNK_ROWS
     global \
@@ -138,6 +146,9 @@ def load() -> None:
         "0",
         "false",
         "no",
+    )
+    PIPELINE_RUN_TIMEOUT_SECONDS = int(
+        os.environ.get("PIPELINE_RUN_TIMEOUT_SECONDS", "21600")
     )
     WORKSPACE_DB_URL = os.environ.get("WORKSPACE_DB_URL", "")
     DATA_WRITER_CHUNK_ROWS = int(os.environ.get("DATA_WRITER_CHUNK_ROWS", "100000"))

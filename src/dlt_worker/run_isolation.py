@@ -83,13 +83,51 @@ def run_pipeline_isolated(cfg: PipelineConfig) -> PipelineRunReport:
     # of blocking forever) when the child dies without sending.
     send_conn.close()
 
+    # A wall-clock deadline on the run: dlt sources don't all enforce
+    # network timeouts, and a child wedged in a read would block this
+    # recv() — and with it the whole poll loop — forever.
+    timeout = config.PIPELINE_RUN_TIMEOUT_SECONDS
+
     report: PipelineRunReport | None = None
+    timed_out = False
     try:
-        report = recv_conn.recv()
+        if timeout <= 0 or recv_conn.poll(timeout):
+            report = recv_conn.recv()
+        else:
+            timed_out = True
     except EOFError:
+        # The child died without sending — distinct from a timeout: fall
+        # through to the exit-code report below. (A dead child's EOF can
+        # arrive before is_alive() flips, so EOF must never be treated as
+        # a deadline expiry.)
         pass
     finally:
         recv_conn.close()
+
+    if timed_out:
+        # Deadline expired with the child still running: terminate, then
+        # kill if it ignores SIGTERM (e.g. stuck in uninterruptible IO).
+        logger.error(
+            "Pipeline %s: run exceeded the %ds wall-clock limit — killing "
+            "the run subprocess",
+            cfg.name,
+            timeout,
+        )
+        proc.terminate()
+        proc.join(30)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        return PipelineRunReport(
+            pipeline_id=cfg.id,
+            status="failed",
+            started_at=started_at.isoformat(),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            error_message=(
+                f"pipeline run exceeded the {timeout}s wall-clock limit and was killed"
+            ),
+        )
+
     proc.join()
 
     if report is not None:

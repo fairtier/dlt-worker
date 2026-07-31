@@ -90,3 +90,74 @@ def test_child_death_becomes_failed_report(monkeypatch: pytest.MonkeyPatch) -> N
     assert "died without reporting" in report.error_message
     assert "exit code 1" in report.error_message
     assert report.started_at and report.completed_at
+
+
+class _HungProc:
+    """Stands in for a run child wedged in a network read: alive, never
+    sends, ignores nothing — until terminated."""
+
+    exitcode = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.alive = True
+        self.terminated = False
+        self.killed = False
+
+    def start(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.alive = False
+
+    def kill(self) -> None:
+        self.killed = True
+        self.alive = False
+
+    def join(self, timeout: float | None = None) -> None:
+        pass
+
+
+def test_hung_child_is_killed_at_the_wall_clock_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B4: a child that never reports must not block the poll loop forever —
+    the deadline expires, the child is terminated, and a failed run report
+    comes back."""
+    monkeypatch.setattr(config, "PIPELINE_SUBPROCESS", True)
+    monkeypatch.setattr(config, "PIPELINE_RUN_TIMEOUT_SECONDS", 1)
+
+    real_recv, real_send = multiprocessing.Pipe(duplex=False)
+    proc = _HungProc()
+
+    class _KeepAliveSend:
+        """close() is a no-op so the pipe never reaches EOF, like a live
+        child holding its end."""
+
+        def close(self) -> None:
+            pass
+
+    fake_ctx = type(
+        "FakeCtx",
+        (),
+        {
+            "Pipe": staticmethod(lambda duplex: (real_recv, _KeepAliveSend())),
+            "Process": staticmethod(lambda **kwargs: proc),
+        },
+    )
+
+    cfg = _make_config()
+    with patch(
+        "dlt_worker.run_isolation.multiprocessing.get_context",
+        return_value=fake_ctx,
+    ):
+        report = run_pipeline_isolated(cfg)
+
+    real_send.close()
+
+    assert report.status == "failed"
+    assert "wall-clock limit" in report.error_message
+    assert proc.terminated is True
