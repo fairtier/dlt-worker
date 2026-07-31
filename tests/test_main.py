@@ -110,6 +110,33 @@ def test_should_run_invalid_cron_never_run_before() -> None:
     assert _should_run(cfg, now) is False
 
 
+def test_should_run_backs_off_after_failure() -> None:
+    """B3: a failing scheduled config waits for the next cron slot after
+    the last failed attempt instead of re-firing every tick."""
+    now = datetime.now(timezone.utc)
+    cfg = _make_config(schedule="*/5 * * * *", last_run_at=now - timedelta(minutes=30))
+    main._last_failure_at.clear()
+    try:
+        main._last_failure_at["p1"] = now - timedelta(minutes=1)
+        assert _should_run(cfg, now) is False
+
+        main._last_failure_at["p1"] = now - timedelta(minutes=6)
+        assert _should_run(cfg, now) is True
+    finally:
+        main._last_failure_at.clear()
+
+
+def test_should_run_trigger_now_bypasses_failure_backoff() -> None:
+    """An explicit Run-now must fire even during failure backoff."""
+    now = datetime.now(timezone.utc)
+    cfg = _make_config(trigger_now=True, schedule="*/5 * * * *")
+    main._last_failure_at["p1"] = now
+    try:
+        assert _should_run(cfg, now) is True
+    finally:
+        main._last_failure_at.clear()
+
+
 def test_should_run_trigger_now_disabled() -> None:
     cfg = _make_config(trigger_now=True, enabled=False)
     now = datetime.now(timezone.utc)
@@ -311,10 +338,12 @@ class TestRunDuePipelinesFiles:
         config.AGE_KEY_FILE = ""
         main._shutdown = False
         main._creds_cache.clear()
+        main._last_failure_at.clear()
         yield
         config.PIPELINES_DIR = ""
         config.AGE_KEY_FILE = ""
         main._creds_cache.clear()
+        main._last_failure_at.clear()
 
     def _client(self, polled: list[PipelineConfig] | None) -> MagicMock:
         client = MagicMock()
@@ -647,6 +676,31 @@ class TestRunDuePipelinesFiles:
         succeeded = main._run_due_pipelines(client)
 
         assert succeeded == {"p2"}
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_failing_pipeline_does_not_refire_next_tick(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """B3 end-to-end: after a failed run, the next tick within the same
+        cron window skips the pipeline; it becomes due again a slot later."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        cfg = _make_config(id="p1")
+        mock_run.return_value = _failure_report(cfg)
+        client = self._client([_make_config(id="p1")])
+
+        main._run_due_pipelines(client)  # never-run → fires, fails
+        assert mock_run.call_count > 0
+        calls_after_first_tick = mock_run.call_count
+
+        main._run_due_pipelines(client)  # immediately after → backed off
+        assert mock_run.call_count == calls_after_first_tick
+
+        # A cron slot later the pipeline is due again.
+        main._last_failure_at["p1"] = datetime.now(timezone.utc) - timedelta(minutes=6)
+        main._run_due_pipelines(client)
+        assert mock_run.call_count > calls_after_first_tick
 
 
 # --- transformation scheduling ---

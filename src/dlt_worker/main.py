@@ -58,6 +58,16 @@ _STALE_SWEEP_INTERVAL = 3600
 # the checkout's .credentials.age files take precedence.
 _creds_cache: dict[str, dict[str, Any]] = {}
 
+# Failure-aware backoff: start time of the last *failed* run per config id
+# (pipelines and transformations). last_run_at only advances on success, so
+# a deterministically failing scheduled config would otherwise re-fire
+# every poll tick — thousands of attempts a day hammering the source and
+# delaying every other pipeline. With this, the next attempt waits for the
+# next cron slot after the last failure, same cadence as successes.
+# Cleared on success. In-memory only: a restart forgets failures, costing
+# at most one immediate re-fire.
+_last_failure_at: dict[str, datetime] = {}
+
 
 def _configure_logging() -> None:
     """Configure root logging at INFO, taking over from dlt.
@@ -106,13 +116,21 @@ def _should_run(cfg: PipelineConfig | TransformationConfig, now: datetime) -> bo
         )
         return False
 
-    if cfg.last_run_at is None:
+    # The cron baseline is the last success — or the last failure when
+    # that is newer, so a failing config retries at its schedule's cadence
+    # instead of every tick (trigger_now above bypasses this).
+    baseline = cfg.last_run_at
+    last_failure = _last_failure_at.get(cfg.id)
+    if last_failure is not None and (baseline is None or last_failure > baseline):
+        baseline = last_failure
+
+    if baseline is None:
         return True  # never run before
 
     # is_valid can't catch date-arithmetic failures (croniter errors
     # subclass ValueError) — treat those as not-due too.
     try:
-        next_run = croniter(cfg.schedule, cfg.last_run_at).get_next(datetime)
+        next_run = croniter(cfg.schedule, baseline).get_next(datetime)
     except ValueError:
         logger.warning(
             "Config %s: cron schedule %r failed to evaluate — skipping",
@@ -232,7 +250,13 @@ def _execute_pipeline(
             )
             run_id = ""
 
-    return _run_with_retry(cfg, run_id, local_run_id, client)
+    report = _run_with_retry(cfg, run_id, local_run_id, client)
+    if report is not None:
+        if report.status == "success":
+            _last_failure_at.pop(cfg.id, None)
+        else:
+            _last_failure_at[cfg.id] = now
+    return report
 
 
 def _run_due_pipelines_api(client: APIClient) -> set[str]:
@@ -422,6 +446,10 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
                 )
 
             report = run_transformation(cfg)
+            if report.status == "success":
+                _last_failure_at.pop(cfg.id, None)
+            else:
+                _last_failure_at[cfg.id] = now
 
             if _recorder:
                 _recorder.record_transformation_run_end(local_run_id, report)
