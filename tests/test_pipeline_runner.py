@@ -21,7 +21,9 @@ from dlt_worker.pipeline_runner import (
     _range_table_name,
     _reader_for,
     _rows_to_records,
+    _scrub_credentials,
     _spreadsheet_id,
+    run_pipeline,
     trigger_snapshot,
 )
 from dlt_worker.api_client import PipelineConfig
@@ -1210,3 +1212,52 @@ class TestReaderFor:
     def test_csv_reader_dependency_is_importable(self) -> None:
         """read_csv parses via pandas — guard the packaging regression."""
         import pandas  # noqa: F401
+
+
+class TestScrubCredentials:
+    """Tests for _scrub_credentials (S1: credentials must never reach run reports)."""
+
+    def test_scrubs_nested_values_and_url_encoded_variants(self) -> None:
+        creds = {
+            "connection_string": "postgresql://user:s3cret!pw@db.internal/prod",
+            "oauth": {"client_secret": "topsecret", "tokens": ["tok_abcd"]},
+        }
+        text = (
+            "connect failed for postgresql://user:s3cret!pw@db.internal/prod "
+            "using topsecret and tok_abcd, encoded "
+            "postgresql%3A%2F%2Fuser%3As3cret%21pw%40db.internal%2Fprod"
+        )
+        scrubbed = _scrub_credentials(text, creds)
+        assert "s3cret!pw" not in scrubbed
+        assert "topsecret" not in scrubbed
+        assert "tok_abcd" not in scrubbed
+        assert "s3cret%21pw" not in scrubbed
+        assert "***" in scrubbed
+
+    def test_short_values_are_left_alone(self) -> None:
+        """1-3 char values would mangle unrelated text if replaced."""
+        scrubbed = _scrub_credentials("a database error", {"region": "a"})
+        assert scrubbed == "a database error"
+
+    def test_no_credentials_is_a_noop(self) -> None:
+        assert _scrub_credentials("boom", {}) == "boom"
+
+
+class TestRunPipelineErrorScrubbing:
+    """The failure report's error_message must not contain credential values."""
+
+    @patch("dlt_worker.pipeline_runner._build_source")
+    @patch("dlt_worker.pipeline_runner.dlt.pipeline")
+    def test_failed_run_report_is_scrubbed(
+        self, mock_pipeline: MagicMock, mock_build_source: MagicMock
+    ) -> None:
+        cfg = _make_config(
+            source_credentials={"connection_string": "postgresql://u:hunter22@h/db"}
+        )
+        mock_build_source.side_effect = RuntimeError(
+            "could not connect: postgresql://u:hunter22@h/db"
+        )
+        report = run_pipeline(cfg)
+        assert report.status == "failed"
+        assert "hunter22" not in report.error_message
+        assert "***" in report.error_message

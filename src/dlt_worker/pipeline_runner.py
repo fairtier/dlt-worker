@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import traceback
 from datetime import datetime, timezone
 from typing import Any, cast
+from urllib.parse import quote
 
 import dlt
 import requests
@@ -17,6 +19,45 @@ from dlt_worker import config
 from dlt_worker.api_client import PipelineConfig, PipelineRunReport
 
 logger = logging.getLogger(__name__)
+
+
+# Credential values shorter than this are not scrubbed: replacing every
+# occurrence of a 1-3 char string would mangle unrelated message text.
+_MIN_SCRUB_LENGTH = 4
+
+
+def _credential_values(obj: Any) -> list[str]:
+    """Collect every string value nested anywhere in a credentials structure."""
+    values: list[str] = []
+    if isinstance(obj, dict):
+        for item in obj.values():
+            values.extend(_credential_values(item))
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            values.extend(_credential_values(item))
+    elif isinstance(obj, str) and len(obj) >= _MIN_SCRUB_LENGTH:
+        values.append(obj)
+    return values
+
+
+def _scrub_credentials(text: str, credentials: dict[str, Any]) -> str:
+    """Replace credential values (and their URL-encoded forms) with ***.
+
+    Second line of defense mirroring transformation_runner._sanitize: dlt
+    source exceptions routinely echo config (SQLAlchemy errors include the
+    connection URL, requests errors the full request URL), and the resulting
+    error_message is persisted to the workspace database, sent to the
+    central API, and logged — nothing credential-shaped may reach any of
+    them. Longest values first so a value that contains another is scrubbed
+    whole before its substring punches a hole in it.
+    """
+    values = sorted(
+        set(_credential_values(credentials)), key=lambda v: len(v), reverse=True
+    )
+    for value in values:
+        for variant in (value, quote(value, safe="")):
+            text = text.replace(variant, "***")
+    return text
 
 
 def _count_rows(normalize_info: Any) -> int:
@@ -81,13 +122,18 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
         )
 
     except Exception as exc:
-        logger.exception("Pipeline %s failed", cfg.name)
+        # Scrub the log too — the traceback quotes the same exception text.
+        logger.error(
+            "Pipeline %s failed:\n%s",
+            cfg.name,
+            _scrub_credentials(traceback.format_exc(), cfg.source_credentials),
+        )
         return PipelineRunReport(
             pipeline_id=cfg.id,
             status="failed",
             started_at=started_at.isoformat(),
             completed_at=datetime.now(timezone.utc).isoformat(),
-            error_message=str(exc),
+            error_message=_scrub_credentials(str(exc), cfg.source_credentials),
         )
 
 
