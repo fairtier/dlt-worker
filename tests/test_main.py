@@ -112,14 +112,20 @@ def test_should_run_invalid_cron_never_run_before() -> None:
 
 def test_should_run_backs_off_after_failure() -> None:
     """B3: a failing scheduled config waits for the next cron slot after
-    the last failed attempt instead of re-firing every tick."""
-    now = datetime.now(timezone.utc)
+    the last failed attempt instead of re-firing every tick.
+
+    Fixed timestamps — with a wall-clock `now`, a */5 boundary can land
+    between `now - 1min` and `now` and flip the first assertion.
+    """
+    now = datetime(2025, 6, 1, 12, 2, 30, tzinfo=timezone.utc)
     cfg = _make_config(schedule="*/5 * * * *", last_run_at=now - timedelta(minutes=30))
     main._last_failure_at.clear()
     try:
+        # Failure at 12:01:30 → next slot 12:05 → not due at 12:02:30.
         main._last_failure_at["p1"] = now - timedelta(minutes=1)
         assert _should_run(cfg, now) is False
 
+        # Failure at 11:56:30 → next slot 12:00 → due again.
         main._last_failure_at["p1"] = now - timedelta(minutes=6)
         assert _should_run(cfg, now) is True
     finally:
@@ -684,8 +690,11 @@ class TestRunDuePipelinesFiles:
         self, mock_run: MagicMock, mock_snapshot: MagicMock, mock_sleep: MagicMock
     ) -> None:
         """B3 end-to-end: after a failed run, the next tick within the same
-        cron window skips the pipeline; it becomes due again a slot later."""
-        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        cron window skips the pipeline; it becomes due again a slot later.
+
+        Daily schedule so no cron boundary can fall between the two ticks.
+        """
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule="0 0 * * *")
         cfg = _make_config(id="p1")
         mock_run.return_value = _failure_report(cfg)
         client = self._client([_make_config(id="p1")])
@@ -698,7 +707,7 @@ class TestRunDuePipelinesFiles:
         assert mock_run.call_count == calls_after_first_tick
 
         # A cron slot later the pipeline is due again.
-        main._last_failure_at["p1"] = datetime.now(timezone.utc) - timedelta(minutes=6)
+        main._last_failure_at["p1"] = datetime.now(timezone.utc) - timedelta(hours=25)
         main._run_due_pipelines(client)
         assert mock_run.call_count > calls_after_first_tick
 
