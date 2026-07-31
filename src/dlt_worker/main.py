@@ -383,6 +383,18 @@ def _process_file_pipeline(
             cfg.name,
         )
         return
+    else:
+        # The poll succeeded but this pipeline wasn't in the response
+        # (deleted centrally, or file-mirror lag on delete). Running would
+        # produce a guaranteed failed run with empty credentials — skip.
+        # A genuinely credential-less pipeline is covered above: its poll
+        # record caches {}.
+        logger.warning(
+            "Skipping pipeline %s: no credential file and the poll "
+            "response does not include it — retrying next tick",
+            cfg.name,
+        )
+        return
 
     report = _execute_pipeline(cfg, now, client)
     if report is not None and report.status == "success":

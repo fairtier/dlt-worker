@@ -702,6 +702,24 @@ class TestRunDuePipelinesFiles:
         main._run_due_pipelines(client)
         assert mock_run.call_count > calls_after_first_tick
 
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_absent_from_successful_poll_skips_instead_of_empty_creds(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """B6: central answered but omitted the pipeline (deleted centrally,
+        mirror lag on delete); with no credential file and no cache the run
+        must be skipped, not fired with empty credentials."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        client = self._client([])  # successful poll, pipeline absent
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == set()
+        mock_run.assert_not_called()
+        # Not recorded — the run retries once credentials appear.
+        assert SchedulerState.load(str(self.state_dir)).get("p1") is None
+
 
 # --- transformation scheduling ---
 
