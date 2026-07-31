@@ -428,3 +428,81 @@ class TestReportTransformationRun:
             completed_at="2025-06-01T12:05:00Z",
         )
         assert client.report_transformation_run(report) is False
+
+
+class TestMalformedCentralResponses:
+    """A garbage-returning central must degrade exactly like an unreachable
+    one (B1): 200-with-non-JSON → None/unhealthy, one bad record skipped."""
+
+    def test_non_json_200_body_returns_none_and_unhealthy(self) -> None:
+        client = _make_client()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.side_effect = ValueError("Expecting value: line 1 column 1")
+        client._session = MagicMock()
+        client._session.post.return_value = mock_resp
+
+        assert client.try_get_pipeline_configs() is None
+        healthy, _ = client.health_status()
+        assert healthy is False
+
+    def test_pipelines_not_a_list_returns_none(self) -> None:
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response({"pipelines": "oops"})
+
+        assert client.try_get_pipeline_configs() is None
+
+    def test_bad_record_is_skipped_others_survive(self) -> None:
+        client = _make_client()
+        good = {
+            "id": "p2",
+            "name": "good",
+            "sourceType": "rest_api",
+            "datasetName": "raw",
+        }
+        bad = {"id": "p1", "name": "bad", "sourceConfig": "{not json"}
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response({"pipelines": [bad, good]})
+
+        configs = client.try_get_pipeline_configs()
+
+        assert configs is not None
+        assert [c.id for c in configs] == ["p2"]
+
+    def test_transformations_non_json_body_returns_empty(self) -> None:
+        client = _make_client()
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.side_effect = ValueError("not json")
+        client._session = MagicMock()
+        client._session.post.return_value = mock_resp
+
+        assert client.get_transformation_configs() == []
+
+    def test_bad_transformation_record_is_skipped(self) -> None:
+        client = _make_client()
+        good = {"id": "t2", "name": "good"}
+        bad = {"name": "no id"}
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response(
+            {"transformations": [bad, good]}
+        )
+
+        configs = client.get_transformation_configs()
+
+        assert [c.id for c in configs] == ["t2"]
+
+    def test_token_response_missing_access_token_degrades_cleanly(self) -> None:
+        """A 200 token response without access_token must surface as a
+        RequestException (the callers' degradation path), not a KeyError."""
+        client = _make_auth_client()
+        bad_token_resp = MagicMock()
+        bad_token_resp.raise_for_status = MagicMock()
+        bad_token_resp.json.return_value = {"unexpected": True}
+        client._session = MagicMock()
+        client._session.post.return_value = bad_token_resp
+
+        assert client.try_get_pipeline_configs() is None
+        healthy, _ = client.health_status()
+        assert healthy is False

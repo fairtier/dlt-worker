@@ -131,9 +131,18 @@ class APIClient:
             timeout=self.timeout,
         )
         resp.raise_for_status()
-        data = resp.json()
-        self._token = data["access_token"]
-        expires_in = int(data.get("expires_in", 3600))
+        # Re-raise parse failures (non-JSON body, missing access_token) as
+        # RequestException so callers' "central unreachable" degradation
+        # paths handle them instead of a raw traceback losing the tick.
+        try:
+            data = resp.json()
+            token = data["access_token"]
+            expires_in = int(data.get("expires_in", 3600))
+        except (ValueError, KeyError, TypeError) as e:
+            raise requests.RequestException(
+                f"OIDC token response malformed: {type(e).__name__}"
+            ) from e
+        self._token = token
         self._token_expires_at = time.monotonic() + max(
             expires_in - _TOKEN_REFRESH_MARGIN, 30
         )
@@ -190,48 +199,38 @@ class APIClient:
         return configs if configs is not None else []
 
     def try_get_pipeline_configs(self) -> list[PipelineConfig] | None:
-        """Fetch pipeline configs, or None when the FairTier API is unreachable."""
+        """Fetch pipeline configs, or None when the FairTier API is unreachable.
+
+        A 200 with a non-JSON body (proxy error page, truncated response)
+        counts as unreachable; one malformed pipeline record is skipped so
+        the rest still run — a garbage-returning central must degrade
+        exactly like an unreachable one, never halt scheduling.
+        """
         url = f"{self.base_url}/pipeline.v1.PipelineService/GetPipelineConfigs"
         try:
             resp = self._post(url, {"customerSlug": self.customer_slug})
             resp.raise_for_status()
-        except requests.RequestException as e:
+            data = resp.json()
+            pipelines = data.get("pipelines", [])
+            if not isinstance(pipelines, list):
+                raise ValueError("'pipelines' is not a list")
+        except (requests.RequestException, ValueError) as e:
             logger.exception("Failed to fetch pipeline configs")
             self._mark_unhealthy(e)
             return None
 
         self._mark_healthy()
 
-        data = resp.json()
         configs = []
-        for p in data.get("pipelines", []):
-            source_config = p.get("sourceConfig", "{}")
-            source_credentials = p.get("sourceCredentials", "{}")
-            last_run_at_str = p.get("lastRunAt", "")
-            last_run_at = (
-                datetime.fromisoformat(last_run_at_str.replace("Z", "+00:00"))
-                if last_run_at_str
-                else None
-            )
-            configs.append(
-                PipelineConfig(
-                    id=p["id"],
-                    name=p["name"],
-                    source_type=p["sourceType"],
-                    source_config=json.loads(source_config) if source_config else {},
-                    source_credentials=json.loads(source_credentials)
-                    if source_credentials
-                    else {},
-                    dataset_name=p["datasetName"],
-                    schedule=p.get("schedule") or None,
-                    write_disposition=p.get("writeDisposition", "append"),
-                    merge_strategy=p.get("mergeStrategy", ""),
-                    enabled=p.get("enabled", True),
-                    trigger_now=p.get("triggerNow", False),
-                    pending_run_id=p.get("pendingRunId", ""),
-                    last_run_at=last_run_at,
+        for p in pipelines:
+            try:
+                configs.append(_parse_pipeline_record(p))
+            except Exception:
+                logger.warning(
+                    "Skipping malformed pipeline record (id=%s)",
+                    p.get("id", "?") if isinstance(p, dict) else "?",
+                    exc_info=True,
                 )
-            )
         return configs
 
     def get_transformation_configs(self) -> list[TransformationConfig]:
@@ -248,38 +247,24 @@ class APIClient:
         try:
             resp = self._post(url, {"customerSlug": self.customer_slug})
             resp.raise_for_status()
-        except requests.RequestException:
+            data = resp.json()
+            transformations = data.get("transformations", [])
+            if not isinstance(transformations, list):
+                raise ValueError("'transformations' is not a list")
+        except (requests.RequestException, ValueError):
             logger.warning("Failed to fetch transformation configs", exc_info=True)
             return []
 
-        data = resp.json()
         configs = []
-        for t in data.get("transformations", []):
-            git_credentials = t.get("gitCredentials", "{}")
-            last_run_at_str = t.get("lastRunAt", "")
-            last_run_at = (
-                datetime.fromisoformat(last_run_at_str.replace("Z", "+00:00"))
-                if last_run_at_str
-                else None
-            )
-            configs.append(
-                TransformationConfig(
-                    id=t["id"],
-                    name=t["name"],
-                    repo_url=t.get("repoUrl", ""),
-                    repo_ref=t.get("repoRef") or "main",
-                    git_credentials=json.loads(git_credentials)
-                    if git_credentials
-                    else {},
-                    schedule=t.get("schedule") or None,
-                    trigger_after_pipeline_id=t.get("triggerAfterPipelineId", ""),
-                    dbt_selector=t.get("dbtSelector", ""),
-                    enabled=t.get("enabled", True),
-                    trigger_now=t.get("triggerNow", False),
-                    pending_run_id=t.get("pendingRunId", ""),
-                    last_run_at=last_run_at,
+        for t in transformations:
+            try:
+                configs.append(_parse_transformation_record(t))
+            except Exception:
+                logger.warning(
+                    "Skipping malformed transformation record (id=%s)",
+                    t.get("id", "?") if isinstance(t, dict) else "?",
+                    exc_info=True,
                 )
-            )
         return configs
 
     def report_transformation_run(self, report: TransformationRunReport) -> bool:
@@ -343,3 +328,52 @@ class APIClient:
             logger.exception("Failed to report pipeline run for %s", report.pipeline_id)
             self._mark_unhealthy(e)
             return False
+
+
+def _parse_last_run_at(record: dict[str, Any]) -> datetime | None:
+    last_run_at_str = record.get("lastRunAt", "")
+    if not last_run_at_str:
+        return None
+    return datetime.fromisoformat(last_run_at_str.replace("Z", "+00:00"))
+
+
+def _parse_pipeline_record(p: dict[str, Any]) -> PipelineConfig:
+    """Map one API pipeline record to a PipelineConfig. Raises on malformed
+    input — the caller skips the record and keeps the rest."""
+    source_config = p.get("sourceConfig", "{}")
+    source_credentials = p.get("sourceCredentials", "{}")
+    return PipelineConfig(
+        id=p["id"],
+        name=p["name"],
+        source_type=p["sourceType"],
+        source_config=json.loads(source_config) if source_config else {},
+        source_credentials=json.loads(source_credentials) if source_credentials else {},
+        dataset_name=p["datasetName"],
+        schedule=p.get("schedule") or None,
+        write_disposition=p.get("writeDisposition", "append"),
+        merge_strategy=p.get("mergeStrategy", ""),
+        enabled=p.get("enabled", True),
+        trigger_now=p.get("triggerNow", False),
+        pending_run_id=p.get("pendingRunId", ""),
+        last_run_at=_parse_last_run_at(p),
+    )
+
+
+def _parse_transformation_record(t: dict[str, Any]) -> TransformationConfig:
+    """Map one API transformation record to a TransformationConfig. Raises on
+    malformed input — the caller skips the record and keeps the rest."""
+    git_credentials = t.get("gitCredentials", "{}")
+    return TransformationConfig(
+        id=t["id"],
+        name=t["name"],
+        repo_url=t.get("repoUrl", ""),
+        repo_ref=t.get("repoRef") or "main",
+        git_credentials=json.loads(git_credentials) if git_credentials else {},
+        schedule=t.get("schedule") or None,
+        trigger_after_pipeline_id=t.get("triggerAfterPipelineId", ""),
+        dbt_selector=t.get("dbtSelector", ""),
+        enabled=t.get("enabled", True),
+        trigger_now=t.get("triggerNow", False),
+        pending_run_id=t.get("pendingRunId", ""),
+        last_run_at=_parse_last_run_at(t),
+    )
