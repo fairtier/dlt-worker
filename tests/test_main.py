@@ -189,7 +189,7 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "", "local-1", client)
+        main._run_with_retry(cfg, "local-1", client)
 
         mock_run.assert_called_once()
         client.report_pipeline_run.assert_called_once()
@@ -206,7 +206,7 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "", "local-1", client)
+        main._run_with_retry(cfg, "local-1", client)
 
         assert mock_run.call_count == 2
         # Only the success report is sent
@@ -224,7 +224,7 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "", "local-1", client)
+        main._run_with_retry(cfg, "local-1", client)
 
         # 1 initial + 2 retries = 3 attempts
         assert mock_run.call_count == 3
@@ -255,7 +255,7 @@ class TestRunWithRetry:
 
         mock_sleep.side_effect = trigger_shutdown
 
-        main._run_with_retry(cfg, "", "local-1", client)
+        main._run_with_retry(cfg, "local-1", client)
 
         # Only 1 attempt — shutdown happens during backoff wait
         assert mock_run.call_count == 1
@@ -276,7 +276,7 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "", "local-1", client)
+        main._run_with_retry(cfg, "local-1", client)
 
         # 3 attempts, 2 backoff waits: 10*2^0=10s, 10*2^1=20s → 30 sleep(1) calls
         assert mock_sleep.call_count == 30
@@ -292,10 +292,33 @@ class TestRunWithRetry:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._run_with_retry(cfg, "run-123", "run-123", client)
+        main._run_with_retry(cfg, "run-123", client)
 
         report = client.report_pipeline_run.call_args[0][0]
         assert report.run_id == "run-123"
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_scheduled_run_reports_its_local_id(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """A run with no central trigger still reports the id it was
+        recorded under.
+
+        Without this the API mints its own id and the run exists twice
+        wherever the local store and the API's store are one database.
+        """
+        cfg = _make_config()
+        report = _success_report(cfg)
+        report.run_id = ""
+        mock_run.return_value = report
+        client = MagicMock()
+        client.report_pipeline_run.return_value = True
+
+        main._run_with_retry(cfg, "local-only-1", client)
+
+        sent = client.report_pipeline_run.call_args[0][0]
+        assert sent.run_id == "local-only-1"
 
 
 # --- files mode (_run_due_pipelines_files) ---
@@ -953,7 +976,7 @@ class TestLocalFirstRecording:
         client = MagicMock()
         client.report_pipeline_run.return_value = False
 
-        report = main._run_with_retry(cfg, "", "local-1", client)
+        report = main._run_with_retry(cfg, "local-1", client)
 
         assert report is not None and report.status == "success"
         assert client.report_pipeline_run.call_count == main._CENTRAL_REPORT_ATTEMPTS
@@ -971,7 +994,7 @@ class TestLocalFirstRecording:
         client = MagicMock()
         client.report_pipeline_run.return_value = False
 
-        main._run_with_retry(cfg, "", "local-1", client)
+        main._run_with_retry(cfg, "local-1", client)
 
         client.report_pipeline_run.assert_called_once()
 

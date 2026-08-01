@@ -225,8 +225,6 @@ def _execute_pipeline(
     """Run one due pipeline and return its final report."""
     logger.info("Running pipeline: %s (%s)", cfg.name, cfg.source_type)
 
-    run_id = cfg.pending_run_id
-
     # Local-first: the run exists in the workspace database before it
     # starts — under the central pending id when there is one (one run,
     # one identity in both stores), else a worker-generated UUID.
@@ -234,26 +232,28 @@ def _execute_pipeline(
     if _recorder:
         _recorder.record_pipeline_run_start(local_run_id, cfg.id, now)
 
-    # Mark triggered run as "running" before execution.
-    # If the update fails (network blip, run already cleaned up),
-    # fall back to creating a new run row.
-    if run_id:
+    # Mark a triggered run as "running" before execution, so the Console
+    # stops showing it as queued. Only triggered runs: a scheduled run has
+    # no row on the API side yet, and the final report creates it.
+    # A failure here needs no fallback — the final report carries the same
+    # id and is an upsert, so the row converges either way.
+    if cfg.pending_run_id:
         ok = client.report_pipeline_run(
             PipelineRunReport(
                 pipeline_id=cfg.id,
                 status="running",
                 started_at=now.isoformat(),
                 completed_at="",
-                run_id=run_id,
+                run_id=cfg.pending_run_id,
             )
         )
         if not ok:
             logger.warning(
-                "Failed to mark run %s as running, will create new run", run_id
+                "Failed to mark run %s as running; the final report will reconcile it",
+                cfg.pending_run_id,
             )
-            run_id = ""
 
-    report = _run_with_retry(cfg, run_id, local_run_id, client)
+    report = _run_with_retry(cfg, local_run_id, client)
     if report is not None:
         if report.status == "success":
             _last_failure_at.pop(cfg.id, None)
@@ -469,6 +469,10 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
                 )
 
             report = run_transformation(cfg)
+            # Same single-identity rule as pipelines: the report is an
+            # upsert on the id the run was recorded under, so a scheduled
+            # run cannot end up as two rows.
+            report.run_id = local_run_id
             if report.status == "success":
                 _last_failure_at.pop(cfg.id, None)
             else:
@@ -488,7 +492,7 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
 
 
 def _run_with_retry(
-    cfg: PipelineConfig, run_id: str, local_run_id: str, client: APIClient
+    cfg: PipelineConfig, local_run_id: str, client: APIClient
 ) -> PipelineRunReport | None:
     """Run a pipeline with exponential-backoff retries on failure.
 
@@ -498,8 +502,12 @@ def _run_with_retry(
 
     for attempt in range(max_attempts):
         report = run_pipeline_isolated(cfg)
-        if run_id:
-            report.run_id = run_id
+        # Always the local id, not just a triggered run's: the run has ONE
+        # identity, and the report is an upsert on it. Reporting without an
+        # id lets the API mint a second one, which shows the customer two
+        # rows for one run wherever the two stores are the same database
+        # (a box serving its own workspace plane).
+        report.run_id = local_run_id
 
         if report.status == "success" or attempt == max_attempts - 1:
             # Success, or final attempt — record and return.

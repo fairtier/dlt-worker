@@ -1,9 +1,14 @@
-"""Local-first run recording into the box-local ``workspace`` database.
+"""Local-first run recording into a workspace database.
 
 Run history must survive the FairTier API being unreachable: every run is
-recorded in the box's own Postgres (``WORKSPACE_DB_URL``) first, and the
-central report becomes best-effort — the local row is the record, the
-central row is only a cache for the Console.
+recorded in the local Postgres (``WORKSPACE_DB_URL``) first, and the
+report to the API becomes best-effort.
+
+Which database that is, is a deployment choice. Where the API is remote it
+is a standalone store and the reported row is what the Console reads. Where
+the API is local it can be the API's own database, and then both writes land
+on ONE row — the run is recorded under an id, and the report carries that
+same id for the API to upsert on.
 
 The schema is owned by the box deployment (its migrations job); the worker
 never runs migrations and writes with explicit column lists only, so
@@ -77,6 +82,12 @@ class WorkspaceRecorder:
     ) -> None:
         # Upsert: a Run-now id retried after a crash reuses its row — reset
         # the outcome columns so the row reads as a fresh attempt.
+        #
+        # Reset to the column DEFAULT, not NULL: rows_loaded and
+        # error_message are NOT NULL in both schemas, so writing NULL fails
+        # the whole statement with SQLSTATE 23502 — and _execute swallows
+        # it, so the run would silently go unrecorded. completed_at is
+        # nullable and genuinely means "not finished", so it stays NULL.
         self._execute(
             """
             INSERT INTO pipeline_runs (id, pipeline_id, status, started_at)
@@ -85,8 +96,8 @@ class WorkspaceRecorder:
                 status = 'running',
                 started_at = EXCLUDED.started_at,
                 completed_at = NULL,
-                rows_loaded = NULL,
-                error_message = NULL
+                rows_loaded = DEFAULT,
+                error_message = DEFAULT
             """,
             (run_id, pipeline_id, started_at),
             desc=f"pipeline run start {run_id}",
@@ -131,13 +142,13 @@ class WorkspaceRecorder:
                 status = 'running',
                 started_at = EXCLUDED.started_at,
                 completed_at = NULL,
-                commit_sha = NULL,
-                models_total = NULL,
-                models_failed = NULL,
-                tests_total = NULL,
-                tests_failed = NULL,
-                model_results = NULL,
-                error_message = NULL
+                commit_sha = DEFAULT,
+                models_total = DEFAULT,
+                models_failed = DEFAULT,
+                tests_total = DEFAULT,
+                tests_failed = DEFAULT,
+                model_results = DEFAULT,
+                error_message = DEFAULT
             """,
             (run_id, transformation_id, started_at),
             desc=f"transformation run start {run_id}",
@@ -146,8 +157,11 @@ class WorkspaceRecorder:
     def record_transformation_run_end(
         self, run_id: str, report: TransformationRunReport
     ) -> None:
-        # model_results is a JSON string already; NULLIF keeps an empty
-        # report out of the jsonb column instead of failing the cast.
+        # model_results is a JSON string already. NULLIF keeps an empty
+        # report out of the jsonb cast, and COALESCE turns that back into
+        # an empty array — the column is NOT NULL, and a run that produced
+        # no per-node results (a clone or profile failure, where the report
+        # defaults to "") is exactly when this path is taken.
         self._execute(
             """
             INSERT INTO transformation_runs
@@ -155,7 +169,7 @@ class WorkspaceRecorder:
                  commit_sha, models_total, models_failed, tests_total,
                  tests_failed, model_results, error_message)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    NULLIF(%s, '')::jsonb, %s)
+                    COALESCE(NULLIF(%s, '')::jsonb, '[]'::jsonb), %s)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 completed_at = EXCLUDED.completed_at,
