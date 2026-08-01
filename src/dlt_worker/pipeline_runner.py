@@ -541,6 +541,94 @@ def _reader_for(pipeline_name: str, file_glob: str) -> tuple[Any, dict[str, Any]
     )
 
 
+def _http_file_resources(cfg: PipelineConfig, base_url: str) -> list[Any]:
+    """Build resources for named files served over plain HTTP(S).
+
+    This exists because dlt's own filesystem source cannot read a host that
+    serves objects by key and refuses to list a directory — the shape of a
+    public object-storage bucket. Both of its behaviours there are traps: a
+    wildcard glob finds nothing and yields **zero rows without an error**,
+    and an exact filename fails inside fsspec on a doubled URL scheme.
+
+    So the file names are not discovered, they are declared: each table
+    carries an explicit `files` list, and nothing here ever lists. That is
+    also the only thing that CAN work — there is no listing to do.
+
+    Reads stream through pyarrow's batch iterator at the same row cap as
+    every other stage, so a multi-gigabyte file is bounded the same way a
+    bucket-backed one is.
+    """
+    import fsspec
+
+    tables = cfg.source_config.get("tables")
+    if not tables:
+        raise ValueError(
+            f"Pipeline {cfg.name!r}: an http(s) bucket_url requires 'tables' with "
+            f"an explicit 'files' list — a listing-less host cannot be globbed"
+        )
+
+    fs = fsspec.filesystem("http")
+    resources = []
+    for i, table in enumerate(tables):
+        name = table.get("name")
+        files = table.get("files")
+        if not name:
+            raise ValueError(f"Pipeline {cfg.name!r}: tables[{i}] missing 'name'")
+        if not files:
+            raise ValueError(
+                f"Pipeline {cfg.name!r}: tables[{i}] missing 'files' — an http(s) "
+                f"source names its files, it cannot discover them"
+            )
+        urls = [f"{base_url.rstrip('/')}/{f.lstrip('/')}" for f in files]
+        resources.append(dlt.resource(_http_batches(cfg.name, fs, urls), name=name))
+    return resources
+
+
+def _http_batches(pipeline_name: str, fs: Any, urls: list[str]) -> Any:
+    """Yield Arrow record batches from each named URL, one bounded batch at
+    a time.
+
+    A missing file is fatal. The caller *declared* this file, so quietly
+    loading fewer rows than asked for is the one outcome worth ruling out —
+    it is precisely the failure that made the glob path unusable here.
+    """
+    import pyarrow.csv as pacsv
+    import pyarrow.parquet as pq
+
+    chunk = config.DATA_WRITER_CHUNK_ROWS or 100_000
+
+    def batches_for(url: str, handle: Any) -> Any:
+        lower = url.lower()
+        if lower.endswith(".parquet"):
+            yield from pq.ParquetFile(handle).iter_batches(batch_size=chunk)
+        elif lower.endswith((".csv", ".tsv")):
+            # open_csv streams; read_csv would materialise the whole file.
+            options = pacsv.ParseOptions(
+                delimiter="\t" if lower.endswith(".tsv") else ","
+            )
+            reader = pacsv.open_csv(
+                handle,
+                read_options=pacsv.ReadOptions(block_size=1 << 20),
+                parse_options=options,
+            )
+            for batch in reader:
+                yield batch
+        else:
+            raise ValueError(
+                f"Pipeline {pipeline_name!r}: unsupported file type over http(s): "
+                f"{url!r} (expected .parquet, .csv or .tsv)"
+            )
+
+    def generator() -> Any:
+        for url in urls:
+            if not fs.exists(url):
+                raise ValueError(f"Pipeline {pipeline_name!r}: {url} not found")
+            with fs.open(url, "rb") as handle:
+                yield from batches_for(url, handle)
+
+    return generator
+
+
 def _build_filesystem_source(cfg: PipelineConfig) -> Any:
     from dlt.common.configuration.specs.aws_credentials import AwsCredentials
     from dlt.sources.filesystem import filesystem
@@ -554,6 +642,11 @@ def _build_filesystem_source(cfg: PipelineConfig) -> Any:
         raise ValueError(
             f"Pipeline {cfg.name!r}: source_config missing required 'bucket_url'"
         ) from None
+
+    # A public HTTP(S) host needs no credentials and cannot be listed, so it
+    # takes a different path entirely — see _http_file_resources.
+    if bucket_url.lower().startswith(("http://", "https://")):
+        return _http_file_resources(cfg, bucket_url)
 
     for key in ("access_key_id", "secret_access_key"):
         if key not in creds:

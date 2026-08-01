@@ -1261,3 +1261,90 @@ class TestRunPipelineErrorScrubbing:
         assert report.status == "failed"
         assert "hunter22" not in report.error_message
         assert "***" in report.error_message
+
+
+class TestPublicHttpFilesystemSource:
+    """A filesystem source over a public, listing-less HTTP(S) origin.
+
+    Public object stores serve objects by key and refuse to list a directory.
+    dlt's own filesystem source is unusable there in two ways worth naming:
+    a wildcard glob finds nothing and yields ZERO ROWS WITHOUT AN ERROR, and
+    an exact filename fails inside fsspec on a doubled URL scheme. So this
+    path never lists — the files are declared, and a declared file that is
+    missing is fatal rather than quietly skipped.
+    """
+
+    def _http_config(self, tables: Any, **overrides: Any) -> PipelineConfig:
+        defaults: dict[str, Any] = {
+            "id": "p-http",
+            "name": "demo-trips",
+            "source_type": "filesystem",
+            "source_config": {
+                "bucket_url": "https://demo-data.example.com",
+                "tables": tables,
+            },
+            # The point of a public origin: nothing to authenticate with.
+            "source_credentials": {},
+            "dataset_name": "raw",
+            "schedule": None,
+            "write_disposition": "append",
+            "enabled": True,
+        }
+        defaults.update(overrides)
+        return PipelineConfig(**defaults)
+
+    def test_needs_no_credentials(self) -> None:
+        cfg = self._http_config([{"name": "trips", "files": ["a.parquet"]}])
+
+        resources = _build_filesystem_source(cfg)
+
+        assert len(resources) == 1
+        assert resources[0].name == "trips"
+
+    def test_a_glob_is_refused_rather_than_silently_empty(self) -> None:
+        """The failure this whole path exists to prevent."""
+        cfg = self._http_config([{"name": "trips", "file_glob": "*.parquet"}])
+
+        with pytest.raises(ValueError, match="missing 'files'"):
+            _build_filesystem_source(cfg)
+
+    def test_tables_are_required(self) -> None:
+        cfg = self._http_config(None)
+        cfg.source_config = {"bucket_url": "https://demo-data.example.com"}
+
+        with pytest.raises(ValueError, match="requires 'tables'"):
+            _build_filesystem_source(cfg)
+
+    def test_table_name_is_required(self) -> None:
+        cfg = self._http_config([{"files": ["a.parquet"]}])
+
+        with pytest.raises(ValueError, match="missing 'name'"):
+            _build_filesystem_source(cfg)
+
+    def test_s3_url_still_takes_the_credentialled_path(self) -> None:
+        """http(s) is the discriminator; s3:// must be unaffected."""
+        cfg = self._http_config(
+            [{"name": "trips", "file_glob": "*.parquet"}],
+            source_config={
+                "bucket_url": "s3://my-bucket/data",
+                "tables": [{"name": "trips", "file_glob": "*.parquet"}],
+            },
+            source_credentials={"access_key_id": "AKID", "secret_access_key": "S"},
+        )
+
+        # Reaches the S3 branch, which requires credentials — proving the
+        # http branch was not taken.
+        resources = _build_filesystem_source(cfg)
+        assert len(resources) == 1
+
+    def test_s3_url_without_credentials_still_fails(self) -> None:
+        cfg = self._http_config(
+            [{"name": "trips", "file_glob": "*.parquet"}],
+            source_config={
+                "bucket_url": "s3://my-bucket/data",
+                "tables": [{"name": "trips", "file_glob": "*.parquet"}],
+            },
+        )
+
+        with pytest.raises(ValueError, match="access_key_id"):
+            _build_filesystem_source(cfg)
