@@ -258,6 +258,26 @@ def _read_profile_name(project_dir: str) -> str:
     return project.get("profile") or _DEFAULT_PROFILE_NAME
 
 
+def _duckdb_settings(tmpdir: str) -> dict[str, Any]:
+    """DuckDB SET statements applied when dbt opens its connection.
+
+    Each is skippable by configuring it empty, which restores DuckDB's own
+    default — the pre-0.7.0 behavior, and the rollback if a bound turns out
+    to be too tight for a real project.
+    """
+    settings: dict[str, Any] = {}
+    if config.DBT_DUCKDB_MEMORY_LIMIT:
+        settings["memory_limit"] = config.DBT_DUCKDB_MEMORY_LIMIT
+    # Spill inside the run's temp dir by default: it is removed with the
+    # run, so a killed build can't leave its spill behind on the box.
+    settings["temp_directory"] = config.DBT_DUCKDB_TEMP_DIR or os.path.join(
+        tmpdir, "duckdb-temp"
+    )
+    if config.DBT_DUCKDB_MAX_TEMP_SIZE:
+        settings["max_temp_directory_size"] = config.DBT_DUCKDB_MAX_TEMP_SIZE
+    return settings
+
+
 def _write_profiles(project_dir: str, tmpdir: str) -> str:
     """Generate profiles.yml in the temp dir and return its directory.
 
@@ -265,6 +285,12 @@ def _write_profiles(project_dir: str, tmpdir: str) -> str:
     credentials stay out of git. The profile targets the box's DuckDB with
     the Lakekeeper Iceberg catalog attached; data-file access uses
     credentials vended by the catalog, so no S3 secret is written.
+
+    The profile is also where DuckDB is told how much memory it may use.
+    Left alone it sizes its buffer manager from *host* RAM, which on a
+    single-node box is everyone else's RAM as well; bounded, it spills to
+    the run's temp dir instead. Generating the profile ourselves is what
+    makes that a guarantee rather than a request of the customer's repo.
     """
     profile_name = _read_profile_name(project_dir)
     profiles = {
@@ -276,6 +302,7 @@ def _write_profiles(project_dir: str, tmpdir: str) -> str:
                     "path": os.path.join(tmpdir, "dbt.duckdb"),
                     "threads": 2,
                     "extensions": ["iceberg", "httpfs"],
+                    "settings": _duckdb_settings(tmpdir),
                     "secrets": [
                         {
                             "type": "iceberg",

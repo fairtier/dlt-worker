@@ -11,12 +11,12 @@ from typing import Any, cast
 from urllib.parse import quote
 
 import dlt
-import requests
 
 from dlt.common.schema.typing import TMergeDispositionDict, TWriteDispositionConfig
 
 from dlt_worker import config, telemetry
 from dlt_worker.api_client import PipelineConfig, PipelineRunReport
+from dlt_worker.snapshot import trigger_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -177,34 +177,6 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
                 completed_at=datetime.now(timezone.utc).isoformat(),
                 error_message=error_message,
             )
-
-
-def trigger_snapshot(pipeline_name: str) -> None:
-    """POST to a configured webhook after each successful pipeline run. Best-effort.
-
-    Designed for use with a state-snapshot sidecar (e.g. snapshot-sidecar) but
-    works with any endpoint that accepts an empty JSON POST.
-    Requires SNAPSHOT_URL to be set; silently skips when not configured.
-    """
-    if not config.SNAPSHOT_URL:
-        return
-    try:
-        resp = requests.post(
-            config.SNAPSHOT_URL,
-            json={},
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        status = resp.json().get("status", "unknown")
-        logger.info("Pipeline %s: snapshot %s", pipeline_name, status)
-    except requests.RequestException:
-        telemetry.add_event("snapshot.failed")
-        logger.warning(
-            "Pipeline %s: failed to trigger snapshot webhook",
-            pipeline_name,
-            exc_info=True,
-        )
 
 
 def _build_source(cfg: PipelineConfig) -> Any:

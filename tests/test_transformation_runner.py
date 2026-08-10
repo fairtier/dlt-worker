@@ -175,6 +175,49 @@ def test_write_profiles_shape(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) ->
     }
 
 
+def test_write_profiles_bounds_duckdb_memory(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DuckDB must be told a ceiling: unbounded it sizes its buffer manager
+    from host RAM, which on a single-node box is everyone else's RAM too."""
+    monkeypatch.setattr(config, "DBT_DUCKDB_MEMORY_LIMIT", "512MB")
+    monkeypatch.setattr(config, "DBT_DUCKDB_TEMP_DIR", "")
+    monkeypatch.setattr(config, "DBT_DUCKDB_MAX_TEMP_SIZE", "4GB")
+
+    project_dir = tmp_path / "repo"
+    project_dir.mkdir()
+
+    profiles_dir = _write_profiles(str(project_dir), str(tmp_path))
+    with open(os.path.join(profiles_dir, "profiles.yml")) as f:
+        profiles = yaml.safe_load(f)
+
+    settings = profiles["fairtier"]["outputs"]["box"]["settings"]
+    assert settings["memory_limit"] == "512MB"
+    assert settings["max_temp_directory_size"] == "4GB"
+    # Spilling inside the run's temp dir means a killed build leaves no
+    # spill behind on the box.
+    assert settings["temp_directory"] == os.path.join(str(tmp_path), "duckdb-temp")
+
+
+def test_write_profiles_empty_bounds_leave_duckdb_defaults(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each bound is skippable — the rollback if one is too tight."""
+    monkeypatch.setattr(config, "DBT_DUCKDB_MEMORY_LIMIT", "")
+    monkeypatch.setattr(config, "DBT_DUCKDB_TEMP_DIR", "/spill")
+    monkeypatch.setattr(config, "DBT_DUCKDB_MAX_TEMP_SIZE", "")
+
+    project_dir = tmp_path / "repo"
+    project_dir.mkdir()
+
+    profiles_dir = _write_profiles(str(project_dir), str(tmp_path))
+    with open(os.path.join(profiles_dir, "profiles.yml")) as f:
+        profiles = yaml.safe_load(f)
+
+    settings = profiles["fairtier"]["outputs"]["box"]["settings"]
+    assert settings == {"temp_directory": "/spill"}
+
+
 # --- node counting ---
 
 

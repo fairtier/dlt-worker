@@ -93,6 +93,34 @@ PIPELINE_SUBPROCESS: bool = True
 # reported. Only enforced in subprocess mode — an in-process run
 # (PIPELINE_SUBPROCESS=0) cannot be safely interrupted. 0 disables.
 PIPELINE_RUN_TIMEOUT_SECONDS: int = 21_600
+# Run each dbt transformation in a short-lived spawned subprocess, for the
+# same reason pipelines are (see run_isolation.py). dbt + DuckDB over a big
+# table retains hundreds of MB the worker never gives back; on 2026-08-10
+# an in-process build over 85M rows left 800 MB resident — under the
+# container limit, so never OOM-killed, and it starved the box until the
+# pod was restarted by hand. 0/false = run in-process (pre-0.7.0
+# behavior). This is the rollback lever.
+TRANSFORMATION_SUBPROCESS: bool = True
+# Wall-clock limit for one dbt transformation run, in seconds. Same purpose
+# as PIPELINE_RUN_TIMEOUT_SECONDS and a separate knob because a dbt build is
+# a different workload: a model that queries a warehouse table has no
+# timeout of its own. Only enforced in subprocess mode. 0 disables.
+TRANSFORMATION_RUN_TIMEOUT_SECONDS: int = 7_200
+# DuckDB memory ceiling for a dbt run (a `memory_limit` SET in the generated
+# profile). Past it DuckDB spills to DBT_DUCKDB_TEMP_DIR instead of growing,
+# which is the difference between a slow model and a box in reclaim thrash —
+# the subprocess gives the memory back afterwards, this bounds what it takes
+# in the first place. Empty = leave DuckDB's default (80% of RAM, which on a
+# box means 80% of everyone else's RAM too).
+DBT_DUCKDB_MEMORY_LIMIT: str = "512MB"
+# Where DuckDB spills once past that ceiling. Empty = the run's temp dir
+# (an emptyDir on the box), which is where a spill belongs: it dies with
+# the run.
+DBT_DUCKDB_TEMP_DIR: str = ""
+# Cap on that spill, so a runaway model fills neither RAM nor the box's
+# disk — disk is the box's other silently-exhausted resource. Empty = leave
+# DuckDB's default (90% of the filesystem).
+DBT_DUCKDB_MAX_TEMP_SIZE: str = "4GB"
 # Local-first run recording: Postgres DSN of the box-local `workspace`
 # database (see workspace_db.py). When set, every run is recorded there
 # first and the FairTier API report becomes best-effort. Unset = feature
@@ -143,6 +171,9 @@ def load() -> None:
     global ICEBERG_CREDENTIAL_REFRESH_SECONDS
     global PIPELINE_SUBPROCESS
     global PIPELINE_RUN_TIMEOUT_SECONDS
+    global TRANSFORMATION_SUBPROCESS
+    global TRANSFORMATION_RUN_TIMEOUT_SECONDS
+    global DBT_DUCKDB_MEMORY_LIMIT, DBT_DUCKDB_TEMP_DIR, DBT_DUCKDB_MAX_TEMP_SIZE
     global WORKSPACE_DB_URL
     global DATA_WRITER_CHUNK_ROWS
     global \
@@ -175,6 +206,19 @@ def load() -> None:
         "no",
     )
     PIPELINE_RUN_TIMEOUT_SECONDS = _int("PIPELINE_RUN_TIMEOUT_SECONDS", 21_600)
+    TRANSFORMATION_SUBPROCESS = os.environ.get(
+        "TRANSFORMATION_SUBPROCESS", "1"
+    ).lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    TRANSFORMATION_RUN_TIMEOUT_SECONDS = _int(
+        "TRANSFORMATION_RUN_TIMEOUT_SECONDS", 7_200
+    )
+    DBT_DUCKDB_MEMORY_LIMIT = os.environ.get("DBT_DUCKDB_MEMORY_LIMIT", "512MB")
+    DBT_DUCKDB_TEMP_DIR = os.environ.get("DBT_DUCKDB_TEMP_DIR", "")
+    DBT_DUCKDB_MAX_TEMP_SIZE = os.environ.get("DBT_DUCKDB_MAX_TEMP_SIZE", "4GB")
     WORKSPACE_DB_URL = os.environ.get("WORKSPACE_DB_URL", "")
     DATA_WRITER_CHUNK_ROWS = _int("DATA_WRITER_CHUNK_ROWS", 100_000)
 

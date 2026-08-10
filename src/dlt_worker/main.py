@@ -19,10 +19,9 @@ from croniter import croniter
 from dlt_worker import config, iceberg_stream, telemetry, workspace_db
 from dlt_worker.health import start_health_server
 from dlt_worker.pipeline_files import load_pipeline_configs
-from dlt_worker.pipeline_runner import trigger_snapshot
-from dlt_worker.run_isolation import run_pipeline_isolated
+from dlt_worker.run_isolation import run_pipeline_isolated, run_transformation_isolated
 from dlt_worker.scheduler_state import SchedulerState
-from dlt_worker.transformation_runner import run_transformation
+from dlt_worker.snapshot import trigger_snapshot
 from dlt_worker.api_client import (
     PipelineConfig,
     PipelineRunReport,
@@ -159,7 +158,11 @@ def run() -> None:
         logger.info("Local-first run recording enabled (workspace database)")
         _recorder.finalize_stale_runs()
 
-    if config.ICEBERG_LOAD_CHUNK_ROWS > 0:
+    # Only the process that actually runs dlt needs the patch, and with
+    # subprocess isolation that is the child — run_isolation applies it
+    # there. Skipping it here is what keeps dlt (~115 MB of imports, since
+    # apply() reaches into dlt.destinations) out of the poll loop for good.
+    if config.ICEBERG_LOAD_CHUNK_ROWS > 0 and not config.PIPELINE_SUBPROCESS:
         iceberg_stream.apply(
             config.ICEBERG_LOAD_CHUNK_ROWS,
             config.ICEBERG_LOAD_COMMIT_EVERY,
@@ -574,7 +577,7 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
                         local_run_id, cfg.id, datetime.now(timezone.utc)
                     )
 
-                report = run_transformation(cfg)
+                report = run_transformation_isolated(cfg)
                 # Same single-identity rule as pipelines: the report is an
                 # upsert on the id the run was recorded under, so a scheduled
                 # run cannot end up as two rows.

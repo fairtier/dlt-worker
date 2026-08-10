@@ -814,7 +814,7 @@ def _transformation_report(status: str = "success") -> TransformationRunReport:
 class TestRunDueTransformations:
     """Tests for main._run_due_transformations."""
 
-    @patch("dlt_worker.main.run_transformation")
+    @patch("dlt_worker.main.run_transformation_isolated")
     def test_chained_after_pipeline_success(self, mock_run: MagicMock) -> None:
         cfg = _make_tconfig(trigger_after_pipeline_id="p1")
         client = MagicMock()
@@ -827,7 +827,7 @@ class TestRunDueTransformations:
         mock_run.assert_called_once_with(cfg)
         client.report_transformation_run.assert_called_once()
 
-    @patch("dlt_worker.main.run_transformation")
+    @patch("dlt_worker.main.run_transformation_isolated")
     def test_not_chained_without_pipeline_success(self, mock_run: MagicMock) -> None:
         cfg = _make_tconfig(trigger_after_pipeline_id="p1")
         client = MagicMock()
@@ -837,7 +837,7 @@ class TestRunDueTransformations:
 
         mock_run.assert_not_called()
 
-    @patch("dlt_worker.main.run_transformation")
+    @patch("dlt_worker.main.run_transformation_isolated")
     def test_trigger_now_and_chained_runs_once(self, mock_run: MagicMock) -> None:
         cfg = _make_tconfig(trigger_after_pipeline_id="p1", trigger_now=True)
         client = MagicMock()
@@ -849,7 +849,7 @@ class TestRunDueTransformations:
 
         mock_run.assert_called_once()
 
-    @patch("dlt_worker.main.run_transformation")
+    @patch("dlt_worker.main.run_transformation_isolated")
     def test_disabled_never_runs(self, mock_run: MagicMock) -> None:
         cfg = _make_tconfig(
             enabled=False, trigger_after_pipeline_id="p1", trigger_now=True
@@ -861,7 +861,7 @@ class TestRunDueTransformations:
 
         mock_run.assert_not_called()
 
-    @patch("dlt_worker.main.run_transformation")
+    @patch("dlt_worker.main.run_transformation_isolated")
     def test_fetch_error_is_swallowed(self, mock_run: MagicMock) -> None:
         client = MagicMock()
         client.get_transformation_configs.side_effect = RuntimeError("boom")
@@ -871,7 +871,7 @@ class TestRunDueTransformations:
 
         mock_run.assert_not_called()
 
-    @patch("dlt_worker.main.run_transformation")
+    @patch("dlt_worker.main.run_transformation_isolated")
     def test_one_crashing_transformation_does_not_stop_the_tick(
         self, mock_run: MagicMock
     ) -> None:
@@ -998,7 +998,7 @@ class TestLocalFirstRecording:
 
         client.report_pipeline_run.assert_called_once()
 
-    @patch("dlt_worker.main.run_transformation")
+    @patch("dlt_worker.main.run_transformation_isolated")
     def test_transformation_recorded_start_and_end(self, mock_run: MagicMock) -> None:
         cfg = _make_tconfig(trigger_now=True, pending_run_id="run-7")
         client = MagicMock()

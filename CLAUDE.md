@@ -45,9 +45,10 @@ src/dlt_worker/       # Application source
   main.py             # Main poll loop with graceful shutdown
   pipeline_files.py   # Files mode: load pipeline definitions from a git checkout
   scheduler_state.py  # Files mode: worker-owned last_run_at (scheduler.json)
-  pipeline_runner.py  # dlt pipeline execution
-  run_isolation.py    # Subprocess-per-run: releases post-run memory, contains OOM kills
-  transformation_runner.py  # dbt transformation execution (git clone + dbt build)
+  pipeline_runner.py  # dlt pipeline execution (child process only)
+  run_isolation.py    # Subprocess-per-run for pipelines AND dbt: releases post-run memory, contains OOM kills, keeps the dlt/dbt imports out of the poll loop
+  transformation_runner.py  # dbt transformation execution (git clone + dbt build; child process only)
+  snapshot.py         # State-snapshot webhook — parent-side, so it can't drag dlt in
   workspace_db.py     # Local-first run recording into the workspace Postgres database
   api_client.py  # FairTier API HTTP client
 tests/                # pytest test suite
