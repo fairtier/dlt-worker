@@ -1,6 +1,6 @@
 [project]
 name = "dlt-worker"
-version = "0.6.1"
+version = "0.7.0"
 description = "Worker that runs dlt pipelines from file-based definitions (or the FairTier API) on a schedule"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,6 +21,9 @@ dependencies = [
     "pyyaml>=6",
     "pyrage>=1.2",
     "psycopg[binary]>=3.2",
+    "opentelemetry-api>=1.30",
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
 ]
 
 [project.urls]

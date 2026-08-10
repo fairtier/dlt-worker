@@ -28,9 +28,9 @@ import logging
 import multiprocessing
 import signal
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
-from dlt_worker import config, iceberg_stream
+from dlt_worker import config, iceberg_stream, telemetry
 from dlt_worker.api_client import PipelineConfig, PipelineRunReport
 from dlt_worker.pipeline_runner import run_pipeline
 
@@ -40,7 +40,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _child_main(conn: Connection, cfg: PipelineConfig) -> None:
+def _child_main(
+    conn: Connection, cfg: PipelineConfig, trace_context: Mapping[str, str]
+) -> None:
     """Entry point of the spawned child: re-apply process-wide setup, run
     the pipeline, send the report back."""
     config.load()
@@ -52,14 +54,24 @@ def _child_main(conn: Connection, cfg: PipelineConfig) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         force=True,
     )
+    # Module state doesn't survive spawn, so telemetry is set up from
+    # scratch here too; the propagated context is what keeps the child's
+    # spans in the parent's trace instead of starting a second one.
+    telemetry.setup("run", config.CUSTOMER_SLUG)
+    telemetry.attach_trace_context(trace_context)
     if config.ICEBERG_LOAD_CHUNK_ROWS > 0:
         iceberg_stream.apply(
             config.ICEBERG_LOAD_CHUNK_ROWS,
             config.ICEBERG_LOAD_COMMIT_EVERY,
             config.ICEBERG_CREDENTIAL_REFRESH_SECONDS,
         )
-    conn.send(run_pipeline(cfg))
-    conn.close()
+    try:
+        conn.send(run_pipeline(cfg))
+        conn.close()
+    finally:
+        # Bounded, and last: the parent is blocked on the report above, so
+        # nothing about a slow or dead collector may delay it.
+        telemetry.flush()
 
 
 def run_pipeline_isolated(cfg: PipelineConfig) -> PipelineRunReport:
@@ -78,7 +90,9 @@ def run_pipeline_isolated(cfg: PipelineConfig) -> PipelineRunReport:
     ctx = multiprocessing.get_context("spawn")
     recv_conn, send_conn = ctx.Pipe(duplex=False)
     proc = ctx.Process(
-        target=_child_main, args=(send_conn, cfg), name=f"run-{cfg.name}"
+        target=_child_main,
+        args=(send_conn, cfg, telemetry.current_trace_context()),
+        name=f"run-{cfg.name}",
     )
     proc.start()
     # Drop the parent's handle on the send end so recv() sees EOF (instead
@@ -109,6 +123,7 @@ def run_pipeline_isolated(cfg: PipelineConfig) -> PipelineRunReport:
     if timed_out:
         # Deadline expired with the child still running: terminate, then
         # kill if it ignores SIGTERM (e.g. stuck in uninterruptible IO).
+        telemetry.add_event("run.timeout", {"dlt_worker.run.timeout_seconds": timeout})
         logger.error(
             "Pipeline %s: run exceeded the %ds wall-clock limit — killing "
             "the run subprocess",
@@ -144,6 +159,9 @@ def run_pipeline_isolated(cfg: PipelineConfig) -> PipelineRunReport:
             detail += " (SIGKILL — likely out of memory)"
     else:
         detail = f"exit code {code}"
+    # An OOM kill leaves nothing else behind — no report, no dlt log tail —
+    # so the event carrying the exit code is the trace's only evidence.
+    telemetry.add_event("run.subprocess_died", {"dlt_worker.run.exit_code": code or 0})
     logger.error(
         "Pipeline %s: run subprocess died without reporting (%s)", cfg.name, detail
     )

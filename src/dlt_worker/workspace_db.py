@@ -26,8 +26,9 @@ from datetime import datetime
 from typing import Any, LiteralString
 
 import psycopg
+from opentelemetry.trace import SpanKind
 
-from dlt_worker import config
+from dlt_worker import config, telemetry
 from dlt_worker.api_client import PipelineRunReport, TransformationRunReport
 
 logger = logging.getLogger(__name__)
@@ -60,22 +61,60 @@ class WorkspaceRecorder:
         self._dsn = dsn
 
     def _execute(
-        self, query: LiteralString, params: tuple[Any, ...], desc: str
+        self,
+        query: LiteralString,
+        params: tuple[Any, ...],
+        desc: str,
+        operation: str,
     ) -> int | None:
-        """Run one statement; returns the affected row count, None on error."""
-        try:
-            with psycopg.connect(
-                self._dsn,
-                autocommit=True,
-                connect_timeout=_CONNECT_TIMEOUT_SECONDS,
-            ) as conn:
-                return conn.execute(query, params).rowcount
-        except Exception:
-            logger.exception(
-                "Workspace DB write failed (%s) — this run is only recorded centrally",
-                desc,
+        """Run one statement; returns the affected row count, None on error.
+
+        ``desc`` identifies the individual write for the log (it carries the
+        run id); ``operation`` is its low-cardinality kind, for the span and
+        the metric.
+        """
+        with telemetry.tracer.start_as_current_span(
+            "dlt_worker.workspace_db.write",
+            kind=SpanKind.CLIENT,
+            attributes={
+                "db.system": "postgresql",
+                telemetry.ATTR_DB_OPERATION: operation,
+            },
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                with psycopg.connect(
+                    self._dsn,
+                    autocommit=True,
+                    connect_timeout=_CONNECT_TIMEOUT_SECONDS,
+                ) as conn:
+                    rowcount = conn.execute(query, params).rowcount
+            except Exception as exc:
+                # Type only: a psycopg error quotes the failing statement,
+                # and these statements carry run parameters.
+                span.set_status(telemetry.error_status(type(exc).__name__))
+                telemetry.workspace_db_operations.add(
+                    1,
+                    {
+                        telemetry.ATTR_DB_OPERATION: operation,
+                        telemetry.ATTR_OUTCOME: "error",
+                    },
+                )
+                logger.exception(
+                    "Workspace DB write failed (%s) — this run is only recorded"
+                    " centrally",
+                    desc,
+                )
+                return None
+            telemetry.workspace_db_operations.add(
+                1,
+                {
+                    telemetry.ATTR_DB_OPERATION: operation,
+                    telemetry.ATTR_OUTCOME: "ok",
+                },
             )
-            return None
+            return rowcount
 
     def record_pipeline_run_start(
         self, run_id: str, pipeline_id: str, started_at: datetime
@@ -101,6 +140,7 @@ class WorkspaceRecorder:
             """,
             (run_id, pipeline_id, started_at),
             desc=f"pipeline run start {run_id}",
+            operation="pipeline_run_start",
         )
 
     def record_pipeline_run_end(self, run_id: str, report: PipelineRunReport) -> None:
@@ -128,6 +168,7 @@ class WorkspaceRecorder:
                 report.error_message,
             ),
             desc=f"pipeline run end {run_id}",
+            operation="pipeline_run_end",
         )
 
     def record_transformation_run_start(
@@ -152,6 +193,7 @@ class WorkspaceRecorder:
             """,
             (run_id, transformation_id, started_at),
             desc=f"transformation run start {run_id}",
+            operation="transformation_run_start",
         )
 
     def record_transformation_run_end(
@@ -196,6 +238,7 @@ class WorkspaceRecorder:
                 report.error_message,
             ),
             desc=f"transformation run end {run_id}",
+            operation="transformation_run_end",
         )
 
     def finalize_stale_runs(self) -> None:
@@ -232,7 +275,12 @@ class WorkspaceRecorder:
             ),
         )
         for table, query in sweeps:
-            count = self._execute(query, (), desc=f"stale-run sweep ({table})")
+            count = self._execute(
+                query,
+                (),
+                desc=f"stale-run sweep ({table})",
+                operation="stale_run_sweep",
+            )
             if count:
                 logger.warning(
                     "Finalized %d orphaned %s row(s) from a previous worker",

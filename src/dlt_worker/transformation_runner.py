@@ -24,7 +24,7 @@ from urllib.parse import quote
 import yaml
 from dbt.cli.main import dbtRunner
 
-from dlt_worker import config
+from dlt_worker import config, telemetry
 from dlt_worker.api_client import TransformationConfig, TransformationRunReport
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,19 @@ _TEST_RESOURCE_TYPES = {"test", "unit_test"}
 _FAILED_STATUSES = {"error", "fail"}
 
 
+def _step_span(name: str) -> Any:
+    """A child span for one step of a run, with exception recording OFF.
+
+    Everything raised in here can quote the git token (git echoes the clone
+    URL, dbt echoes profile contents) and a span's recorded exception is
+    past the reach of ``_sanitize``. The sanitized message reaches the trace
+    exactly once, as the outer run span's status, set by the caller.
+    """
+    return telemetry.tracer.start_as_current_span(
+        name, record_exception=False, set_status_on_exception=False
+    )
+
+
 def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
     """Clone and run a dbt project from the given config. Returns a run report."""
     started_at = datetime.now(timezone.utc)
@@ -55,9 +68,14 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
     try:
         repo_url, username, token = _resolve_repo(cfg)
         clone_dir = os.path.join(tmpdir, "repo")
-        commit_sha = _clone_repo(
-            repo_url, cfg.repo_ref or "main", username, token, clone_dir
-        )
+        with _step_span("dlt_worker.git.clone") as span:
+            commit_sha = _clone_repo(
+                repo_url, cfg.repo_ref or "main", username, token, clone_dir
+            )
+            # The ref is config, the sha is what actually ran — both belong
+            # on the trace; the URL never does (it can carry a userinfo).
+            span.set_attribute("dlt_worker.git.ref", cfg.repo_ref or "main")
+            span.set_attribute("dlt_worker.git.commit_sha", commit_sha)
         profiles_dir = _write_profiles(clone_dir, tmpdir)
 
         # dbt (and DuckDB's iceberg extension) resolve relative paths against
@@ -79,7 +97,11 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
         ]
         if cfg.dbt_selector:
             build_args += ["--select", cfg.dbt_selector]
-        res = runner.invoke(build_args)
+        # Its own span because a transformation's time is essentially all
+        # here, and "clone was slow" vs "the build was slow" is the first
+        # question asked of a long run.
+        with _step_span("dlt_worker.dbt.build"):
+            res = runner.invoke(build_args)
 
         nodes = _node_results(res)
         models_total, models_failed, tests_total, tests_failed = _count_nodes(nodes)
@@ -297,17 +319,18 @@ def _run_deps(
     if not has_packages:
         return
 
-    res = runner.invoke(
-        [
-            "deps",
-            "--project-dir",
-            project_dir,
-            "--profiles-dir",
-            profiles_dir,
-            "--target",
-            "box",
-        ]
-    )
+    with _step_span("dlt_worker.dbt.deps"):
+        res = runner.invoke(
+            [
+                "deps",
+                "--project-dir",
+                project_dir,
+                "--profiles-dir",
+                profiles_dir,
+                "--target",
+                "box",
+            ]
+        )
     if not res.success or res.exception is not None:
         msg = str(res.exception) if res.exception else "unknown error"
         raise RuntimeError(f"dbt deps failed: {_sanitize(msg, token)}")

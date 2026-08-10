@@ -56,9 +56,10 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import time
 from typing import Any, Callable
+
+from dlt_worker import telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -88,19 +89,12 @@ DEFAULT_COMMIT_EVERY = 20
 # inert when commit_every is 0. 0 disables it (pre-0.6.1 behavior).
 DEFAULT_CREDENTIAL_REFRESH = 15 * 60
 
-_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
-
 _original_run: Callable[..., None] | None = None
 
 
 def _rss_mb() -> int:
-    """Current resident set size in MiB from /proc; 0 where unavailable."""
-    try:
-        with open("/proc/self/statm") as f:
-            resident_pages = int(f.read().split()[1])
-        return resident_pages * _PAGE_SIZE // (1024 * 1024)
-    except Exception:
-        return 0
+    """Current resident set size in MiB; 0 where unavailable."""
+    return telemetry.rss_bytes() // (1024 * 1024)
 
 
 def apply(
@@ -122,7 +116,23 @@ def apply(
     _original_run = original_run
 
     def run(self: Any) -> None:
-        _streamed_run(self, original_run, chunk_rows, commit_every, credential_refresh)
+        # One span per load job, i.e. per destination table per run — the
+        # level at which "which table is slow" is answerable. Exception
+        # recording is off: an expired-credential failure here surfaces as
+        # an S3 error that can quote a signed URL.
+        with telemetry.tracer.start_as_current_span(
+            "dlt_worker.iceberg.load",
+            attributes={telemetry.ATTR_TABLE: self.load_table_name},
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                _streamed_run(
+                    self, original_run, chunk_rows, commit_every, credential_refresh
+                )
+            except Exception as exc:
+                span.set_status(telemetry.error_status(type(exc).__name__))
+                raise
 
     IcebergLoadFilesystemJob.run = run  # type: ignore[method-assign]
     logger.info(
@@ -151,6 +161,9 @@ def _streamed_run(
 
     disposition = job._load_table["write_disposition"]
     if disposition == "merge":
+        telemetry.add_event(
+            "iceberg.merge_fallback", {telemetry.ATTR_TABLE: job.load_table_name}
+        )
         # Upsert joins against the incoming data as a whole; keep upstream
         # behavior rather than pretend chunked upserts are equivalent. This
         # path materializes the load package — loud so an OOM here is not a
@@ -232,6 +245,13 @@ def _streamed_run(
         f.name for f in table.schema().fields if f.required and f.name not in data_names
     ]
     if missing_required:
+        telemetry.add_event(
+            "iceberg.columns_relaxed",
+            {
+                telemetry.ATTR_TABLE: job.load_table_name,
+                "dlt_worker.iceberg.columns": missing_required,
+            },
+        )
         logger.warning(
             "Iceberg streamed load: required column(s) %s of %s are missing from"
             " the incoming data; making them optional so the load can proceed",
@@ -291,6 +311,13 @@ def _streamed_run(
                 f"Iceberg streamed load: schema-incompatible append to"
                 f" {job.load_table_name}: {exc}"
             ) from exc
+        append_seconds = time.monotonic() - started
+        telemetry.iceberg_append_duration.record(
+            append_seconds, {telemetry.ATTR_TABLE: job.load_table_name}
+        )
+        telemetry.iceberg_rows_appended.add(
+            rows, {telemetry.ATTR_TABLE: job.load_table_name}
+        )
         total_rows += rows
         pending = True
         del chunk
@@ -302,7 +329,7 @@ def _streamed_run(
             "Iceberg streamed load: chunk %d appended in %.1fs (%d rows, %d total)"
             " [rss=%dMB, arrow=%dMB]",
             chunks,
-            time.monotonic() - started,
+            append_seconds,
             rows,
             total_rows,
             _rss_mb(),
@@ -332,6 +359,16 @@ def _streamed_run(
                 refresh_started = time.monotonic()
                 table = open_table()
                 opened_at = time.monotonic()
+                telemetry.iceberg_credential_refreshes.add(
+                    1, {telemetry.ATTR_TABLE: job.load_table_name}
+                )
+                telemetry.add_event(
+                    "iceberg.credentials_refreshed",
+                    {
+                        telemetry.ATTR_TABLE: job.load_table_name,
+                        "dlt_worker.iceberg.held_for_seconds": round(held_for),
+                    },
+                )
                 logger.info(
                     "Iceberg streamed load: re-opened %s for fresh storage"
                     " credentials after %.0fm in %.1fs [rss=%dMB]",
@@ -384,6 +421,13 @@ def _streamed_run(
     if pending:
         txn.commit_transaction()
 
+    telemetry.set_attributes(
+        {
+            "dlt_worker.iceberg.write_disposition": disposition,
+            "dlt_worker.iceberg.rows": total_rows,
+            "dlt_worker.iceberg.chunks": chunks,
+        }
+    )
     logger.info(
         "Iceberg streamed %s: %d rows in %d chunk(s) of <=%d rows to table %s"
         " [rss=%dMB]",

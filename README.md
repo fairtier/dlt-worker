@@ -79,6 +79,22 @@ All configuration is via environment variables.
 | `TRANSFORM_GIT_USERNAME`    | _(empty)_    | Git username for the hosted dbt repo                                                  |
 | `TRANSFORM_GIT_TOKEN`       | _(empty)_    | Git token for the hosted dbt repo                                                     |
 
+### OpenTelemetry
+
+Telemetry is configured with the [standard OTel environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/) — the worker mirrors none of them into its own config.
+
+| Variable                       | Default      | Description                                                                                     |
+|--------------------------------|--------------|-------------------------------------------------------------------------------------------------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT`  | _(empty)_    | OTLP/HTTP collector base URL (e.g. `http://otel-collector:4318`). **This is the on switch**: unset = no SDK is installed at all and instrumentation is a no-op |
+| `OTEL_EXPORTER_OTLP_HEADERS`   | _(empty)_    | Extra OTLP headers, e.g. authentication for a hosted collector                                  |
+| `OTEL_SERVICE_NAME`            | `dlt-worker` | Service name on every span and metric                                                           |
+| `OTEL_RESOURCE_ATTRIBUTES`     | _(empty)_    | Extra resource attributes (`k8s.namespace.name=…,deployment.environment=…`)                     |
+| `OTEL_METRIC_EXPORT_INTERVAL`  | `60000`      | Metric export interval in ms                                                                    |
+| `OTEL_TRACES_SAMPLER`          | `parentbased_always_on` | Sampler; a run trace is a handful of spans, so sampling is rarely worth it            |
+| `OTEL_SDK_DISABLED`            | `false`      | Kill switch — `true` disables export even with an endpoint configured                           |
+
+See [Observability](#observability) for what is emitted.
+
 ## Supported source types
 
 The control plane provides pipeline configurations that specify one of these source types:
@@ -98,6 +114,16 @@ Besides ingestion pipelines, the worker runs [dbt](https://www.getdbt.com/) tran
 4. Reports per-model and per-test results back to the control plane
 
 Transformations run on a cron schedule, on manual trigger, or chained after a successful pipeline run.
+
+## Observability
+
+Besides `/healthz` and structured logs, the worker emits OpenTelemetry traces and metrics over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. With it unset nothing is exported and no SDK is installed — the instrumentation compiles down to no-op API calls, so leaving telemetry off costs nothing.
+
+**Traces.** One trace per poll tick. `dlt_worker.poll` is the root; under it sit the control plane RPCs (`pipeline.v1.PipelineService/GetPipelineConfigs`, …), one `dlt_worker.pipeline.run` per due pipeline (with a `dlt_worker.pipeline.attempt` child per retry), and one `dlt_worker.transformation.run` per due transformation (with `dlt_worker.git.clone`, `dlt_worker.dbt.deps`, `dlt_worker.dbt.build` children). Pipeline runs execute in a subprocess, and the trace context is propagated into it, so `dlt_worker.pipeline.execute`, `dlt_worker.source.build`, `dlt_worker.dlt.run` and one `dlt_worker.iceberg.load` per destination table join the same trace. Events mark the things that are worth seeing inside a run but do not deserve a span of their own: `pipeline.retry`, `run.timeout`, `run.subprocess_died` (with the exit code — an OOM kill leaves nothing else behind), `pipeline.skipped`, `central.unreachable`, `iceberg.credentials_refreshed`.
+
+**Metrics.** `dlt_worker.pipeline.runs` / `.run.duration` / `.rows_loaded` / `.attempts`, `dlt_worker.transformation.runs` / `.run.duration` / `.nodes`, `dlt_worker.poll.duration`, `dlt_worker.api.requests` / `.request.duration`, `dlt_worker.workspace_db.operations`, `dlt_worker.iceberg.rows_appended` / `.append.duration` / `.credential_refreshes`, and `dlt_worker.process.memory.rss` (the number that decides whether the next run gets OOM-killed). Attributes are deliberately low-cardinality: pipeline/transformation name, source type, status, trigger kind — never run ids or error messages, which live on spans.
+
+**Secrets.** Source credentials, connection strings and git tokens reach exception text routinely, so spans never record raw exceptions on any path that touches them: what reaches a span is the same scrubbed message that goes into the run report, or the exception type alone.
 
 ## Development
 

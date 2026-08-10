@@ -15,7 +15,7 @@ import requests
 
 from dlt.common.schema.typing import TMergeDispositionDict, TWriteDispositionConfig
 
-from dlt_worker import config
+from dlt_worker import config, telemetry
 from dlt_worker.api_client import PipelineConfig, PipelineRunReport
 
 logger = logging.getLogger(__name__)
@@ -81,60 +81,102 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
     started_at = datetime.now(timezone.utc)
     rows_loaded = 0
 
-    try:
-        # destination="filesystem" writes Iceberg files to S3; unrelated to
-        # source_type="filesystem" which *reads* files from S3.
-        pipeline = dlt.pipeline(
-            pipeline_name=cfg.name,
-            destination="filesystem",
-            dataset_name=cfg.dataset_name,
-            pipelines_dir=config.DLT_STATE_DIR,
-        )
-
-        source = _build_source(cfg)
-
-        # Apply merge strategy when write_disposition is "merge" and strategy is set
-        write_disp: TWriteDispositionConfig = cfg.write_disposition
-        if cfg.write_disposition == "merge" and cfg.merge_strategy:
-            write_disp = TMergeDispositionDict(
-                disposition="merge",
-                strategy=cfg.merge_strategy,  # type: ignore[arg-type]
+    # The inner spans below are created with exception recording OFF on
+    # purpose: a dlt source exception quotes config freely (SQLAlchemy puts
+    # the whole connection URL in its message), and a span's recorded
+    # exception is not something _scrub_credentials can reach. The one
+    # message that lands on a span is the scrubbed one, set by hand.
+    with telemetry.tracer.start_as_current_span(
+        "dlt_worker.pipeline.execute",
+        attributes={
+            telemetry.ATTR_PIPELINE_ID: cfg.id,
+            telemetry.ATTR_PIPELINE_NAME: cfg.name,
+            telemetry.ATTR_SOURCE_TYPE: cfg.source_type,
+            telemetry.ATTR_DATASET: cfg.dataset_name,
+            telemetry.ATTR_WRITE_DISPOSITION: cfg.write_disposition,
+        },
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        try:
+            # destination="filesystem" writes Iceberg files to S3; unrelated to
+            # source_type="filesystem" which *reads* files from S3.
+            pipeline = dlt.pipeline(
+                pipeline_name=cfg.name,
+                destination="filesystem",
+                dataset_name=cfg.dataset_name,
+                pipelines_dir=config.DLT_STATE_DIR,
             )
 
-        pipeline.run(
-            source,
-            write_disposition=write_disp,
-            table_format="iceberg",
-        )
+            with telemetry.tracer.start_as_current_span(
+                "dlt_worker.source.build",
+                attributes={telemetry.ATTR_SOURCE_TYPE: cfg.source_type},
+                record_exception=False,
+                set_status_on_exception=False,
+            ):
+                source = _build_source(cfg)
 
-        rows_loaded = _count_rows(pipeline.last_trace.last_normalize_info)
+            # Apply merge strategy when write_disposition is "merge" and
+            # strategy is set
+            write_disp: TWriteDispositionConfig = cfg.write_disposition
+            if cfg.write_disposition == "merge" and cfg.merge_strategy:
+                write_disp = TMergeDispositionDict(
+                    disposition="merge",
+                    strategy=cfg.merge_strategy,  # type: ignore[arg-type]
+                )
 
-        logger.info("Pipeline %s completed: %d rows loaded", cfg.name, rows_loaded)
+            # dlt's own extract/normalize/load stages live under this span;
+            # it is where a run spends essentially all of its time.
+            with telemetry.tracer.start_as_current_span(
+                "dlt_worker.dlt.run",
+                attributes={telemetry.ATTR_PIPELINE_NAME: cfg.name},
+                record_exception=False,
+                set_status_on_exception=False,
+            ):
+                pipeline.run(
+                    source,
+                    write_disposition=write_disp,
+                    table_format="iceberg",
+                )
 
-        trigger_snapshot(cfg.name)
+            rows_loaded = _count_rows(pipeline.last_trace.last_normalize_info)
 
-        return PipelineRunReport(
-            pipeline_id=cfg.id,
-            status="success",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            rows_loaded=rows_loaded,
-        )
+            logger.info("Pipeline %s completed: %d rows loaded", cfg.name, rows_loaded)
 
-    except Exception as exc:
-        # Scrub the log too — the traceback quotes the same exception text.
-        logger.error(
-            "Pipeline %s failed:\n%s",
-            cfg.name,
-            _scrub_credentials(traceback.format_exc(), cfg.source_credentials),
-        )
-        return PipelineRunReport(
-            pipeline_id=cfg.id,
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error_message=_scrub_credentials(str(exc), cfg.source_credentials),
-        )
+            span.set_attribute(telemetry.ATTR_ROWS, rows_loaded)
+            span.set_attribute(telemetry.ATTR_STATUS, "success")
+            # What the run left resident is the number that decides whether
+            # the next one gets OOM-killed (see run_isolation).
+            span.set_attribute("dlt_worker.process.memory.rss", telemetry.rss_bytes())
+
+            trigger_snapshot(cfg.name)
+
+            return PipelineRunReport(
+                pipeline_id=cfg.id,
+                status="success",
+                started_at=started_at.isoformat(),
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                rows_loaded=rows_loaded,
+            )
+
+        except Exception as exc:
+            # Scrub the log too — the traceback quotes the same exception text.
+            logger.error(
+                "Pipeline %s failed:\n%s",
+                cfg.name,
+                _scrub_credentials(traceback.format_exc(), cfg.source_credentials),
+            )
+            error_message = _scrub_credentials(str(exc), cfg.source_credentials)
+            span.set_attribute(telemetry.ATTR_STATUS, "failed")
+            span.set_attribute("exception.type", type(exc).__name__)
+            span.set_status(telemetry.error_status(error_message))
+            return PipelineRunReport(
+                pipeline_id=cfg.id,
+                status="failed",
+                started_at=started_at.isoformat(),
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                error_message=error_message,
+            )
 
 
 def trigger_snapshot(pipeline_name: str) -> None:
@@ -157,6 +199,7 @@ def trigger_snapshot(pipeline_name: str) -> None:
         status = resp.json().get("status", "unknown")
         logger.info("Pipeline %s: snapshot %s", pipeline_name, status)
     except requests.RequestException:
+        telemetry.add_event("snapshot.failed")
         logger.warning(
             "Pipeline %s: failed to trigger snapshot webhook",
             pipeline_name,

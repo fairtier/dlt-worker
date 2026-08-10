@@ -21,13 +21,30 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import requests
+from opentelemetry.trace import SpanKind
+
+from dlt_worker import telemetry
 
 logger = logging.getLogger(__name__)
 
 # Refresh the cached token this many seconds before it expires.
 _TOKEN_REFRESH_MARGIN = 60
+
+
+def _rpc_target(url: str) -> tuple[str, str]:
+    """Split a Connect endpoint URL into (service, method).
+
+    ``.../pipeline.v1.PipelineService/GetPipelineConfigs`` ->
+    ``("pipeline.v1.PipelineService", "GetPipelineConfigs")``. Both halves
+    are from a fixed set, so they are safe as metric attributes.
+    """
+    parts = urlsplit(url).path.rsplit("/", 2)
+    if len(parts) < 3:
+        return "", parts[-1]
+    return parts[-2], parts[-1]
 
 
 @dataclass
@@ -121,27 +138,36 @@ class APIClient:
         if self._token and time.monotonic() < self._token_expires_at:
             return self._token
 
-        resp = self._session.post(
-            self.oidc_token_url,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": self.oidc_client_id,
-                "client_secret": self.oidc_client_secret,
-            },
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        # Re-raise parse failures (non-JSON body, missing access_token) as
-        # RequestException so callers' "central unreachable" degradation
-        # paths handle them instead of a raw traceback losing the tick.
-        try:
-            data = resp.json()
-            token = data["access_token"]
-            expires_in = int(data.get("expires_in", 3600))
-        except (ValueError, KeyError, TypeError) as e:
-            raise requests.RequestException(
-                f"OIDC token response malformed: {type(e).__name__}"
-            ) from e
+        # Traced because "the worker went quiet" is as often a broken OIDC
+        # app as it is a broken API. requests keeps neither headers nor the
+        # form body (the client secret) in its exception messages, so the
+        # default exception recording is safe here.
+        with telemetry.tracer.start_as_current_span(
+            "dlt_worker.oidc.token",
+            kind=SpanKind.CLIENT,
+            attributes={"server.address": urlsplit(self.oidc_token_url).hostname or ""},
+        ):
+            resp = self._session.post(
+                self.oidc_token_url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self.oidc_client_id,
+                    "client_secret": self.oidc_client_secret,
+                },
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            # Re-raise parse failures (non-JSON body, missing access_token) as
+            # RequestException so callers' "central unreachable" degradation
+            # paths handle them instead of a raw traceback losing the tick.
+            try:
+                data = resp.json()
+                token = data["access_token"]
+                expires_in = int(data.get("expires_in", 3600))
+            except (ValueError, KeyError, TypeError) as e:
+                raise requests.RequestException(
+                    f"OIDC token response malformed: {type(e).__name__}"
+                ) from e
         self._token = token
         self._token_expires_at = time.monotonic() + max(
             expires_in - _TOKEN_REFRESH_MARGIN, 30
@@ -153,22 +179,58 @@ class APIClient:
 
         Retries once with a fresh token on 401 (token revoked/expired early,
         e.g. after a Casdoor credential rotation).
-        """
-        headers = {"Content-Type": "application/json"}
-        if self.auth_enabled:
-            headers["Authorization"] = f"Bearer {self._get_token()}"
 
-        resp = self._session.post(
-            url, json=payload, timeout=self.timeout, headers=headers
-        )
-        if resp.status_code == 401 and self.auth_enabled:
-            self._token = ""
-            self._token_expires_at = 0.0
-            headers["Authorization"] = f"Bearer {self._get_token()}"
-            resp = self._session.post(
-                url, json=payload, timeout=self.timeout, headers=headers
-            )
-        return resp
+        Every control plane call funnels through here, so this is also where
+        they are traced and counted — one CLIENT span and one duration
+        sample per call, method and status code as attributes.
+        """
+        service, method = _rpc_target(url)
+        started = time.monotonic()
+        status_code = 0
+
+        with telemetry.tracer.start_as_current_span(
+            f"{service}/{method}" if service else method,
+            kind=SpanKind.CLIENT,
+            attributes={
+                "rpc.system": "connect_rpc",
+                "rpc.service": service,
+                "rpc.method": method,
+                "server.address": urlsplit(url).hostname or "",
+            },
+        ) as span:
+            try:
+                headers = {"Content-Type": "application/json"}
+                if self.auth_enabled:
+                    headers["Authorization"] = f"Bearer {self._get_token()}"
+
+                resp = self._session.post(
+                    url, json=payload, timeout=self.timeout, headers=headers
+                )
+                if resp.status_code == 401 and self.auth_enabled:
+                    span.add_event("auth.token_refreshed")
+                    self._token = ""
+                    self._token_expires_at = 0.0
+                    headers["Authorization"] = f"Bearer {self._get_token()}"
+                    resp = self._session.post(
+                        url, json=payload, timeout=self.timeout, headers=headers
+                    )
+                status_code = resp.status_code
+                span.set_attribute("http.response.status_code", status_code)
+                return resp
+            finally:
+                # Counted on the way out so a transport failure (no
+                # response, status 0) is counted too — that is the shape a
+                # central outage takes.
+                telemetry.api_requests.add(
+                    1,
+                    {
+                        "rpc.method": method,
+                        "http.response.status_code": status_code,
+                    },
+                )
+                telemetry.api_request_duration.record(
+                    time.monotonic() - started, {"rpc.method": method}
+                )
 
     def health_status(self) -> tuple[bool, dict[str, Any]]:
         """Return health status and details dict."""

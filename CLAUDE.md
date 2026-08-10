@@ -41,6 +41,7 @@ src/dlt_worker/       # Application source
   __main__.py         # Entry point (python -m dlt_worker)
   config.py           # Environment variable configuration
   health.py           # Kubernetes health check server
+  telemetry.py        # OpenTelemetry traces + metrics (no-op unless an OTLP endpoint is set)
   main.py             # Main poll loop with graceful shutdown
   pipeline_files.py   # Files mode: load pipeline definitions from a git checkout
   scheduler_state.py  # Files mode: worker-owned last_run_at (scheduler.json)
