@@ -36,6 +36,20 @@ Every append is bracketed by an RSS + wall-clock log line. A single 200k-row
 append taking minutes or the RSS climbing across chunks are the two ways this
 load can still OOM a small box; the trace makes which one it is unambiguous
 in the box logs instead of a silent 13-minute gap before the OOM-kill.
+
+Long loads also have to survive their own storage credentials expiring.
+With credential vending (Lakekeeper's default for R2), the catalog's
+``load_table`` response carries temporary S3 credentials, and PyIceberg
+builds the table's ``FileIO`` from them exactly once — there is no refresh,
+and the response advertises no expiry to refresh against. A load that runs
+longer than the credential's lifetime therefore fails on whatever it touches
+last, usually a manifest or snapshot write, with ``ACCESS_DENIED`` or
+``SIGNATURE_DOES_NOT_MATCH``. dlt reads that as transient and retries the
+whole load package, which for ``replace`` truncates and starts over — so the
+load does not merely fail, it loops forever, and a table that takes longer
+than one credential lifetime can never load at all. ``credential_refresh``
+re-opens the table at interim commit boundaries, which re-issues
+``load_table`` and returns freshly vended credentials.
 """
 
 from __future__ import annotations
@@ -63,6 +77,17 @@ DEFAULT_CHUNK_ROWS = 200_000
 # periodic commits (single atomic commit at the end, the pre-0.2.5 behavior).
 DEFAULT_COMMIT_EVERY = 20
 
+# Re-open the table (and so re-vend its storage credentials) once a load has
+# held the same ones for this long. Vended credentials carry no advertised
+# expiry — the catalog response has an access key, a secret and a session
+# token, and nothing that says when they die — so this cannot be derived and
+# has to be a conservative interval. 15 minutes is well inside the hour that
+# Lakekeeper's R2 vending has been observed to grant, leaves room for a
+# deployment configured shorter, and costs one extra catalog round-trip per
+# interval. Refresh happens only at an interim commit boundary, so it is
+# inert when commit_every is 0. 0 disables it (pre-0.6.1 behavior).
+DEFAULT_CREDENTIAL_REFRESH = 15 * 60
+
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 _original_run: Callable[..., None] | None = None
@@ -81,6 +106,7 @@ def _rss_mb() -> int:
 def apply(
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     commit_every: int = DEFAULT_COMMIT_EVERY,
+    credential_refresh: int = DEFAULT_CREDENTIAL_REFRESH,
 ) -> None:
     """Monkeypatch IcebergLoadFilesystemJob.run with the streamed version.
 
@@ -96,13 +122,15 @@ def apply(
     _original_run = original_run
 
     def run(self: Any) -> None:
-        _streamed_run(self, original_run, chunk_rows, commit_every)
+        _streamed_run(self, original_run, chunk_rows, commit_every, credential_refresh)
 
     IcebergLoadFilesystemJob.run = run  # type: ignore[method-assign]
     logger.info(
-        "Iceberg loads patched to streamed appends (chunk of %d rows, commit every %d)",
+        "Iceberg loads patched to streamed appends (chunk of %d rows, commit every"
+        " %d, credential refresh every %ds)",
         chunk_rows,
         commit_every,
+        credential_refresh,
     )
 
 
@@ -111,6 +139,7 @@ def _streamed_run(
     original_run: Callable[..., None],
     chunk_rows: int,
     commit_every: int,
+    credential_refresh: int = DEFAULT_CREDENTIAL_REFRESH,
 ) -> None:
     from dlt.common.destination.exceptions import (
         DestinationTerminalException,
@@ -143,18 +172,26 @@ def _streamed_run(
         _rss_mb(),
     )
 
-    open_started = time.monotonic()
-    try:
-        table = job._job_client.load_open_table(
+    def open_table() -> Any:
+        # Every call re-issues the catalog's load_table, so a vending catalog
+        # hands back freshly minted storage credentials and PyIceberg builds a
+        # new FileIO around them. That re-vending is the whole point of
+        # re-opening mid-load; the schema union is a no-op by then.
+        return job._job_client.load_open_table(
             "iceberg", job.load_table_name, schema=ds.schema
         )
+
+    open_started = time.monotonic()
+    try:
+        table = open_table()
     except DestinationUndefinedEntity:
         # Upstream's missing-table branch creates the table and re-enters
         # self.run() — i.e. this patched run — without materializing data.
         return original_run(job)
+    opened_at = time.monotonic()
     logger.info(
         "Iceberg streamed load: table opened/evolved in %.1fs [rss=%dMB]",
-        time.monotonic() - open_started,
+        opened_at - open_started,
         _rss_mb(),
     )
 
@@ -180,9 +217,8 @@ def _streamed_run(
             _rss_mb(),
         )
         # Re-open on the now-empty table so the appends build on a clean base.
-        table = job._job_client.load_open_table(
-            "iceberg", job.load_table_name, schema=ds.schema
-        )
+        table = open_table()
+        opened_at = time.monotonic()
 
     # Required table columns the incoming data doesn't provide can never be
     # satisfied by an append — PyIceberg rejects every write outright, and dlt
@@ -206,6 +242,16 @@ def _streamed_run(
             for name in missing_required:
                 update.make_column_optional(name)
 
+    if credential_refresh and not commit_every:
+        # Without interim commits there is no boundary to swap the table at,
+        # so a load in this mode still dies when its credentials expire. Say
+        # so once, rather than let the refresh look active in the config line.
+        logger.warning(
+            "Iceberg streamed load: credential refresh is inert with"
+            " commit_every=0 — a load outlasting its vended credentials will"
+            " fail and be retried from the start"
+        )
+
     txn = table.transaction()
     pending = False  # the current txn holds uncommitted appends
 
@@ -217,6 +263,7 @@ def _streamed_run(
 
     def flush() -> None:
         nonlocal buf, buf_rows, total_rows, chunks, committed_chunks, txn, pending
+        nonlocal table, opened_at
         if not buf:
             return
         chunk = pa.Table.from_batches(buf, schema=ds.schema)
@@ -277,6 +324,22 @@ def _streamed_run(
                 time.monotonic() - commit_started,
                 _rss_mb(),
             )
+            # Between commits is the only safe moment to swap the table: an
+            # open transaction belongs to the object that created it, so a
+            # refresh has to land where nothing is pending.
+            held_for = time.monotonic() - opened_at
+            if credential_refresh and held_for >= credential_refresh:
+                refresh_started = time.monotonic()
+                table = open_table()
+                opened_at = time.monotonic()
+                logger.info(
+                    "Iceberg streamed load: re-opened %s for fresh storage"
+                    " credentials after %.0fm in %.1fs [rss=%dMB]",
+                    job.load_table_name,
+                    held_for / 60,
+                    opened_at - refresh_started,
+                    _rss_mb(),
+                )
             txn = table.transaction()
 
     # batch_size caps what the scanner materializes per batch; the explicit

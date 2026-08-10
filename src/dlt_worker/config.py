@@ -70,6 +70,15 @@ ICEBERG_LOAD_CHUNK_ROWS: int = 200_000
 # end (pre-0.2.5 behavior). Snapshot expiry in the maintenance CronJob reaps
 # the extra snapshots.
 ICEBERG_LOAD_COMMIT_EVERY: int = 20
+# Re-open the Iceberg table mid-load once its storage credentials are this
+# old, in seconds (see iceberg_stream.py). With credential vending the
+# catalog mints temporary S3 credentials and PyIceberg never refreshes them,
+# so a load that outlives them fails on a metadata write and dlt retries the
+# whole package — for `replace`, forever. The response advertises no expiry,
+# so this is a conservative interval rather than a derived one. Only takes
+# effect at an interim commit, so it needs ICEBERG_LOAD_COMMIT_EVERY > 0.
+# 0 disables (pre-0.6.1 behavior).
+ICEBERG_CREDENTIAL_REFRESH_SECONDS: int = 900
 # Run each pipeline in a short-lived spawned subprocess (see
 # run_isolation.py). A big dlt run leaves ~1 GB resident (Arrow buffers,
 # dlt caches, allocator free lists) that Python never returns to the OS —
@@ -131,6 +140,7 @@ def load() -> None:
     global PIPELINE_MAX_RETRIES, PIPELINE_RETRY_BASE_DELAY, SNAPSHOT_URL
     global PIPELINES_DIR, AGE_KEY_FILE, ICEBERG_LOAD_CHUNK_ROWS
     global ICEBERG_LOAD_COMMIT_EVERY
+    global ICEBERG_CREDENTIAL_REFRESH_SECONDS
     global PIPELINE_SUBPROCESS
     global PIPELINE_RUN_TIMEOUT_SECONDS
     global WORKSPACE_DB_URL
@@ -158,6 +168,7 @@ def load() -> None:
     AGE_KEY_FILE = os.environ.get("AGE_KEY_FILE", "")
     ICEBERG_LOAD_CHUNK_ROWS = _int("ICEBERG_LOAD_CHUNK_ROWS", 200_000)
     ICEBERG_LOAD_COMMIT_EVERY = _int("ICEBERG_LOAD_COMMIT_EVERY", 20)
+    ICEBERG_CREDENTIAL_REFRESH_SECONDS = _int("ICEBERG_CREDENTIAL_REFRESH_SECONDS", 900)
     PIPELINE_SUBPROCESS = os.environ.get("PIPELINE_SUBPROCESS", "1").lower() not in (
         "0",
         "false",

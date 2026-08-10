@@ -111,38 +111,58 @@ class _FakeJob:
         num_rows: int,
         table_fields: list[tuple[str, bool]] | None = None,
         append_error: Exception | None = None,
+        fresh_table_per_open: bool = False,
     ) -> None:
         self._load_table = {"write_disposition": disposition}
         self._ds = _arrow_dataset(num_rows)
-        self.table = _FakeTable(table_fields, append_error)
+        self._table_fields = table_fields
+        self._append_error = append_error
         self._job_client = MagicMock()
-        self._job_client.load_open_table.return_value = self.table
+        if fresh_table_per_open:
+            # A vending catalog builds a new Table (and a new FileIO around
+            # newly minted credentials) on every load_table, so a distinct
+            # object per open is what makes a mid-load refresh observable.
+            self.tables: list[_FakeTable] = []
+            self._job_client.load_open_table.side_effect = lambda *a, **kw: (
+                self._new_table()
+            )
+        else:
+            self.table = _FakeTable(table_fields, append_error)
+            self.tables = [self.table]
+            self._job_client.load_open_table.return_value = self.table
+
+    def _new_table(self) -> _FakeTable:
+        table = _FakeTable(self._table_fields, self._append_error)
+        self.tables.append(table)
+        return table
 
     @property
     def arrow_dataset(self) -> Any:
         return self._ds
 
     # --- aggregate helpers ----------------------------------------------
+    # Across every table the job opened, so the counts mean the same thing
+    # whether or not the load re-opened for fresh credentials.
     @property
     def txns(self) -> list[_FakeTxn]:
-        return self.table.txns
+        return [txn for table in self.tables for txn in table.txns]
 
     @property
     def appended(self) -> list[pa.Table]:
-        return [t for txn in self.table.txns for t in txn.appended]
+        return [t for txn in self.txns for t in txn.appended]
 
     @property
     def deletes(self) -> list[Any]:
-        return self.table.deletes
+        return [d for table in self.tables for d in table.deletes]
 
     @property
     def commit_count(self) -> int:
-        return sum(1 for txn in self.table.txns if txn.committed)
+        return sum(1 for txn in self.txns if txn.committed)
 
     @property
     def all_committed(self) -> bool:
         # every transaction that received appends must have been committed
-        return all(txn.committed for txn in self.table.txns if txn.appended)
+        return all(txn.committed for txn in self.txns if txn.appended)
 
 
 def test_append_streams_in_chunks() -> None:
@@ -301,3 +321,76 @@ def test_apply_patches_once() -> None:
     finally:
         IcebergLoadFilesystemJob.run = before
         iceberg_stream._original_run = None
+
+
+class _FakeClock:
+    """monotonic() that jumps a fixed step per call, so 'how long have we held
+    these credentials' is decided by the test rather than by how fast the
+    machine runs."""
+
+    def __init__(self, step: float = 60.0) -> None:
+        self._now = 0.0
+        self._step = step
+
+    def monotonic(self) -> float:
+        self._now += self._step
+        return self._now
+
+
+def test_credentials_refreshed_at_interim_commits(monkeypatch: Any) -> None:
+    # Vended storage credentials expire mid-load and PyIceberg never renews
+    # them, so a long load must re-open the table to get fresh ones. 5 chunks
+    # committing every 2 gives interim commits after chunks 2 and 4; with the
+    # refresh interval already exceeded, each must re-open.
+    monkeypatch.setattr(iceberg_stream.time, "monotonic", _FakeClock().monotonic)
+    job = _FakeJob("append", num_rows=5_000, fresh_table_per_open=True)
+
+    iceberg_stream._streamed_run(
+        job, MagicMock(), chunk_rows=1_000, commit_every=2, credential_refresh=1
+    )
+
+    assert len(job.tables) == 3  # initial open + one per interim commit
+    # and the load is still correct across the swap: nothing lost, nothing
+    # appended to a transaction belonging to a superseded table.
+    assert sum(t.num_rows for t in job.appended) == 5_000
+    assert job.all_committed
+
+
+def test_credentials_not_refreshed_before_the_interval(monkeypatch: Any) -> None:
+    monkeypatch.setattr(iceberg_stream.time, "monotonic", _FakeClock().monotonic)
+    job = _FakeJob("append", num_rows=5_000, fresh_table_per_open=True)
+
+    iceberg_stream._streamed_run(
+        job, MagicMock(), chunk_rows=1_000, commit_every=2, credential_refresh=10**9
+    )
+
+    assert len(job.tables) == 1
+    assert sum(t.num_rows for t in job.appended) == 5_000
+
+
+def test_credential_refresh_disabled(monkeypatch: Any) -> None:
+    monkeypatch.setattr(iceberg_stream.time, "monotonic", _FakeClock().monotonic)
+    job = _FakeJob("append", num_rows=5_000, fresh_table_per_open=True)
+
+    iceberg_stream._streamed_run(
+        job, MagicMock(), chunk_rows=1_000, commit_every=2, credential_refresh=0
+    )
+
+    assert len(job.tables) == 1
+
+
+def test_credential_refresh_warns_when_no_interim_commits(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    # Without interim commits there is no boundary to swap the table at, so
+    # the refresh cannot run — say so rather than appear configured.
+    monkeypatch.setattr(iceberg_stream.time, "monotonic", _FakeClock().monotonic)
+    job = _FakeJob("append", num_rows=5_000, fresh_table_per_open=True)
+
+    with caplog.at_level("WARNING", logger=iceberg_stream.logger.name):
+        iceberg_stream._streamed_run(
+            job, MagicMock(), chunk_rows=1_000, commit_every=0, credential_refresh=1
+        )
+
+    assert len(job.tables) == 1
+    assert any("credential refresh is inert" in r.message for r in caplog.records)

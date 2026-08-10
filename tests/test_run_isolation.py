@@ -64,10 +64,11 @@ def test_child_main_sends_report_over_pipe(monkeypatch: pytest.MonkeyPatch) -> N
     ):
         mock_config.ICEBERG_LOAD_CHUNK_ROWS = 200_000
         mock_config.ICEBERG_LOAD_COMMIT_EVERY = 20
+        mock_config.ICEBERG_CREDENTIAL_REFRESH_SECONDS = 900
         _child_main(send_conn, cfg)
 
     mock_config.load.assert_called_once_with()
-    mock_stream.apply.assert_called_once_with(200_000, 20)
+    mock_stream.apply.assert_called_once_with(200_000, 20, 900)
     m_run.assert_called_once_with(cfg)
     assert recv_conn.recv() == report
     recv_conn.close()

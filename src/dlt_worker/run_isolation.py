@@ -54,7 +54,9 @@ def _child_main(conn: Connection, cfg: PipelineConfig) -> None:
     )
     if config.ICEBERG_LOAD_CHUNK_ROWS > 0:
         iceberg_stream.apply(
-            config.ICEBERG_LOAD_CHUNK_ROWS, config.ICEBERG_LOAD_COMMIT_EVERY
+            config.ICEBERG_LOAD_CHUNK_ROWS,
+            config.ICEBERG_LOAD_COMMIT_EVERY,
+            config.ICEBERG_CREDENTIAL_REFRESH_SECONDS,
         )
     conn.send(run_pipeline(cfg))
     conn.close()
