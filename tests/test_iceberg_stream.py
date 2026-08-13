@@ -28,6 +28,29 @@ def _arrow_dataset(num_rows: int) -> Any:
     return pyarrow.dataset.dataset(tbl)
 
 
+def _batched_dataset(batch_rows: list[int]) -> Any:
+    """A dataset whose batches deliberately do NOT align with the chunk size.
+
+    The scanner hands these through as stored, which is the shape that used to
+    break the chunk bound: a batch tail leaves a partial buffer, and the next
+    batch's slice was taken as a full chunk regardless.
+    """
+    # Explicit schema: a zero-row string column would otherwise infer as null
+    # and refuse to concatenate with its non-empty siblings.
+    schema = pa.schema([("id", pa.int64()), ("name", pa.string())])
+    batches = [
+        pa.record_batch(
+            {
+                "id": pa.array(range(n), type=pa.int64()),
+                "name": pa.array([f"row-{i}" for i in range(n)], type=pa.string()),
+            },
+            schema=schema,
+        )
+        for n in batch_rows
+    ]
+    return pyarrow.dataset.dataset(pa.Table.from_batches(batches, schema=schema))
+
+
 class _FakeTxn:
     def __init__(self, append_error: Exception | None = None) -> None:
         self.appended: list[pa.Table] = []
@@ -112,9 +135,10 @@ class _FakeJob:
         table_fields: list[tuple[str, bool]] | None = None,
         append_error: Exception | None = None,
         fresh_table_per_open: bool = False,
+        dataset: Any | None = None,
     ) -> None:
         self._load_table = {"write_disposition": disposition}
-        self._ds = _arrow_dataset(num_rows)
+        self._ds = dataset if dataset is not None else _arrow_dataset(num_rows)
         self._table_fields = table_fields
         self._append_error = append_error
         self._job_client = MagicMock()
@@ -177,6 +201,51 @@ def test_append_streams_in_chunks() -> None:
     assert len(job.appended) >= 3  # 2500 rows in <=1000-row chunks
     assert sum(t.num_rows for t in job.appended) == 2_500
     assert all(t.num_rows <= 1_000 for t in job.appended)
+
+
+def test_chunk_bound_holds_when_batches_do_not_align() -> None:
+    """The bound the whole design rests on: peak memory is ONE chunk.
+
+    It did not hold. A batch tail left a partial buffer, and the next batch's
+    first slice was still taken as a full `chunk_rows`, so a chunk could reach
+    `2 * chunk_rows - 1`. Measured on a real 421-chunk taxi load: 22 chunks
+    over the nominal 200,000 rows, the largest 298,963 — and the run was
+    OOM-killed on one of the oversized ones.
+
+    700-row batches against a 1,000-row chunk reproduce it exactly: the old
+    code emitted 1,400.
+    """
+    job = _FakeJob("append", num_rows=0, dataset=_batched_dataset([700] * 6))
+    original = MagicMock()
+
+    iceberg_stream._streamed_run(job, original, chunk_rows=1_000, commit_every=0)
+
+    assert sum(t.num_rows for t in job.appended) == 4_200
+    assert max(t.num_rows for t in job.appended) <= 1_000
+    # And it must still fill chunks rather than emitting one per batch —
+    # bounding by flushing early would trade the OOM for tiny data files.
+    assert [t.num_rows for t in job.appended] == [1_000, 1_000, 1_000, 1_000, 200]
+
+
+def test_chunk_bound_holds_for_batches_larger_than_a_chunk() -> None:
+    """The other direction: one batch must still be split into whole chunks."""
+    job = _FakeJob("append", num_rows=0, dataset=_batched_dataset([2_500, 300]))
+    original = MagicMock()
+
+    iceberg_stream._streamed_run(job, original, chunk_rows=1_000, commit_every=0)
+
+    assert sum(t.num_rows for t in job.appended) == 2_800
+    assert [t.num_rows for t in job.appended] == [1_000, 1_000, 800]
+
+
+def test_empty_batches_do_not_stall_the_stream() -> None:
+    """A zero-row batch must be skipped, not loop forever on no progress."""
+    job = _FakeJob("append", num_rows=0, dataset=_batched_dataset([0, 500, 0, 500]))
+    original = MagicMock()
+
+    iceberg_stream._streamed_run(job, original, chunk_rows=1_000, commit_every=0)
+
+    assert sum(t.num_rows for t in job.appended) == 1_000
 
 
 def test_periodic_commit_flushes_and_reopens_transactions() -> None:

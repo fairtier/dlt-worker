@@ -54,12 +54,12 @@ re-opens the table at interim commit boundaries, which re-issues
 
 from __future__ import annotations
 
-import gc
 import logging
 import time
 from typing import Any, Callable
 
 from dlt_worker import telemetry
+from dlt_worker.memory import release_memory
 
 logger = logging.getLogger(__name__)
 
@@ -321,10 +321,11 @@ def _streamed_run(
         total_rows += rows
         pending = True
         del chunk
-        # Arrow's default pool retains freed buffers; on a memory-limited
-        # worker the RSS would otherwise ratchet up across chunks.
-        pa.default_memory_pool().release_unused()
-        gc.collect()
+        # Arrow's default pool retains freed buffers and glibc keeps freed
+        # heap chunks in its arenas; on a memory-limited worker the RSS would
+        # otherwise ratchet up across chunks. See memory.release_memory for
+        # why all three holders have to be asked separately.
+        release_memory()
         logger.info(
             "Iceberg streamed load: chunk %d appended in %.1fs (%d rows, %d total)"
             " [rss=%dMB, arrow=%dMB]",
@@ -410,9 +411,24 @@ def _streamed_run(
         # Exotic dataset/format that rejects parquet scan options — the
         # memory-growth fix doesn't apply there, streaming still does.
         scanner = ds.scanner(**scanner_kwargs)
+    # Whatever extract and normalize left resident is still held here, and the
+    # load phase is about to add its own peak on top. Trim once before the
+    # first append rather than only after it: a child that had just normalized
+    # started its load at 492MB and died at chunk 15, while one that resumed a
+    # pending package ran the same chunks at 324MB (2026-08-12).
+    release_memory()
+
     for batch in scanner.to_batches():
-        for start in range(0, batch.num_rows, chunk_rows):
-            piece = batch.slice(start, chunk_rows)
+        offset = 0
+        # Slice to the space LEFT in the buffer, not to a full chunk_rows.
+        # Slicing blindly overshot whenever a batch's tail left a partial
+        # buffer behind: the next full slice pushed buf_rows to as much as
+        # 2*chunk_rows-1, so the bound the whole design rests on ("peak memory
+        # is one chunk") silently did not hold. Measured on a 421-chunk taxi
+        # load: 22 chunks over the nominal 200,000 rows, the largest 298,963.
+        while offset < batch.num_rows:
+            piece = batch.slice(offset, chunk_rows - buf_rows)
+            offset += piece.num_rows
             buf.append(piece)
             buf_rows += piece.num_rows
             if buf_rows >= chunk_rows:

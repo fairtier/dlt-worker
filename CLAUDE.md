@@ -47,6 +47,7 @@ src/dlt_worker/       # Application source
   scheduler_state.py  # Files mode: worker-owned last_run_at (scheduler.json)
   pipeline_runner.py  # dlt pipeline execution (child process only)
   run_isolation.py    # Subprocess-per-run for pipelines AND dbt: releases post-run memory, contains OOM kills, keeps the dlt/dbt imports out of the poll loop
+  memory.py           # release_memory(): gc + Arrow pool + glibc malloc_trim. Three holders, three separate asks — freeing one does not free the others
   transformation_runner.py  # dbt transformation execution (git clone + dbt build; child process only)
   snapshot.py         # State-snapshot webhook — parent-side, so it can't drag dlt in
   workspace_db.py     # Local-first run recording into the workspace Postgres database
