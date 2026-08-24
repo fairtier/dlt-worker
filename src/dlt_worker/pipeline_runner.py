@@ -257,11 +257,29 @@ def _build_rest_api_source(cfg: PipelineConfig) -> Any:
     )
 
 
+def _normalize_pg_connection_string(connection_string: str) -> str:
+    """Map the common PostgreSQL URL schemes onto the installed driver.
+
+    This image deliberately ships psycopg (v3) as its only database driver,
+    but SQLAlchemy resolves a plain ``postgresql://`` to psycopg2 and knows
+    no ``postgres`` dialect at all — so the natural forms users paste would
+    crash at engine creation. Anything that is not a PostgreSQL scheme is
+    left untouched (the FairTier API rejects those at save time; a
+    self-hoster who installed extra drivers keeps them working).
+    """
+    scheme, sep, rest = connection_string.partition("://")
+    if sep and scheme.lower() in ("postgres", "postgresql"):
+        return "postgresql+psycopg://" + rest
+    return connection_string
+
+
 def _build_sql_database_source(cfg: PipelineConfig) -> Any:
     from dlt.sources.sql_database import sql_database
 
     try:
-        connection_string = cfg.source_credentials["connection_string"]
+        connection_string = _normalize_pg_connection_string(
+            cfg.source_credentials["connection_string"]
+        )
     except KeyError:
         raise ValueError(
             f"Pipeline {cfg.name!r}: source_credentials missing required 'connection_string'"

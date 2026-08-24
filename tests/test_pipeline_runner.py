@@ -17,6 +17,7 @@ from dlt_worker.pipeline_runner import (
     _build_sql_database_source,
     _count_rows,
     _normalize_headers,
+    _normalize_pg_connection_string,
     _range_table_name,
     _reader_for,
     _rows_to_records,
@@ -43,6 +44,50 @@ def _make_config(**overrides: Any) -> PipelineConfig:
     return PipelineConfig(**defaults)
 
 
+class TestNormalizePgConnectionString:
+    """The image ships psycopg (v3) only; SQLAlchemy would resolve a plain
+    postgresql:// to the absent psycopg2, and postgres:// is not a dialect
+    at all — both must be mapped onto the installed driver."""
+
+    def test_plain_postgresql_scheme(self) -> None:
+        assert (
+            _normalize_pg_connection_string("postgresql://u:p@host:5432/db")
+            == "postgresql+psycopg://u:p@host:5432/db"
+        )
+
+    def test_heroku_style_postgres_scheme(self) -> None:
+        assert (
+            _normalize_pg_connection_string("postgres://u:p@host/db")
+            == "postgresql+psycopg://u:p@host/db"
+        )
+
+    def test_explicit_psycopg_unchanged(self) -> None:
+        assert (
+            _normalize_pg_connection_string("postgresql+psycopg://u:p@host/db")
+            == "postgresql+psycopg://u:p@host/db"
+        )
+
+    def test_scheme_case_insensitive(self) -> None:
+        assert (
+            _normalize_pg_connection_string("PostgreSQL://u:p@host/db")
+            == "postgresql+psycopg://u:p@host/db"
+        )
+
+    def test_other_dialects_untouched(self) -> None:
+        # A self-hoster with extra drivers installed keeps them working;
+        # the FairTier API rejects unsupported dialects at save time.
+        assert (
+            _normalize_pg_connection_string("mysql+pymysql://u:p@host/db")
+            == "mysql+pymysql://u:p@host/db"
+        )
+
+    def test_non_url_untouched(self) -> None:
+        assert (
+            _normalize_pg_connection_string("host=localhost dbname=prod")
+            == "host=localhost dbname=prod"
+        )
+
+
 @patch("dlt.sources.sql_database.sql_database")
 class TestBuildSqlDatabaseSource:
     """Tests for _build_sql_database_source."""
@@ -54,7 +99,7 @@ class TestBuildSqlDatabaseSource:
         _build_sql_database_source(cfg)
 
         mock_sql_db.assert_called_once_with(
-            credentials="postgresql://u:p@host/db",
+            credentials="postgresql+psycopg://u:p@host/db",
             table_names=["orders", "customers"],
         )
 
@@ -72,7 +117,7 @@ class TestBuildSqlDatabaseSource:
         _build_sql_database_source(cfg)
 
         mock_sql_db.assert_called_once_with(
-            credentials="postgresql://u:p@host/db",
+            credentials="postgresql+psycopg://u:p@host/db",
             table_names=["orders", "customers"],
         )
         # No apply_hints called when there's no incremental config
@@ -107,7 +152,7 @@ class TestBuildSqlDatabaseSource:
         _build_sql_database_source(cfg)
 
         mock_sql_db.assert_called_once_with(
-            credentials="postgresql://u:p@host/db",
+            credentials="postgresql+psycopg://u:p@host/db",
             table_names=["orders", "customers"],
         )
 
@@ -160,7 +205,7 @@ class TestBuildSqlDatabaseSource:
             _build_sql_database_source(cfg)
 
         mock_sql_db.assert_called_once_with(
-            credentials="postgresql://u:p@host/db",
+            credentials="postgresql+psycopg://u:p@host/db",
             table_names=["used_table"],
         )
         assert "'tables' will be ignored" in caplog.text
@@ -172,7 +217,7 @@ class TestBuildSqlDatabaseSource:
         _build_sql_database_source(cfg)
 
         mock_sql_db.assert_called_once_with(
-            credentials="postgresql://u:p@host/db",
+            credentials="postgresql+psycopg://u:p@host/db",
             table_names=None,
         )
 
