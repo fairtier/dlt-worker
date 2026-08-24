@@ -23,6 +23,9 @@ _REQUIRED = {
     "AWS_ENDPOINT_URL": "https://acc.r2.cloudflarestorage.com",
     "AWS_REGION": "auto",
     "S3_BUCKET": "ft-acme",
+    # Required since 0.9.0: the pipelines checkout is the only source of
+    # definitions, so a worker without one has nothing to schedule.
+    "PIPELINES_DIR": "/pipelines",
 }
 
 _ROW_GROUP_KEY = "DATA_WRITER__ROW_GROUP_SIZE"

@@ -63,6 +63,17 @@ class PipelineFilesResult:
 _REQUIRED_FIELDS = ("id", "source_type", "dataset_name")
 
 
+def checkout_present(pipelines_dir: str) -> bool:
+    """True when the pipelines checkout is readable at ``pipelines_dir``.
+
+    In files mode this directory *is* the schedule, so its absence is the
+    one condition under which the worker genuinely cannot run anything —
+    which is why /healthz gates on it there (see health.py). Shared with
+    the loader below so the two can never disagree on what "present" means.
+    """
+    return os.path.isdir(os.path.join(pipelines_dir, "pipelines"))
+
+
 def load_pipeline_configs(
     pipelines_dir: str, age_key_file: str = ""
 ) -> PipelineFilesResult:
@@ -74,7 +85,7 @@ def load_pipeline_configs(
         logger.error("Failed to list pipeline files at %s", pattern, exc_info=True)
         return PipelineFilesResult(configs=[], had_errors=True)
 
-    if not os.path.isdir(os.path.join(pipelines_dir, "pipelines")):
+    if not checkout_present(pipelines_dir):
         # Distinguish "no pipelines yet" (empty dir) from a missing/broken
         # checkout — the latter must not prune scheduler state.
         logger.error("Pipelines checkout missing at %s/pipelines", pipelines_dir)

@@ -39,124 +39,100 @@ def _api_response(payload: dict | None = None, status_code: int = 200) -> MagicM
     return resp
 
 
-class TestGetPipelineConfigs:
-    """Tests for APIClient.get_pipeline_configs."""
+class TestTryGetPipelineTriggers:
+    """try_get_pipeline_triggers carries what the checkout cannot: the manual
+    trigger, file_upload credentials and the last-run watermark. It also
+    distinguishes "nothing pending" from "unreachable" — the caller needs
+    that to decide between pruning cached credentials and keeping them."""
 
     def test_parses_full_response(self) -> None:
         client = _make_client()
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {
-            "pipelines": [
-                {
-                    "id": "p1",
-                    "name": "orders",
-                    "sourceType": "sql_database",
-                    "sourceConfig": '{"tables":["orders"]}',
-                    "sourceCredentials": '{"connection_string":"pg://host/db"}',
-                    "datasetName": "raw",
-                    "schedule": "*/5 * * * *",
-                    "writeDisposition": "append",
-                    "mergeStrategy": "",
-                    "enabled": True,
-                    "triggerNow": True,
-                    "pendingRunId": "run-1",
-                    "lastRunAt": "2025-06-01T12:00:00Z",
-                },
-            ],
-        }
-        mock_resp.raise_for_status = MagicMock()
         client._session = MagicMock()
-        client._session.post.return_value = mock_resp
+        client._session.post.return_value = _api_response(
+            {
+                "pipelines": [
+                    {
+                        "id": "p1",
+                        "sourceCredentials": '{"connection_string":"pg://host/db"}',
+                        "triggerNow": True,
+                        "pendingRunId": "run-1",
+                        "lastRunAt": "2025-06-01T12:00:00Z",
+                    },
+                ],
+            }
+        )
 
-        configs = client.get_pipeline_configs()
+        triggers = client.try_get_pipeline_triggers()
 
-        assert len(configs) == 1
-        cfg = configs[0]
-        assert cfg.id == "p1"
-        assert cfg.name == "orders"
-        assert cfg.source_type == "sql_database"
-        assert cfg.source_config == {"tables": ["orders"]}
-        assert cfg.source_credentials == {"connection_string": "pg://host/db"}
-        assert cfg.dataset_name == "raw"
-        assert cfg.schedule == "*/5 * * * *"
-        assert cfg.write_disposition == "append"
-        assert cfg.enabled is True
-        assert cfg.trigger_now is True
-        assert cfg.pending_run_id == "run-1"
-        assert cfg.last_run_at is not None
-        assert cfg.last_run_at.year == 2025
+        assert triggers is not None
+        assert len(triggers) == 1
+        t = triggers[0]
+        assert t.id == "p1"
+        assert t.source_credentials == {"connection_string": "pg://host/db"}
+        assert t.trigger_now is True
+        assert t.pending_run_id == "run-1"
+        assert t.last_run_at is not None
+        assert t.last_run_at.year == 2025
 
-    def test_empty_pipelines_list(self) -> None:
-        client = _make_client()
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"pipelines": []}
-        mock_resp.raise_for_status = MagicMock()
-        client._session = MagicMock()
-        client._session.post.return_value = mock_resp
-
-        configs = client.get_pipeline_configs()
-
-        assert configs == []
-
-    def test_missing_optional_fields(self) -> None:
-        client = _make_client()
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {
-            "pipelines": [
-                {
-                    "id": "p2",
-                    "name": "minimal",
-                    "sourceType": "rest_api",
-                    "datasetName": "raw",
-                },
-            ],
-        }
-        mock_resp.raise_for_status = MagicMock()
-        client._session = MagicMock()
-        client._session.post.return_value = mock_resp
-
-        configs = client.get_pipeline_configs()
-
-        assert len(configs) == 1
-        cfg = configs[0]
-        assert cfg.schedule is None
-        assert cfg.last_run_at is None
-        assert cfg.trigger_now is False
-        assert cfg.pending_run_id == ""
-
-    def test_http_error_returns_empty_and_unhealthy(self) -> None:
+    def test_definition_fields_from_an_older_server_are_ignored(self) -> None:
+        """A pre-0.9.0 control plane still sends definitions. They must be
+        dropped, not treated as a malformed record — the checkout is the
+        only definition the worker reads."""
         client = _make_client()
         client._session = MagicMock()
-        client._session.post.side_effect = requests.ConnectionError("refused")
+        client._session.post.return_value = _api_response(
+            {
+                "pipelines": [
+                    {
+                        "id": "p1",
+                        "name": "orders",
+                        "sourceType": "sql_database",
+                        "sourceConfig": '{"tables":["orders"]}',
+                        "datasetName": "raw",
+                        "schedule": "*/5 * * * *",
+                        "writeDisposition": "replace",
+                        "enabled": False,
+                    },
+                ],
+            }
+        )
 
-        configs = client.get_pipeline_configs()
+        triggers = client.try_get_pipeline_triggers()
 
-        assert configs == []
-        healthy, details = client.health_status()
-        assert healthy is False
-        assert "refused" in details["last_error"]
+        assert triggers is not None
+        assert [t.id for t in triggers] == ["p1"]
+        assert not hasattr(triggers[0], "schedule")
 
-
-class TestTryGetPipelineConfigs:
-    """try_get_pipeline_configs distinguishes "no pipelines" from
-    "unreachable" — files mode needs that to decide between empty state
-    and cached credentials."""
-
-    def test_returns_list_on_success(self) -> None:
+    def test_returns_empty_list_when_nothing_pending(self) -> None:
         client = _make_client()
         client._session = MagicMock()
         client._session.post.return_value = _api_response({"pipelines": []})
 
-        assert client.try_get_pipeline_configs() == []
+        assert client.try_get_pipeline_triggers() == []
+
+    def test_missing_optional_fields(self) -> None:
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response({"pipelines": [{"id": "p2"}]})
+
+        triggers = client.try_get_pipeline_triggers()
+
+        assert triggers is not None
+        t = triggers[0]
+        assert t.source_credentials == {}
+        assert t.last_run_at is None
+        assert t.trigger_now is False
+        assert t.pending_run_id == ""
 
     def test_returns_none_on_connection_error(self) -> None:
         client = _make_client()
         client._session = MagicMock()
         client._session.post.side_effect = requests.ConnectionError("refused")
 
-        assert client.try_get_pipeline_configs() is None
-        healthy, _ = client.health_status()
+        assert client.try_get_pipeline_triggers() is None
+        healthy, details = client.health_status()
         assert healthy is False
+        assert "refused" in details["last_error"]
 
 
 class TestReportPipelineRun:
@@ -213,7 +189,7 @@ class TestBearerAuth:
 
         client._session = MagicMock()
         client._session.post.return_value = _api_response()
-        client.get_pipeline_configs()
+        client.try_get_pipeline_triggers()
 
         headers = client._session.post.call_args.kwargs["headers"]
         assert "Authorization" not in headers
@@ -226,7 +202,7 @@ class TestBearerAuth:
             _api_response(),
         ]
 
-        client.get_pipeline_configs()
+        client.try_get_pipeline_triggers()
 
         token_call, api_call = client._session.post.call_args_list
         assert token_call.args[0] == client.oidc_token_url
@@ -242,8 +218,8 @@ class TestBearerAuth:
             _api_response(),
         ]
 
-        client.get_pipeline_configs()
-        client.get_pipeline_configs()
+        client.try_get_pipeline_triggers()
+        client.try_get_pipeline_triggers()
 
         # One token fetch, two API calls.
         assert client._session.post.call_count == 3
@@ -260,7 +236,7 @@ class TestBearerAuth:
             _api_response(),
         ]
 
-        configs = client.get_pipeline_configs()
+        configs = client.try_get_pipeline_triggers()
 
         assert configs == []
         assert client._session.post.call_count == 4
@@ -274,9 +250,7 @@ class TestBearerAuth:
         client._session = MagicMock()
         client._session.post.side_effect = requests.ConnectionError("casdoor down")
 
-        configs = client.get_pipeline_configs()
-
-        assert configs == []
+        assert client.try_get_pipeline_triggers() is None
         healthy, details = client.health_status()
         assert healthy is False
         assert "casdoor down" in details["last_error"]
@@ -315,7 +289,7 @@ class TestHealthStatus:
         client._session = MagicMock()
         client._session.post.side_effect = requests.ConnectionError("refused")
 
-        client.get_pipeline_configs()
+        client.try_get_pipeline_triggers()
 
         healthy, details = client.health_status()
         assert healthy is False
@@ -442,7 +416,7 @@ class TestMalformedCentralResponses:
         client._session = MagicMock()
         client._session.post.return_value = mock_resp
 
-        assert client.try_get_pipeline_configs() is None
+        assert client.try_get_pipeline_triggers() is None
         healthy, _ = client.health_status()
         assert healthy is False
 
@@ -451,24 +425,19 @@ class TestMalformedCentralResponses:
         client._session = MagicMock()
         client._session.post.return_value = _api_response({"pipelines": "oops"})
 
-        assert client.try_get_pipeline_configs() is None
+        assert client.try_get_pipeline_triggers() is None
 
     def test_bad_record_is_skipped_others_survive(self) -> None:
         client = _make_client()
-        good = {
-            "id": "p2",
-            "name": "good",
-            "sourceType": "rest_api",
-            "datasetName": "raw",
-        }
-        bad = {"id": "p1", "name": "bad", "sourceConfig": "{not json"}
+        good = {"id": "p2"}
+        bad = {"id": "p1", "sourceCredentials": "{not json"}
         client._session = MagicMock()
         client._session.post.return_value = _api_response({"pipelines": [bad, good]})
 
-        configs = client.try_get_pipeline_configs()
+        triggers = client.try_get_pipeline_triggers()
 
-        assert configs is not None
-        assert [c.id for c in configs] == ["p2"]
+        assert triggers is not None
+        assert [t.id for t in triggers] == ["p2"]
 
     def test_transformations_non_json_body_returns_empty(self) -> None:
         client = _make_client()
@@ -503,6 +472,6 @@ class TestMalformedCentralResponses:
         client._session = MagicMock()
         client._session.post.return_value = bad_token_resp
 
-        assert client.try_get_pipeline_configs() is None
+        assert client.try_get_pipeline_triggers() is None
         healthy, _ = client.health_status()
         assert healthy is False

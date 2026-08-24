@@ -1,6 +1,6 @@
 # dlt-worker
 
-Worker that polls FairTier API for pipeline configurations and runs them via [dlt](https://dlthub.com/).
+Worker that runs declarative dlt pipelines from a git-synced definition checkout, polling the FairTier API only for triggers and credentials.
 
 Published as `github.com/fairtier/dlt-worker`. Docker images at `ghcr.io/fairtier/dlt-worker`.
 

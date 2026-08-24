@@ -69,6 +69,25 @@ class PipelineConfig:
 
 
 @dataclass
+class PipelineTrigger:
+    """What the control-plane poll still carries for one pipeline.
+
+    Not a definition: since the pipelines-as-files Phase 2.5 cleanup the
+    checkout is the only source of a pipeline's definition and schedule, and
+    GetPipelineConfigs was shrunk to the three things a checkout cannot
+    provide — the manual trigger, the credentials of a synthesized
+    file_upload pipeline (no .age file exists for those), and the last-run
+    watermark that seeds a worker with no local scheduler entry.
+    """
+
+    id: str
+    source_credentials: dict[str, Any] = field(default_factory=dict)
+    trigger_now: bool = False
+    pending_run_id: str = ""
+    last_run_at: datetime | None = None
+
+
+@dataclass
 class PipelineRunReport:
     pipeline_id: str
     status: str  # "running", "success", or "failed"
@@ -250,23 +269,19 @@ class APIClient:
         self._last_error = str(err)
         self._last_check_at = datetime.now(timezone.utc).isoformat()
 
-    def get_pipeline_configs(self) -> list[PipelineConfig]:
-        """Fetch all enabled pipeline configs for this customer.
+    def try_get_pipeline_triggers(self) -> list[PipelineTrigger] | None:
+        """Fetch the poll's per-pipeline triggers, or None when the FairTier
+        API is unreachable.
 
-        Legacy-mode entry point: a fetch failure is indistinguishable from
-        "no pipelines" (empty list). Files mode needs the distinction —
-        use try_get_pipeline_configs there.
-        """
-        configs = self.try_get_pipeline_configs()
-        return configs if configs is not None else []
-
-    def try_get_pipeline_configs(self) -> list[PipelineConfig] | None:
-        """Fetch pipeline configs, or None when the FairTier API is unreachable.
+        The None is the point: scheduling comes from the checkout, so the
+        caller must tell "the control plane says there is nothing pending"
+        apart from "the control plane did not answer" — the first prunes
+        cached credentials, the second must not.
 
         A 200 with a non-JSON body (proxy error page, truncated response)
-        counts as unreachable; one malformed pipeline record is skipped so
-        the rest still run — a garbage-returning central must degrade
-        exactly like an unreachable one, never halt scheduling.
+        counts as unreachable; one malformed record is skipped so the rest
+        still run — a garbage-returning control plane must degrade exactly
+        like an unreachable one, never halt scheduling.
         """
         url = f"{self.base_url}/pipeline.v1.PipelineService/GetPipelineConfigs"
         try:
@@ -286,7 +301,7 @@ class APIClient:
         configs = []
         for p in pipelines:
             try:
-                configs.append(_parse_pipeline_record(p))
+                configs.append(_parse_trigger_record(p))
             except Exception:
                 logger.warning(
                     "Skipping malformed pipeline record (id=%s)",
@@ -399,22 +414,18 @@ def _parse_last_run_at(record: dict[str, Any]) -> datetime | None:
     return datetime.fromisoformat(last_run_at_str.replace("Z", "+00:00"))
 
 
-def _parse_pipeline_record(p: dict[str, Any]) -> PipelineConfig:
-    """Map one API pipeline record to a PipelineConfig. Raises on malformed
-    input — the caller skips the record and keeps the rest."""
-    source_config = p.get("sourceConfig", "{}")
+def _parse_trigger_record(p: dict[str, Any]) -> PipelineTrigger:
+    """Map one API pipeline record to a PipelineTrigger. Raises on malformed
+    input — the caller skips the record and keeps the rest.
+
+    Definition fields a pre-0.9.0 response may still carry are ignored
+    rather than rejected: an older control plane must degrade to "triggers
+    only", not to "every record is malformed".
+    """
     source_credentials = p.get("sourceCredentials", "{}")
-    return PipelineConfig(
+    return PipelineTrigger(
         id=p["id"],
-        name=p["name"],
-        source_type=p["sourceType"],
-        source_config=json.loads(source_config) if source_config else {},
         source_credentials=json.loads(source_credentials) if source_credentials else {},
-        dataset_name=p["datasetName"],
-        schedule=p.get("schedule") or None,
-        write_disposition=p.get("writeDisposition", "append"),
-        merge_strategy=p.get("mergeStrategy", ""),
-        enabled=p.get("enabled", True),
         trigger_now=p.get("triggerNow", False),
         pending_run_id=p.get("pendingRunId", ""),
         last_run_at=_parse_last_run_at(p),

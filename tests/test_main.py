@@ -17,6 +17,7 @@ from dlt_worker.scheduler_state import SchedulerState
 from dlt_worker.api_client import (
     PipelineConfig,
     PipelineRunReport,
+    PipelineTrigger,
     TransformationConfig,
     TransformationRunReport,
 )
@@ -144,15 +145,19 @@ def test_should_run_trigger_now_bypasses_failure_backoff() -> None:
 
 
 def test_should_run_trigger_now_disabled() -> None:
+    """A Run-now fires on a disabled pipeline: disabling stops the schedule,
+    not a run a person just asked for. GetEnabledPipelines already serves a
+    disabled pipeline that has a pending run, so blocking it here left that
+    run pending forever."""
     cfg = _make_config(trigger_now=True, enabled=False)
     now = datetime.now(timezone.utc)
-    assert _should_run(cfg, now) is False
+    assert _should_run(cfg, now) is True
 
 
 # --- _run_with_retry tests ---
 
 
-def _success_report(cfg: PipelineConfig) -> PipelineRunReport:
+def _success_report(cfg: PipelineConfig | PipelineTrigger) -> PipelineRunReport:
     return PipelineRunReport(
         pipeline_id=cfg.id,
         status="success",
@@ -321,7 +326,17 @@ class TestRunWithRetry:
         assert sent.run_id == "local-only-1"
 
 
-# --- files mode (_run_due_pipelines_files) ---
+# --- files mode (_run_due_pipelines) ---
+
+
+def _make_trigger(**overrides: Any) -> PipelineTrigger:
+    """One record of the poll's trigger feed. Note what it cannot express:
+    a schedule, a source config, an `enabled` flag. Since the Phase 2.5
+    shrink those are not on the wire at all, so "the poll cannot overrule
+    the file" is a property of the type rather than of the worker."""
+    defaults: dict[str, Any] = {"id": "p1"}
+    defaults.update(overrides)
+    return PipelineTrigger(**defaults)
 
 
 def _write_pipeline_yaml(
@@ -374,9 +389,9 @@ class TestRunDuePipelinesFiles:
         main._creds_cache.clear()
         main._last_failure_at.clear()
 
-    def _client(self, polled: list[PipelineConfig] | None) -> MagicMock:
+    def _client(self, polled: list[PipelineTrigger] | None) -> MagicMock:
         client = MagicMock()
-        client.try_get_pipeline_configs.return_value = polled
+        client.try_get_pipeline_triggers.return_value = polled
         client.report_pipeline_run.return_value = True
         return client
 
@@ -385,15 +400,15 @@ class TestRunDuePipelinesFiles:
     def test_dispatcher_uses_files_mode(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
-        """With PIPELINES_DIR set, definitions come from files — the
-        legacy full-truth accessor is never consulted."""
+        """Definitions come from the checkout and the poll is consulted
+        once, for triggers. There is no longer a full-truth accessor to
+        avoid — the poll cannot serve a definition at all."""
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
         client = self._client([])
 
         main._run_due_pipelines(client)
 
-        client.try_get_pipeline_configs.assert_called_once()
-        client.get_pipeline_configs.assert_not_called()
+        client.try_get_pipeline_triggers.assert_called_once()
 
     @patch("dlt_worker.main.trigger_snapshot")
     @patch("dlt_worker.main.run_pipeline_isolated")
@@ -407,7 +422,7 @@ class TestRunDuePipelinesFiles:
         mock_run.return_value = _success_report(cfg)
 
         # First tick: central up, credentials get cached, run fires.
-        api_cfg = _make_config(id="p1", source_credentials={"key": "s3cr3t"})
+        api_cfg = _make_trigger(id="p1", source_credentials={"key": "s3cr3t"})
         client = self._client([api_cfg])
         succeeded = main._run_due_pipelines(client)
         assert succeeded == {"p1"}
@@ -445,7 +460,7 @@ class TestRunDuePipelinesFiles:
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
         cfg = _make_config(id="p1")
         mock_run.return_value = _success_report(cfg)
-        api_cfg = _make_config(id="p1", trigger_now=True, pending_run_id="run-9")
+        api_cfg = _make_trigger(id="p1", trigger_now=True, pending_run_id="run-9")
         client = self._client([api_cfg])
 
         succeeded = main._run_due_pipelines(client)
@@ -461,16 +476,40 @@ class TestRunDuePipelinesFiles:
     def test_polled_definitions_ignored(
         self, mock_run: MagicMock, mock_snapshot: MagicMock
     ) -> None:
-        """File truth wins: a file-disabled pipeline does not run even if
-        the poll says enabled + triggered (worker-parity semantics)."""
+        """File truth wins: a file-disabled pipeline stays put while the
+        poll answers normally. Since the Phase 2.5 shrink the poll has no
+        `enabled` to overrule it with — _make_trigger cannot express one —
+        so this guards the worker's half: nothing in the trigger feed
+        re-enables a pipeline the file disabled.
+
+        Deliberately not asserted here: a *trigger*, which does fire on a
+        file-disabled pipeline (test_trigger_runs_a_file_disabled_pipeline)."""
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", enabled=False)
-        api_cfg = _make_config(id="p1", enabled=True, trigger_now=True)
+        api_cfg = _make_trigger(id="p1")
         client = self._client([api_cfg])
 
         succeeded = main._run_due_pipelines(client)
 
         assert succeeded == set()
         mock_run.assert_not_called()
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_trigger_runs_a_file_disabled_pipeline(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """A Run-now on a disabled pipeline fires in files mode too. The
+        server hands out the pending run (`enabled = true OR pr.id IS NOT
+        NULL`); refusing it here is what left the run pending forever."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", enabled=False)
+        api_cfg = _make_trigger(id="p1", trigger_now=True)
+        client = self._client([api_cfg])
+        mock_run.return_value = _success_report(api_cfg)
+
+        succeeded = main._run_due_pipelines(client)
+
+        assert succeeded == {"p1"}
+        mock_run.assert_called_once()
 
     @patch("dlt_worker.main.trigger_snapshot")
     @patch("dlt_worker.main.run_pipeline_isolated")
@@ -488,7 +527,7 @@ class TestRunDuePipelinesFiles:
         schedule = f"{(now.minute + 30) % 60} * * * *"
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=schedule)
         recent = now - timedelta(minutes=1)
-        api_cfg = _make_config(id="p1", last_run_at=recent)
+        api_cfg = _make_trigger(id="p1", last_run_at=recent)
         client = self._client([api_cfg])
 
         succeeded = main._run_due_pipelines(client)
@@ -513,7 +552,7 @@ class TestRunDuePipelinesFiles:
         state = SchedulerState.load(str(self.state_dir))
         state.record("p1", now - timedelta(minutes=1))
         stale = now - timedelta(hours=2)
-        client = self._client([_make_config(id="p1", last_run_at=stale)])
+        client = self._client([_make_trigger(id="p1", last_run_at=stale)])
 
         succeeded = main._run_due_pipelines(client)
 
@@ -535,8 +574,8 @@ class TestRunDuePipelinesFiles:
         )
         client = self._client(
             [
-                _make_config(id="p1", trigger_now=True),
-                _make_config(id="p2", trigger_now=True),
+                _make_trigger(id="p1", trigger_now=True),
+                _make_trigger(id="p2", trigger_now=True),
             ]
         )
 
@@ -600,7 +639,7 @@ class TestRunDuePipelinesFiles:
         self._age_key({"orders": {"password": "fr0m-f1le"}})
         cfg = _make_config(id="p1")
         mock_run.return_value = _success_report(cfg)
-        api_cfg = _make_config(
+        api_cfg = _make_trigger(
             id="p1", trigger_now=True, source_credentials={"password": "stale"}
         )
         client = self._client([api_cfg])
@@ -665,24 +704,6 @@ class TestRunDuePipelinesFiles:
 
         assert SchedulerState.load(str(self.state_dir)).get("p-broken") == kept
 
-    @patch("dlt_worker.main.run_pipeline_isolated")
-    def test_legacy_mode_untouched(self, mock_run: MagicMock) -> None:
-        """PIPELINES_DIR unset = 0.0.11 behavior: poll is full truth and
-        scheduler.json is never created."""
-        config.PIPELINES_DIR = ""
-        cfg = _make_config(id="p1", trigger_now=True)
-        mock_run.return_value = _success_report(cfg)
-        client = MagicMock()
-        client.get_pipeline_configs.return_value = [cfg]
-        client.report_pipeline_run.return_value = True
-
-        succeeded = main._run_due_pipelines(client)
-
-        assert succeeded == {"p1"}
-        client.get_pipeline_configs.assert_called_once()
-        client.try_get_pipeline_configs.assert_not_called()
-        assert not (self.state_dir / "scheduler.json").exists()
-
     @patch("dlt_worker.main.trigger_snapshot")
     @patch("dlt_worker.main.run_pipeline_isolated")
     def test_one_crashing_pipeline_does_not_stop_the_tick(
@@ -700,7 +721,7 @@ class TestRunDuePipelinesFiles:
             return _success_report(ok)
 
         mock_run.side_effect = run
-        client = self._client([_make_config(id="p1"), _make_config(id="p2")])
+        client = self._client([_make_trigger(id="p1"), _make_trigger(id="p2")])
 
         succeeded = main._run_due_pipelines(client)
 
@@ -720,7 +741,7 @@ class TestRunDuePipelinesFiles:
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule="0 0 * * *")
         cfg = _make_config(id="p1")
         mock_run.return_value = _failure_report(cfg)
-        client = self._client([_make_config(id="p1")])
+        client = self._client([_make_trigger(id="p1")])
 
         main._run_due_pipelines(client)  # never-run → fires, fails
         assert mock_run.call_count > 0
@@ -765,15 +786,15 @@ class TestRunDuePipelinesFiles:
         _write_pipeline_yaml(self.checkout, "sales.yaml", "p2", schedule=None)
         client = self._client(
             [
-                _make_config(id="p1", source_credentials={"k": "1"}),
-                _make_config(id="p2", source_credentials={"k": "2"}),
+                _make_trigger(id="p1", source_credentials={"k": "1"}),
+                _make_trigger(id="p2", source_credentials={"k": "2"}),
             ]
         )
         main._run_due_pipelines(client)
         assert set(main._creds_cache) == {"p1", "p2"}
 
         # p2 absent from the poll but its file remains: entry kept.
-        client = self._client([_make_config(id="p1", source_credentials={"k": "1"})])
+        client = self._client([_make_trigger(id="p1", source_credentials={"k": "1"})])
         main._run_due_pipelines(client)
         assert set(main._creds_cache) == {"p1", "p2"}
 

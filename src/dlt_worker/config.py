@@ -48,10 +48,12 @@ HEALTHZ_PORT: int = 8080
 PIPELINE_MAX_RETRIES: int = 2
 PIPELINE_RETRY_BASE_DELAY: int = 30
 SNAPSHOT_URL: str = ""
-# Files mode: when set, pipeline definitions and schedules are read from
-# <PIPELINES_DIR>/pipelines/*.yaml (a checkout kept in sync by a sidecar)
-# and the API poll shrinks to triggers + credentials. Unset = legacy mode,
-# the poll is the full source of truth. This is the rollback lever.
+# Pipeline definitions and schedules are read from
+# <PIPELINES_DIR>/pipelines/*.yaml (a checkout kept in sync by a sidecar);
+# the API poll carries only triggers, the last-run watermark and the
+# credentials that have no file. Required as of 0.9.0 — the legacy
+# poll-is-truth mode it used to be a lever over was retired with the
+# definition fields it read (pipelines-as-files Phase 2.5).
 PIPELINES_DIR: str = ""
 # Age credentials (files mode): path to the box age identity file (the
 # dlt-age Secret mount). When set, pipelines/<name>.credentials.age files
@@ -195,7 +197,7 @@ def load() -> None:
     PIPELINE_MAX_RETRIES = _int("PIPELINE_MAX_RETRIES", 2)
     PIPELINE_RETRY_BASE_DELAY = _int("PIPELINE_RETRY_BASE_DELAY", 30)
     SNAPSHOT_URL = os.environ.get("SNAPSHOT_URL", "")
-    PIPELINES_DIR = os.environ.get("PIPELINES_DIR", "")
+    PIPELINES_DIR = _require("PIPELINES_DIR")
     AGE_KEY_FILE = os.environ.get("AGE_KEY_FILE", "")
     ICEBERG_LOAD_CHUNK_ROWS = _int("ICEBERG_LOAD_CHUNK_ROWS", 200_000)
     ICEBERG_LOAD_COMMIT_EVERY = _int("ICEBERG_LOAD_COMMIT_EVERY", 20)

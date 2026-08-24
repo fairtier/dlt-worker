@@ -25,6 +25,7 @@ from dlt_worker.snapshot import trigger_snapshot
 from dlt_worker.api_client import (
     PipelineConfig,
     PipelineRunReport,
+    PipelineTrigger,
     TransformationConfig,
     APIClient,
 )
@@ -98,6 +99,23 @@ def _handle_signal(signum: int, _frame: object) -> None:
 def _should_run(cfg: PipelineConfig | TransformationConfig, now: datetime) -> bool:
     """Determine if a pipeline or transformation should run based on its
     cron schedule or trigger flag."""
+    # A Run-now on a PIPELINE outranks `enabled`: disabling stops the
+    # schedule, not a run a person just asked for. The server already agrees
+    # — GetEnabledPipelines serves a disabled pipeline that has a pending run
+    # (`enabled = true OR pr.id IS NOT NULL`) — so checking enabled first left
+    # that run pending forever, with the Console showing a trigger that never
+    # fired. In files mode this is not the poll overruling the file: only
+    # trigger_now/pending_run_id are taken from the poll, and every definition
+    # field (`enabled` included, when no trigger is present) still comes from
+    # the checkout.
+    #
+    # Transformations are deliberately stricter and stay so: disabled means it
+    # never runs — by schedule, by chain, or by trigger — which is why
+    # GetEnabledTransformations filters on `enabled` alone and a disabled one
+    # never reaches the worker at all.
+    if cfg.trigger_now and isinstance(cfg, PipelineConfig):
+        return True
+
     if not cfg.enabled:
         return False
 
@@ -186,7 +204,7 @@ def run() -> None:
             "tenant-bound auth"
         )
 
-    start_health_server(client, config.HEALTHZ_PORT)
+    start_health_server(client, config.HEALTHZ_PORT, config.PIPELINES_DIR)
 
     logger.info(
         "dlt-worker started for customer=%s, polling every %ds",
@@ -220,7 +238,7 @@ def _tick(client: APIClient) -> None:
     and each transformation hang off it, so one trace answers "what did the
     worker do at 04:00" without joining log lines by timestamp.
     """
-    mode = "files" if config.PIPELINES_DIR else "api"
+    mode = "files"
     started = time.monotonic()
     outcome = "ok"
 
@@ -246,13 +264,6 @@ def _tick(client: APIClient) -> None:
 def _poll_and_run(client: APIClient) -> None:
     succeeded_pipelines = _run_due_pipelines(client)
     _run_due_transformations(client, succeeded_pipelines)
-
-
-def _run_due_pipelines(client: APIClient) -> set[str]:
-    """Run all due pipelines. Returns the ids of pipelines that succeeded."""
-    if config.PIPELINES_DIR:
-        return _run_due_pipelines_files(client)
-    return _run_due_pipelines_api(client)
 
 
 def _execute_pipeline(
@@ -324,42 +335,19 @@ def _execute_pipeline(
     return report
 
 
-def _run_due_pipelines_api(client: APIClient) -> set[str]:
-    """Legacy mode: the API poll is the full source of truth."""
-    succeeded: set[str] = set()
+def _run_due_pipelines(client: APIClient) -> set[str]:
+    """Run all due pipelines. Returns the ids of pipelines that succeeded.
 
-    configs = client.get_pipeline_configs()
-    if not configs:
-        return succeeded
+    Definitions and schedules come from the pipelines checkout; the poll is
+    consumed only for Run-now triggers, the last-run watermark, and the
+    source credentials that have no file to come from. A control-plane
+    outage degrades (no history, no triggers, possibly no credentials)
+    instead of stopping scheduled ingestion.
 
-    now = datetime.now(timezone.utc)
-
-    for cfg in configs:
-        if _shutdown:
-            break
-        # One broken config must not abandon the rest of the tick.
-        try:
-            if not _should_run(cfg, now):
-                continue
-
-            report = _execute_pipeline(cfg, now, client)
-            if report is not None and report.status == "success":
-                succeeded.add(cfg.id)
-        except Exception as exc:
-            _tick_error(cfg.name, exc)
-            logger.exception(
-                "Pipeline %s: tick processing failed — continuing with the rest",
-                cfg.name,
-            )
-
-    return succeeded
-
-
-def _run_due_pipelines_files(client: APIClient) -> set[str]:
-    """Files mode: definitions and schedules come from the pipelines
-    checkout; the poll is consumed only for Run-now triggers and source
-    credentials. A central outage degrades (no history, no triggers,
-    possibly no credentials) instead of stopping scheduled ingestion.
+    There is no longer an alternative: the legacy poll-is-truth mode, in
+    which the API served whole definitions and PIPELINES_DIR was optional,
+    was retired in the pipelines-as-files Phase 2.5 cleanup along with the
+    definition fields it read.
     """
     succeeded: set[str] = set()
 
@@ -367,8 +355,8 @@ def _run_due_pipelines_files(client: APIClient) -> set[str]:
     file_ids = {c.id for c in files.configs}
     state = SchedulerState.load(config.DLT_STATE_DIR)
 
-    polled = client.try_get_pipeline_configs()
-    by_id: dict[str, PipelineConfig] = {}
+    polled = client.try_get_pipeline_triggers()
+    by_id: dict[str, PipelineTrigger] = {}
     if polled is None:
         telemetry.add_event("central.unreachable")
         logger.warning(
@@ -449,14 +437,14 @@ def _skipped(cfg: PipelineConfig, reason: str) -> None:
 
 def _process_file_pipeline(
     cfg: PipelineConfig,
-    by_id: dict[str, PipelineConfig],
-    polled: list[PipelineConfig] | None,
+    by_id: dict[str, PipelineTrigger],
+    polled: list[PipelineTrigger] | None,
     state: SchedulerState,
     now: datetime,
     client: APIClient,
     succeeded: set[str],
 ) -> None:
-    """Process one files-mode pipeline within a tick (schedule, run, record)."""
+    """Process one pipeline within a tick (schedule, run, record)."""
     api_cfg = by_id.get(cfg.id)
 
     # One-time migration: adopt central's last_run_at so existing

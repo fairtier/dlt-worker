@@ -4,21 +4,27 @@
 [![Coverage](https://fairtier.github.io/dlt-worker/badges/coverage.svg)](https://github.com/fairtier/dlt-worker/actions)
 [![License](https://img.shields.io/github/license/fairtier/dlt-worker)](LICENSE)
 
-Worker that runs declarative data pipelines via [dlt](https://dlthub.com/), writing Iceberg tables to S3-compatible storage. Pipeline definitions come either from a control plane poll (legacy mode) or from local YAML files kept in sync by a git sidecar (files mode).
+Worker that runs declarative data pipelines via [dlt](https://dlthub.com/), writing Iceberg tables to S3-compatible storage. Pipeline definitions come from local YAML files kept in sync by a git sidecar; the control plane poll carries only what those files cannot.
 
 ## How it works
 
-1. Reads pipeline definitions — from `$PIPELINES_DIR/pipelines/*.yaml` when `PIPELINES_DIR` is set (files mode), otherwise from a control plane poll
-2. Evaluates cron schedules (or manual triggers) to decide which pipelines to run; in files mode the worker owns `last_run_at` locally (`scheduler.json` in the state dir), so scheduling keeps working when the control plane is unreachable
+1. Reads pipeline definitions from `$PIPELINES_DIR/pipelines/*.yaml` (a checkout kept in sync by a git sidecar)
+2. Evaluates cron schedules (or manual triggers) to decide which pipelines to run; the worker owns `last_run_at` locally (`scheduler.json` in the state dir), so scheduling keeps working when the control plane is unreachable
 3. Runs each due pipeline using [dlt](https://dlthub.com/) with Iceberg table format
 4. Records the run in a local `workspace` Postgres database first when `WORKSPACE_DB_URL` is set (local-first mode), then reports results (rows loaded, errors) back to the control plane (best-effort)
-5. Exposes a `/healthz` endpoint for Kubernetes readiness probes
+5. Exposes a `/healthz` endpoint for Kubernetes readiness probes, gated on what it actually schedules from — the checkout (see below)
 
-In files mode the control plane poll is still made every tick, but only manual ("Run now") triggers and source credentials are consumed from it — definitions, schedules, and enablement come from the files. Credentials are cached in memory only, so a pipeline whose credentials were seen at least once keeps running through a control plane outage.
+The control plane poll is still made every tick, but only manual ("Run now") triggers, the last-run watermark and source credentials are consumed from it — definitions, schedules, and enablement come from the files. Credentials are cached in memory only, so a pipeline whose credentials were seen at least once keeps running through a control plane outage.
+
+As of 0.9.0 this is the only mode: `PIPELINES_DIR` is required, and the legacy poll-is-truth mode was retired together with the definition fields it read (`source_config`, `schedule`, `write_disposition`, `enabled`) — `GetPipelineConfigs` no longer returns them. Running 0.9.0 against a pre-shrink control plane is fine; the extra fields are ignored. Running an older worker against a shrunk one is not: it sees every pipeline as scheduleless.
+
+Because of that split, `/healthz` no longer follows the poll (as of 0.9.0). An unreachable control plane costs triggers and run history while scheduled ingestion keeps firing, so the endpoint stays `200` and reports the outage as `"api_healthy": false` alongside `"mode": "files"`. What gates readiness instead is the checkout itself — a missing `$PIPELINES_DIR/pipelines` is the one state in which the worker has no schedule at all, and is the only `503` it returns. Only a readiness probe reads this, so an unready worker is reported, never restarted.
+
+A manual "Run now" also outranks `enabled` on a **pipeline** (0.9.0): disabling stops the schedule, not a run someone just asked for, and the control plane already hands out a pending run for a disabled pipeline — so refusing it here left that run pending forever. This does not weaken file truth: the poll cannot carry an `enabled` flag at all, and the file's is what every other path reads. Transformations are deliberately stricter — disabled means never, by schedule, chain, or trigger.
 
 When `AGE_KEY_FILE` additionally points at an [age](https://age-encryption.org/) identity file, source credentials are read from `pipelines/<name>.credentials.age` in the checkout (armored age ciphertext of the credentials JSON, encrypted to this worker's public key) and take precedence over polled credentials. A pipeline with a credential file then runs fully control-plane-independent — even a fresh worker process during an outage. A missing or undecryptable credential file degrades that one pipeline to polled/cached credentials. The companion `python -m dlt_worker.agekey <outdir>` command generates the keypair (used by the box seed job).
 
-When `WORKSPACE_DB_URL` is set (local-first run recording), every pipeline and transformation run is written to that Postgres database — a `running` row before execution, the outcome after — and the control plane report becomes strictly best-effort (a few bounded retries, then log-and-continue). The local row is the record; the central one is only a cache. A run picked up from a central "Run now" trigger reuses the trigger's run id locally, so the same run has one identity in both stores. The worker never migrates that schema (it's owned by the deployment) and writes explicit column lists only; on startup and hourly it finalizes its own orphaned `running` rows older than 2 hours (a crashed worker's leftovers). Combined with files mode and age credential files, ingestion, scheduling, and run history all keep working with no control plane at all.
+When `WORKSPACE_DB_URL` is set (local-first run recording), every pipeline and transformation run is written to that Postgres database — a `running` row before execution, the outcome after — and the control plane report becomes strictly best-effort (a few bounded retries, then log-and-continue). The local row is the record; the central one is only a cache. A run picked up from a central "Run now" trigger reuses the trigger's run id locally, so the same run has one identity in both stores. The worker never migrates that schema (it's owned by the deployment) and writes explicit column lists only; on startup and hourly it finalizes its own orphaned `running` rows older than 2 hours (a crashed worker's leftovers). Combined with the definition checkout and age credential files, ingestion, scheduling, and run history all keep working with no control plane at all.
 
 ## Quick start
 
@@ -32,6 +38,8 @@ docker run --rm \
   -e AWS_ENDPOINT_URL=https://s3.example.com \
   -e AWS_REGION=us-east-1 \
   -e S3_BUCKET=my-data-lake \
+  -e PIPELINES_DIR=/pipelines \
+  -v "$PWD/checkout:/pipelines:ro" \
   ghcr.io/fairtier/dlt-worker:latest
 ```
 
@@ -51,6 +59,7 @@ All configuration is via environment variables.
 | `AWS_ENDPOINT_URL`      | S3 endpoint URL (e.g. `https://s3.amazonaws.com`)                    |
 | `AWS_REGION`            | S3 region (e.g. `us-east-1`)                                         |
 | `S3_BUCKET`             | Target S3 bucket for Iceberg data                                    |
+| `PIPELINES_DIR`         | Checkout root holding the `pipelines/*.yaml` definitions the worker schedules from (required since 0.9.0) |
 
 ### Optional
 
@@ -62,8 +71,7 @@ All configuration is via environment variables.
 | `PIPELINE_MAX_RETRIES`      | `2`          | Max retry attempts per pipeline on failure                                            |
 | `PIPELINE_RETRY_BASE_DELAY` | `30`         | Base delay in seconds for exponential backoff                                         |
 | `SNAPSHOT_URL`              | _(empty)_    | URL to trigger a state snapshot sidecar after each pipeline run (disabled when empty) |
-| `PIPELINES_DIR`             | _(empty)_    | Files mode: checkout root holding `pipelines/*.yaml` definitions; unset = poll the control plane for definitions (legacy) |
-| `AGE_KEY_FILE`              | _(empty)_    | Files mode: path to the age identity file for decrypting `pipelines/*.credentials.age`; unset = credentials come from the poll only |
+| `AGE_KEY_FILE`              | _(empty)_    | Path to the age identity file for decrypting `pipelines/*.credentials.age`; unset = credentials come from the poll only |
 | `WORKSPACE_DB_URL`          | _(empty)_    | Postgres DSN of the local `workspace` database for local-first run recording — every run is recorded there first and the control plane report becomes best-effort (bounded retries); unset = central-only reporting |
 | `ICEBERG_LOAD_CHUNK_ROWS`   | `200000`     | Rows per chunked Iceberg append — bounds peak memory during the load stage so large loads stream instead of materializing in RAM; `0` restores dlt's load-everything behavior. This is a real ceiling as of 0.8.0: before it, a source batch whose tail left a partial buffer let the next chunk reach `2×` this value (observed 298,963 against a nominal 200,000) |
 | `ICEBERG_LOAD_COMMIT_EVERY` | `20`         | Commit the streamed Iceberg load every N appends — PyIceberg holds each appended data file's metadata in the open transaction until commit, so across hundreds of chunks that alone can OOM a small worker; `0` keeps a single atomic commit at the end. Extra snapshots are reaped by the maintenance CronJob's snapshot expiry |
