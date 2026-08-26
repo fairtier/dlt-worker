@@ -70,7 +70,6 @@ SUPPORTED_DUCKDB_EXTENSIONS: dict[str, str] = {
     # Databases (ATTACH-style: attach template + tables).
     "mysql": "core",
     "mssql": "community",
-    "firebird": "community",
     # Document/file readers (table-function style: no attach, query-only —
     # read_pdf/read_pdf_tables, read_html/read_xml/html_extract_tables).
     "pdf": "community",
