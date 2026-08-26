@@ -67,7 +67,19 @@ logger = logging.getLogger(__name__)
 # allowlist (workspace-api pipeline_schema.go) and the drafter's capability
 # prompt (workspace-api llm/drafter.go): the three move in the same change.
 SUPPORTED_DUCKDB_EXTENSIONS: dict[str, str] = {
+    # Databases (ATTACH-style: attach template + tables).
     "mysql": "core",
+    "mssql": "community",
+    "firebird": "community",
+    # Document/file readers (table-function style: no attach, query-only —
+    # read_pdf/read_pdf_tables, read_html/read_xml/html_extract_tables).
+    "pdf": "community",
+    "webbed": "community",
+    # Helper: not a source by itself, but read_pdf('https://…') and friends
+    # autoload it for the http(s) protocol, and autoinstall cannot write
+    # into the read-only baked directory — so it must be baked. Also lets a
+    # query-only pipeline read remote csv/parquet/json directly.
+    "httpfs": "core",
 }
 
 # An extension name is interpolated into LOAD/ATTACH statements, so it must
