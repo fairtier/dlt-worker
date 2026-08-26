@@ -189,6 +189,12 @@ def _build_source(cfg: PipelineConfig) -> Any:
         return _build_filesystem_source(cfg)
     if cfg.source_type == "google_sheets":
         return _build_google_sheets_source(cfg)
+    if cfg.source_type == "duckdb":
+        # Deferred import like the dlt sources above: duckdb costs real
+        # memory and only the runs that use it should pay.
+        from dlt_worker.duckdb_source import build_duckdb_source
+
+        return build_duckdb_source(cfg)
 
     raise ValueError(f"Unsupported source type: {cfg.source_type}")
 

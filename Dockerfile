@@ -22,6 +22,18 @@ COPY src/ src/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
+# Bake the DuckDB extensions the `duckdb` source type LOADs
+# (SUPPORTED_DUCKDB_EXTENSIONS in duckdb_source.py — the single source of
+# truth), keyed to the duckdb wheel's own version/platform. No run-time
+# egress to extensions.duckdb.org, and deliberately NOT the DuckFlight
+# extension image: those binaries are ABI-locked to a different DuckDB.
+RUN /app/.venv/bin/python -c "\
+import duckdb; \
+from dlt_worker.duckdb_source import SUPPORTED_DUCKDB_EXTENSIONS; \
+con = duckdb.connect(config={'extension_directory': '/opt/duckdb-extensions'}); \
+[con.install_extension(name) if repo == 'core' else con.install_extension(name, repository=repo) \
+ for name, repo in SUPPORTED_DUCKDB_EXTENSIONS.items()]"
+
 ############################
 # STEP 2: Runtime image
 ############################
@@ -34,6 +46,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
 
 # Copy the virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
+
+# The baked DuckDB extension set (read-only for the runtime user, which is
+# the point: LOAD finds them, nothing can grow the set at run time).
+COPY --from=builder /opt/duckdb-extensions /opt/duckdb-extensions
+ENV DUCKDB_EXTENSION_DIR=/opt/duckdb-extensions
 
 # Set PATH to use the venv
 ENV PATH="/app/.venv/bin:$PATH"

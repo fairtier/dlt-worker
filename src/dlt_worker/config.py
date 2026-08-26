@@ -123,6 +123,21 @@ DBT_DUCKDB_TEMP_DIR: str = ""
 # disk — disk is the box's other silently-exhausted resource. Empty = leave
 # DuckDB's default (90% of the filesystem).
 DBT_DUCKDB_MAX_TEMP_SIZE: str = "4GB"
+# The same three bounds for the `duckdb` source type's extraction engine
+# (see duckdb_source.py). Separate knobs from the dbt trio because an
+# extraction is a different workload: it streams batches out and should
+# rarely need memory at all, so a tight ceiling is safe. Empty memory/temp
+# caps restore DuckDB's defaults; an empty temp dir means a per-pipeline
+# directory under the system temp dir, wiped on the next run.
+PIPELINE_DUCKDB_MEMORY_LIMIT: str = "512MB"
+PIPELINE_DUCKDB_TEMP_DIR: str = ""
+PIPELINE_DUCKDB_MAX_TEMP_SIZE: str = "4GB"
+# Where the `duckdb` source type finds its extension binaries. The image
+# bakes SUPPORTED_DUCKDB_EXTENSIONS (duckdb_source.py) into this directory
+# at build time, keyed to the duckdb wheel's version/platform, so LOAD
+# needs no run-time egress. Empty = DuckDB's default (~/.duckdb), where a
+# missing extension is autoinstalled from the official repositories.
+DUCKDB_EXTENSION_DIR: str = ""
 # Local-first run recording: Postgres DSN of the box-local `workspace`
 # database (see workspace_db.py). When set, every run is recorded there
 # first and the FairTier API report becomes best-effort. Unset = feature
@@ -176,6 +191,8 @@ def load() -> None:
     global TRANSFORMATION_SUBPROCESS
     global TRANSFORMATION_RUN_TIMEOUT_SECONDS
     global DBT_DUCKDB_MEMORY_LIMIT, DBT_DUCKDB_TEMP_DIR, DBT_DUCKDB_MAX_TEMP_SIZE
+    global PIPELINE_DUCKDB_MEMORY_LIMIT, PIPELINE_DUCKDB_TEMP_DIR
+    global PIPELINE_DUCKDB_MAX_TEMP_SIZE, DUCKDB_EXTENSION_DIR
     global WORKSPACE_DB_URL
     global DATA_WRITER_CHUNK_ROWS
     global \
@@ -221,6 +238,14 @@ def load() -> None:
     DBT_DUCKDB_MEMORY_LIMIT = os.environ.get("DBT_DUCKDB_MEMORY_LIMIT", "512MB")
     DBT_DUCKDB_TEMP_DIR = os.environ.get("DBT_DUCKDB_TEMP_DIR", "")
     DBT_DUCKDB_MAX_TEMP_SIZE = os.environ.get("DBT_DUCKDB_MAX_TEMP_SIZE", "4GB")
+    PIPELINE_DUCKDB_MEMORY_LIMIT = os.environ.get(
+        "PIPELINE_DUCKDB_MEMORY_LIMIT", "512MB"
+    )
+    PIPELINE_DUCKDB_TEMP_DIR = os.environ.get("PIPELINE_DUCKDB_TEMP_DIR", "")
+    PIPELINE_DUCKDB_MAX_TEMP_SIZE = os.environ.get(
+        "PIPELINE_DUCKDB_MAX_TEMP_SIZE", "4GB"
+    )
+    DUCKDB_EXTENSION_DIR = os.environ.get("DUCKDB_EXTENSION_DIR", "")
     WORKSPACE_DB_URL = os.environ.get("WORKSPACE_DB_URL", "")
     DATA_WRITER_CHUNK_ROWS = _int("DATA_WRITER_CHUNK_ROWS", 100_000)
 
