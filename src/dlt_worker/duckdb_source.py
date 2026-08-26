@@ -74,6 +74,12 @@ SUPPORTED_DUCKDB_EXTENSIONS: dict[str, str] = {
     # read_pdf/read_pdf_tables, read_html/read_xml/html_extract_tables).
     "pdf": "community",
     "webbed": "community",
+    # Google Drive virtual filesystem (gdrive:// paths for read_csv,
+    # read_parquet, read_pdf, …; native Sheets via read_csv). Query-only,
+    # no attach; auth via secret {PROVIDER: config, REFRESH_TOKEN,
+    # CLIENT_ID, CLIENT_SECRET} — the customer's own OAuth client, the
+    # google_sheets precedent. Needs duckdb >= 1.5.5 (no 1.5.4 build).
+    "gdrive": "community",
     # Helper: not a source by itself, but read_pdf('https://…') and friends
     # autoload it for the http(s) protocol, and autoinstall cannot write
     # into the read-only baked directory — so it must be baked. Also lets a
