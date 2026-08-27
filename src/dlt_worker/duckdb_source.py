@@ -1,7 +1,8 @@
 """The `duckdb` source type: extract through a DuckDB extension, land via dlt.
 
 DuckDB is the extractor, dlt is the loader. The builder opens an in-memory
-DuckDB, LOADs one extension, optionally ATTACHes the external system, and
+DuckDB, LOADs the configured extension (or extensions), optionally ATTACHes
+the external system, and
 exposes each configured table as a dlt resource that streams Arrow record
 batches out of a query — so the existing pipeline machinery (write
 dispositions, merge, incremental cursor state, the chunked Iceberg load in
@@ -10,6 +11,12 @@ only ever reads; landing in the lake is dlt's job.
 
 source_config:
     extension: mysql              # which DuckDB extension to LOAD (required)
+    extensions: [gdrive, pdf]     # ...or several, when one extension's reader
+                                  # has to run over another's filesystem (a PDF
+                                  # in Google Drive). Ordered: the FIRST is the
+                                  # primary one — the ATTACH TYPE and the
+                                  # default CREATE SECRET type. Set `extension`
+                                  # or `extensions`, never both.
     attach: "host={host} user={user} password={password} database=shop"
                                   # ATTACH template (optional; see below)
     tables:
@@ -74,11 +81,13 @@ SUPPORTED_DUCKDB_EXTENSIONS: dict[str, str] = {
     # read_pdf/read_pdf_tables, read_html/read_xml/html_extract_tables).
     "pdf": "community",
     "webbed": "community",
-    # Google Drive virtual filesystem (gdrive:// paths for read_csv,
-    # read_parquet, read_pdf, …; native Sheets via read_csv). Query-only,
-    # no attach; auth via secret {PROVIDER: config, REFRESH_TOKEN,
-    # CLIENT_ID, CLIENT_SECRET} — the customer's own OAuth client, the
-    # google_sheets precedent. Needs duckdb >= 1.5.5 (no 1.5.4 build).
+    # Google Drive virtual filesystem: gdrive:// paths for the readers,
+    # native Sheets via read_csv. Query-only, no attach. It is a filesystem
+    # and nothing else, so a PDF *in* Drive needs `pdf` loaded beside it
+    # (extensions: [gdrive, pdf]) — DuckDB autoloads no community
+    # extension's functions. Auth via secret {PROVIDER: config,
+    # REFRESH_TOKEN, CLIENT_ID, CLIENT_SECRET} — the customer's own OAuth
+    # client, the google_sheets precedent. Needs duckdb >= 1.5.5.
     "gdrive": "community",
     # Helper: not a source by itself, but read_pdf('https://…') and friends
     # autoload it for the http(s) protocol, and autoinstall cannot write
@@ -106,6 +115,51 @@ def _sql_string(value: str) -> str:
 def _quote_ident(name: str) -> str:
     """Double-quote an identifier, escaping embedded quotes."""
     return '"' + name.replace('"', '""') + '"'
+
+
+def source_extensions(pipeline_name: str, src_cfg: dict[str, Any]) -> list[str]:
+    """The extensions this pipeline LOADs, in order; the first is primary.
+
+    A pipeline used to load exactly one, which made a whole shape
+    unreachable: DuckDB does not autoload a *community* extension's
+    functions, so with only ``gdrive`` loaded ``read_pdf`` does not exist and
+    a PDF in Google Drive — the headline of the gdrive work — could be saved
+    and never run. Measured against duckdb 1.5.5: with ``gdrive`` and ``pdf``
+    both loaded, ``read_pdf('gdrive://id:…')`` reaches the gdrive filesystem
+    (it asks for the secret) where ``pdf`` alone reports "No such file or
+    directory". Core extensions are the exception that hid this — httpfs
+    autoloads, so a PDF at an http(s) URL always worked.
+
+    Ordered rather than a set because the primary extension is what ATTACH
+    names as its TYPE and what a CREATE SECRET defaults its type to.
+    """
+    single = src_cfg.get("extension")
+    many = src_cfg.get("extensions")
+    if single and many:
+        raise ValueError(
+            f"Pipeline {pipeline_name!r}: source_config sets both 'extension' "
+            "and 'extensions'; use one of them"
+        )
+    if many is not None and not isinstance(many, list):
+        raise ValueError(
+            f"Pipeline {pipeline_name!r}: source_config 'extensions' must be a list"
+        )
+    names = [str(n) for n in (many or ([single] if single else []))]
+    if not names:
+        raise ValueError(
+            f"Pipeline {pipeline_name!r}: source_config missing required 'extension'"
+        )
+    ordered: list[str] = []
+    for name in names:
+        if not _IDENT_RE.match(name):
+            raise ValueError(
+                f"Pipeline {pipeline_name!r}: invalid extension name {name!r}"
+            )
+        # A repeated LOAD is harmless, but the list is also what error
+        # messages name — say each extension once.
+        if name not in ordered:
+            ordered.append(name)
+    return ordered
 
 
 def render_attach(pipeline_name: str, template: str, params: dict[str, Any]) -> str:
@@ -157,8 +211,12 @@ def _spill_dir(pipeline_id: str) -> str:
     return path
 
 
-def _connect(cfg: PipelineConfig) -> Any:
-    """Open a bounded in-memory DuckDB for one extraction."""
+def _connect(pipeline_id: str) -> Any:
+    """Open a bounded in-memory DuckDB for one extraction.
+
+    Takes the id rather than the config because the source-test probe opens
+    the same bounded connection with no pipeline behind it.
+    """
     import duckdb
 
     ddb_config: dict[str, Any] = {}
@@ -169,7 +227,7 @@ def _connect(cfg: PipelineConfig) -> Any:
         con.execute(
             f"SET memory_limit = '{_sql_string(config.PIPELINE_DUCKDB_MEMORY_LIMIT)}'"
         )
-    con.execute(f"SET temp_directory = '{_sql_string(_spill_dir(cfg.id))}'")
+    con.execute(f"SET temp_directory = '{_sql_string(_spill_dir(pipeline_id))}'")
     if config.PIPELINE_DUCKDB_MAX_TEMP_SIZE:
         con.execute(
             "SET max_temp_directory_size = "
@@ -255,25 +313,22 @@ def build_duckdb_source(cfg: PipelineConfig) -> Any:
     """Build the list of dlt resources for a `duckdb` pipeline."""
     src_cfg = cfg.source_config
 
-    extension = src_cfg.get("extension")
-    if not extension:
-        raise ValueError(
-            f"Pipeline {cfg.name!r}: source_config missing required 'extension'"
-        )
-    if not _IDENT_RE.match(str(extension)):
-        raise ValueError(f"Pipeline {cfg.name!r}: invalid extension name {extension!r}")
-    if extension not in SUPPORTED_DUCKDB_EXTENSIONS:
-        # Not fatal on purpose: the image only *bakes* the supported set,
-        # but DuckDB can still autoinstall a signed extension over the
-        # box's open 443 — a self-hoster's escape hatch. The FairTier API
-        # enforces its own allowlist at save time.
-        logger.warning(
-            "Pipeline %s: extension %r is not in the baked set %s; "
-            "DuckDB will try to install it at run time",
-            cfg.name,
-            extension,
-            sorted(SUPPORTED_DUCKDB_EXTENSIONS),
-        )
+    extensions = source_extensions(cfg.name, src_cfg)
+    # The one ATTACH names as its TYPE, and the default type of a secret.
+    extension = extensions[0]
+    for name in extensions:
+        if name not in SUPPORTED_DUCKDB_EXTENSIONS:
+            # Not fatal on purpose: the image only *bakes* the supported set,
+            # but DuckDB can still autoinstall a signed extension over the
+            # box's open 443 — a self-hoster's escape hatch. The FairTier API
+            # enforces its own allowlist at save time.
+            logger.warning(
+                "Pipeline %s: extension %r is not in the baked set %s; "
+                "DuckDB will try to install it at run time",
+                cfg.name,
+                name,
+                sorted(SUPPORTED_DUCKDB_EXTENSIONS),
+            )
 
     tables = src_cfg.get("tables")
     if not tables:
@@ -291,15 +346,16 @@ def build_duckdb_source(cfg: PipelineConfig) -> Any:
                     "source_config has no 'attach'"
                 )
 
-    con = _connect(cfg)
+    con = _connect(cfg.id)
 
-    try:
-        con.execute(f"LOAD {extension}")
-    except Exception as exc:
-        raise ValueError(
-            f"Pipeline {cfg.name!r}: failed to load DuckDB extension "
-            f"{extension!r}: {exc}"
-        ) from exc
+    for name in extensions:
+        try:
+            con.execute(f"LOAD {name}")
+        except Exception as exc:
+            raise ValueError(
+                f"Pipeline {cfg.name!r}: failed to load DuckDB extension "
+                f"{name!r}: {exc}"
+            ) from exc
 
     secret = cfg.source_credentials.get("secret")
     if secret:

@@ -19,6 +19,7 @@ from dlt_worker.duckdb_source import (
     _secret_sql,
     build_duckdb_source,
     render_attach,
+    source_extensions,
 )
 
 
@@ -91,6 +92,40 @@ class TestSecretSql:
             _secret_sql("p", "x", {"type": "s3; DROP"})
 
 
+class TestSourceExtensions:
+    """The LOAD list. One key or the other, ordered, first is primary."""
+
+    def test_single_extension(self) -> None:
+        assert source_extensions("p", {"extension": "gdrive"}) == ["gdrive"]
+
+    def test_list_keeps_order(self) -> None:
+        # Order is the contract: the first is the ATTACH TYPE and the
+        # default secret type, so [gdrive, pdf] is not [pdf, gdrive].
+        assert source_extensions("p", {"extensions": ["gdrive", "pdf"]}) == [
+            "gdrive",
+            "pdf",
+        ]
+
+    def test_duplicates_named_once(self) -> None:
+        assert source_extensions("p", {"extensions": ["pdf", "pdf"]}) == ["pdf"]
+
+    def test_both_keys_refused(self) -> None:
+        with pytest.raises(ValueError, match="both 'extension' and 'extensions'"):
+            source_extensions("p", {"extension": "pdf", "extensions": ["gdrive"]})
+
+    def test_list_must_be_a_list(self) -> None:
+        with pytest.raises(ValueError, match="'extensions' must be a list"):
+            source_extensions("p", {"extensions": "gdrive"})
+
+    def test_every_name_is_an_identifier(self) -> None:
+        with pytest.raises(ValueError, match="invalid extension name"):
+            source_extensions("p", {"extensions": ["gdrive", "pdf; DROP"]})
+
+    def test_empty_is_missing(self) -> None:
+        with pytest.raises(ValueError, match="missing required 'extension'"):
+            source_extensions("p", {"extensions": []})
+
+
 class TestBuildValidation:
     def test_missing_extension(self) -> None:
         cfg = _make_config(source_config={"tables": [{"name": "t"}]})
@@ -125,6 +160,17 @@ class TestBuildValidation:
         )
         with pytest.raises(ValueError, match="missing required 'name'"):
             build_duckdb_source(cfg)
+
+    def test_every_extension_is_loaded(self) -> None:
+        # Two statically-linked extensions, so the assertion is about the
+        # LOAD list rather than about any binary: both names reach DuckDB.
+        cfg = _make_config(
+            source_config={
+                "extensions": ["json", "icu"],
+                "tables": [{"name": "t", "query": "SELECT 1 AS id"}],
+            }
+        )
+        assert len(build_duckdb_source(cfg)) == 1
 
     def test_unsupported_extension_warns_not_fails(
         self, caplog: pytest.LogCaptureFixture
@@ -217,7 +263,7 @@ class TestConnect:
         old_tmp = config.PIPELINE_DUCKDB_TEMP_DIR
         config.PIPELINE_DUCKDB_TEMP_DIR = str(tmp_path)
         try:
-            con = _connect(cfg)
+            con = _connect(cfg.id)
             temp_dir = con.execute(
                 "SELECT current_setting('temp_directory')"
             ).fetchone()[0]
