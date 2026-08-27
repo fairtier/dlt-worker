@@ -131,6 +131,29 @@ class TransformationRunReport:
 
 
 @dataclass
+class SourceTest:
+    """One queued "can this thing read my X?" probe, claimed from the API.
+
+    Config and credentials arrive in exactly the shape a run would receive
+    them — a Google connection reference is already resolved server-side —
+    so the probe exercises the same thing the run will.
+    """
+
+    id: str
+    source_type: str
+    source_config: dict[str, Any]
+    source_credentials: dict[str, Any]
+
+
+@dataclass
+class SourceTestReport:
+    id: str
+    status: str  # "success" or "failed"
+    message: str
+    details: list[str] = field(default_factory=list)
+
+
+@dataclass
 class APIClient:
     base_url: str
     customer_slug: str
@@ -379,6 +402,60 @@ class APIClient:
             )
             return False
 
+    def get_pending_source_tests(self) -> list[SourceTest]:
+        """Claim this customer's queued source tests.
+
+        Claiming happens server-side in the same statement as the read, so
+        two overlapping polls cannot probe one test twice — with a database
+        password, twice is how an account gets locked out.
+
+        Deliberately does not touch health status: source tests are a
+        convenience, and a FairTier API too old to serve them (404/501) must
+        not flip the pod unready while pipelines still run.
+        """
+        url = f"{self.base_url}/pipeline.v1.PipelineService/GetPendingSourceTests"
+        try:
+            resp = self._post(url, {"customerSlug": self.customer_slug})
+            resp.raise_for_status()
+            data = resp.json()
+            tests = data.get("tests", [])
+            if not isinstance(tests, list):
+                raise ValueError("'tests' is not a list")
+        except (requests.RequestException, ValueError):
+            logger.debug("Failed to fetch source tests", exc_info=True)
+            return []
+
+        out = []
+        for t in tests:
+            try:
+                out.append(_parse_source_test(t))
+            except Exception:
+                logger.warning(
+                    "Skipping malformed source test (id=%s)",
+                    t.get("id", "?") if isinstance(t, dict) else "?",
+                    exc_info=True,
+                )
+        return out
+
+    def report_source_test(self, report: SourceTestReport) -> bool:
+        """Report a probe's outcome. Returns True on success."""
+        url = f"{self.base_url}/pipeline.v1.PipelineService/ReportSourceTest"
+        try:
+            resp = self._post(
+                url,
+                {
+                    "id": report.id,
+                    "status": report.status,
+                    "message": report.message,
+                    "details": report.details,
+                },
+            )
+            resp.raise_for_status()
+            return True
+        except requests.RequestException:
+            logger.exception("Failed to report source test %s", report.id)
+            return False
+
     def report_pipeline_run(self, report: PipelineRunReport) -> bool:
         """Report the result of a pipeline run back to FairTier API.
 
@@ -405,6 +482,28 @@ class APIClient:
             logger.exception("Failed to report pipeline run for %s", report.pipeline_id)
             self._mark_unhealthy(e)
             return False
+
+
+def _parse_source_test(t: dict[str, Any]) -> SourceTest:
+    return SourceTest(
+        id=t["id"],
+        source_type=t.get("sourceType", ""),
+        source_config=_json_object(t.get("sourceConfig")),
+        source_credentials=_json_object(t.get("sourceCredentials")),
+    )
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    """Parse a JSON-string field into an object; anything else is empty.
+
+    The wire carries these as strings (they are free-form per source type),
+    and a null, an empty string and a JSON array all mean the same thing
+    here: nothing this probe can use.
+    """
+    if not raw:
+        return {}
+    value = json.loads(raw) if isinstance(raw, str) else raw
+    return value if isinstance(value, dict) else {}
 
 
 def _parse_last_run_at(record: dict[str, Any]) -> datetime | None:

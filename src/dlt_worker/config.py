@@ -108,6 +108,23 @@ TRANSFORMATION_SUBPROCESS: bool = True
 # a different workload: a model that queries a warehouse table has no
 # timeout of its own. Only enforced in subprocess mode. 0 disables.
 TRANSFORMATION_RUN_TIMEOUT_SECONDS: int = 7_200
+# How often, in seconds, to ask the FairTier API for queued source tests
+# ("Test connection" in the Console). Much shorter than POLL_INTERVAL_SECONDS
+# because a person is watching a spinner: the probe has to run here — this is
+# where the drivers, the baked DuckDB extensions and the box's network path
+# are — so the only way to make the button feel like a button is to look more
+# often. The request is a small POST that usually returns an empty list.
+# 0 disables source tests entirely (the rollback lever).
+SOURCE_TEST_POLL_SECONDS: int = 10
+# Wall-clock limit for one probe. Short on purpose and far below a run's: a
+# test that has not answered in a minute has answered — the source is not
+# reachable from this box. Only enforced in subprocess mode.
+SOURCE_TEST_TIMEOUT_SECONDS: int = 60
+# Run each probe in a short-lived spawned subprocess, for the same reasons a
+# run is (see run_isolation.py) plus one of its own: a probe opens exactly the
+# connections a wrong config makes hang, and a hung connect in the poll loop
+# would stop every schedule on the box. 0/false = in-process. Rollback lever.
+SOURCE_TEST_SUBPROCESS: bool = True
 # DuckDB memory ceiling for a dbt run (a `memory_limit` SET in the generated
 # profile). Past it DuckDB spills to DBT_DUCKDB_TEMP_DIR instead of growing,
 # which is the difference between a slow model and a box in reclaim thrash —
@@ -190,6 +207,8 @@ def load() -> None:
     global PIPELINE_RUN_TIMEOUT_SECONDS
     global TRANSFORMATION_SUBPROCESS
     global TRANSFORMATION_RUN_TIMEOUT_SECONDS
+    global SOURCE_TEST_POLL_SECONDS, SOURCE_TEST_TIMEOUT_SECONDS
+    global SOURCE_TEST_SUBPROCESS
     global DBT_DUCKDB_MEMORY_LIMIT, DBT_DUCKDB_TEMP_DIR, DBT_DUCKDB_MAX_TEMP_SIZE
     global PIPELINE_DUCKDB_MEMORY_LIMIT, PIPELINE_DUCKDB_TEMP_DIR
     global PIPELINE_DUCKDB_MAX_TEMP_SIZE, DUCKDB_EXTENSION_DIR
@@ -225,6 +244,15 @@ def load() -> None:
         "no",
     )
     PIPELINE_RUN_TIMEOUT_SECONDS = _int("PIPELINE_RUN_TIMEOUT_SECONDS", 21_600)
+    SOURCE_TEST_POLL_SECONDS = _int("SOURCE_TEST_POLL_SECONDS", 10)
+    SOURCE_TEST_TIMEOUT_SECONDS = _int("SOURCE_TEST_TIMEOUT_SECONDS", 60)
+    SOURCE_TEST_SUBPROCESS = os.environ.get(
+        "SOURCE_TEST_SUBPROCESS", "1"
+    ).lower() not in (
+        "0",
+        "false",
+        "no",
+    )
     TRANSFORMATION_SUBPROCESS = os.environ.get(
         "TRANSFORMATION_SUBPROCESS", "1"
     ).lower() not in (

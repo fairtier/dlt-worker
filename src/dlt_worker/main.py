@@ -19,7 +19,11 @@ from croniter import croniter
 from dlt_worker import config, iceberg_stream, telemetry, workspace_db
 from dlt_worker.health import start_health_server
 from dlt_worker.pipeline_files import load_pipeline_configs
-from dlt_worker.run_isolation import run_pipeline_isolated, run_transformation_isolated
+from dlt_worker.run_isolation import (
+    run_pipeline_isolated,
+    run_source_test_isolated,
+    run_transformation_isolated,
+)
 from dlt_worker.scheduler_state import SchedulerState
 from dlt_worker.snapshot import trigger_snapshot
 from dlt_worker.api_client import (
@@ -220,14 +224,49 @@ def run() -> None:
             _recorder.finalize_stale_runs()
             last_sweep = time.monotonic()
 
-        # Sleep in small increments to respond to shutdown quickly.
-        for _ in range(config.POLL_INTERVAL_SECONDS):
+        # Sleep in small increments to respond to shutdown quickly — and to
+        # answer source tests in between polls. A person is watching a
+        # spinner for those, so they cannot wait for the next full tick.
+        for elapsed in range(1, config.POLL_INTERVAL_SECONDS + 1):
             if _shutdown:
                 break
             time.sleep(1)
+            if (
+                config.SOURCE_TEST_POLL_SECONDS > 0
+                and elapsed % config.SOURCE_TEST_POLL_SECONDS == 0
+            ):
+                _serve_source_tests(client)
 
     telemetry.flush()
     logger.info("dlt-worker shut down cleanly")
+
+
+def _serve_source_tests(client: APIClient) -> None:
+    """Claim and run any queued source tests ("Test connection").
+
+    Runs on the poll loop's own thread, so a probe delays the next tick by
+    at most its own deadline (SOURCE_TEST_TIMEOUT_SECONDS, a minute by
+    default). That is the right trade: scheduled work is minutes-granular,
+    and a probe that cannot answer in a minute has answered.
+
+    Never raises: a control plane too old to serve source tests, or one that
+    is simply down, must not touch scheduling.
+    """
+    try:
+        tests = client.get_pending_source_tests()
+    except Exception:
+        logger.warning("Failed to claim source tests", exc_info=True)
+        return
+
+    for test in tests:
+        logger.info("Running source test %s (%s)", test.id, test.source_type)
+        with telemetry.tracer.start_as_current_span(
+            "dlt_worker.source_test",
+            attributes={telemetry.ATTR_SOURCE_TYPE: test.source_type},
+        ):
+            report = run_source_test_isolated(test)
+        logger.info("Source test %s: %s", test.id, report.status)
+        client.report_source_test(report)
 
 
 def _tick(client: APIClient) -> None:

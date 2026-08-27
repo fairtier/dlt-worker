@@ -8,56 +8,24 @@ import re
 import traceback
 from datetime import datetime, timezone
 from typing import Any, cast
-from urllib.parse import quote
 
 import dlt
 
 from dlt.common.schema.typing import TMergeDispositionDict, TWriteDispositionConfig
 
-from dlt_worker import config, telemetry
+from dlt_worker import config, pgurl, scrub, telemetry
 from dlt_worker.api_client import PipelineConfig, PipelineRunReport
 from dlt_worker.snapshot import trigger_snapshot
 
 logger = logging.getLogger(__name__)
 
 
-# Credential values shorter than this are not scrubbed: replacing every
-# occurrence of a 1-3 char string would mangle unrelated message text.
-_MIN_SCRUB_LENGTH = 4
-
-
-def _credential_values(obj: Any) -> list[str]:
-    """Collect every string value nested anywhere in a credentials structure."""
-    values: list[str] = []
-    if isinstance(obj, dict):
-        for item in obj.values():
-            values.extend(_credential_values(item))
-    elif isinstance(obj, (list, tuple)):
-        for item in obj:
-            values.extend(_credential_values(item))
-    elif isinstance(obj, str) and len(obj) >= _MIN_SCRUB_LENGTH:
-        values.append(obj)
-    return values
-
-
-def _scrub_credentials(text: str, credentials: dict[str, Any]) -> str:
-    """Replace credential values (and their URL-encoded forms) with ***.
-
-    Second line of defense mirroring transformation_runner._sanitize: dlt
-    source exceptions routinely echo config (SQLAlchemy errors include the
-    connection URL, requests errors the full request URL), and the resulting
-    error_message is persisted to the workspace database, sent to the
-    central API, and logged — nothing credential-shaped may reach any of
-    them. Longest values first so a value that contains another is scrubbed
-    whole before its substring punches a hole in it.
-    """
-    values = sorted(
-        set(_credential_values(credentials)), key=lambda v: len(v), reverse=True
-    )
-    for value in values:
-        for variant in (value, quote(value, safe="")):
-            text = text.replace(variant, "***")
-    return text
+# The scrubber moved to dlt_worker.scrub so the source-test probe can use it
+# without importing this module (and, with it, dlt). Re-exported under their
+# old private names because everything here — and its tests — calls them that.
+_MIN_SCRUB_LENGTH = scrub.MIN_SCRUB_LENGTH
+_credential_values = scrub.credential_values
+_scrub_credentials = scrub.scrub_credentials
 
 
 def _count_rows(normalize_info: Any) -> int:
@@ -263,20 +231,9 @@ def _build_rest_api_source(cfg: PipelineConfig) -> Any:
     )
 
 
-def _normalize_pg_connection_string(connection_string: str) -> str:
-    """Map the common PostgreSQL URL schemes onto the installed driver.
-
-    This image deliberately ships psycopg (v3) as its only database driver,
-    but SQLAlchemy resolves a plain ``postgresql://`` to psycopg2 and knows
-    no ``postgres`` dialect at all — so the natural forms users paste would
-    crash at engine creation. Anything that is not a PostgreSQL scheme is
-    left untouched (the FairTier API rejects those at save time; a
-    self-hoster who installed extra drivers keeps them working).
-    """
-    scheme, sep, rest = connection_string.partition("://")
-    if sep and scheme.lower() in ("postgres", "postgresql"):
-        return "postgresql+psycopg://" + rest
-    return connection_string
+# Moved to dlt_worker.pgurl so the source-test probe can normalize a URL
+# without importing dlt; kept under its old name for every caller here.
+_normalize_pg_connection_string = pgurl.normalize_pg_connection_string
 
 
 def _build_sql_database_source(cfg: PipelineConfig) -> Any:

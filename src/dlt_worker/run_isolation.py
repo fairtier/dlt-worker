@@ -49,6 +49,8 @@ from dlt_worker import config, iceberg_stream, telemetry
 from dlt_worker.api_client import (
     PipelineConfig,
     PipelineRunReport,
+    SourceTest,
+    SourceTestReport,
     TransformationConfig,
     TransformationRunReport,
 )
@@ -58,7 +60,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_Report = TypeVar("_Report", PipelineRunReport, TransformationRunReport)
+_Report = TypeVar(
+    "_Report", PipelineRunReport, TransformationRunReport, SourceTestReport
+)
 
 
 def _child_setup(trace_context: Mapping[str, str]) -> None:
@@ -114,6 +118,24 @@ def _transformation_child_main(
 
     try:
         conn.send(run_transformation(cfg))
+        conn.close()
+    finally:
+        telemetry.flush()
+
+
+def _source_test_child_main(
+    conn: Connection, test: SourceTest, trace_context: Mapping[str, str]
+) -> None:
+    """Entry point of a spawned probe child: set up, probe, send the report.
+
+    No iceberg patch and no dlt import: a probe opens the source, reads a
+    row and lands nothing.
+    """
+    _child_setup(trace_context)
+    from dlt_worker.source_test import probe_source
+
+    try:
+        conn.send(probe_source(test))
         conn.close()
     finally:
         telemetry.flush()
@@ -243,6 +265,32 @@ def run_pipeline_isolated(cfg: PipelineConfig) -> PipelineRunReport:
         kind="pipeline",
         label=cfg.name,
         timeout=config.PIPELINE_RUN_TIMEOUT_SECONDS,
+        failed=failed,
+    )
+
+
+def run_source_test_isolated(test: SourceTest) -> SourceTestReport:
+    """Probe one source in a short-lived child and return its report.
+
+    Isolated for the usual reason (a DuckDB ATTACH or a SQLAlchemy engine
+    leaves memory behind) and one of its own: a probe opens exactly the
+    connections a wrong config makes hang, and the deadline here is what
+    keeps a hung connect from stopping every schedule on the box.
+    """
+    if not config.SOURCE_TEST_SUBPROCESS:
+        from dlt_worker.source_test import probe_source
+
+        return probe_source(test)
+
+    def failed(started_at: datetime, message: str) -> SourceTestReport:
+        return SourceTestReport(id=test.id, status="failed", message=message)
+
+    return _supervise(
+        _source_test_child_main,
+        test,
+        kind="source test",
+        label=test.id,
+        timeout=config.SOURCE_TEST_TIMEOUT_SECONDS,
         failed=failed,
     )
 

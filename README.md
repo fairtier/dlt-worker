@@ -81,6 +81,9 @@ All configuration is via environment variables.
 | `PIPELINE_RUN_TIMEOUT_SECONDS` | `21600`   | Wall-clock limit for one pipeline run attempt — on expiry the run subprocess is killed and a failed run is reported, so a source stuck in a read can't wedge the poll loop forever; only enforced in subprocess mode; `0` disables |
 | `TRANSFORMATION_SUBPROCESS` | `1`          | Run each dbt transformation in a short-lived spawned subprocess, for the same reason pipelines are: dbt + DuckDB over a big table retains hundreds of MB the worker otherwise never gives back (and stays *under* its container limit while doing it, so nothing kills it); `0` runs transformations in-process (pre-0.7.0 behavior) |
 | `TRANSFORMATION_RUN_TIMEOUT_SECONDS` | `7200` | Wall-clock limit for one dbt run — a model querying the warehouse has no timeout of its own; on expiry the subprocess is killed and a failed run is reported. Only enforced in subprocess mode; `0` disables |
+| `SOURCE_TEST_POLL_SECONDS`  | `10`         | How often to claim queued source tests ("Test connection" in the Console) between config polls — much shorter than `POLL_INTERVAL_SECONDS` because a person is watching a spinner. `0` disables source tests |
+| `SOURCE_TEST_TIMEOUT_SECONDS` | `60`       | Wall-clock limit for one probe. A test that has not answered in a minute has answered: the source is not reachable from this box. Only enforced in subprocess mode; `0` disables |
+| `SOURCE_TEST_SUBPROCESS`    | `1`         | Run each probe in a short-lived spawned subprocess. A probe opens exactly the connections a wrong config makes hang; `0` runs it in the poll loop |
 | `DBT_DUCKDB_MEMORY_LIMIT`   | `512MB`      | DuckDB `memory_limit` for a dbt run. Unbounded, DuckDB sizes its buffer manager from *host* RAM — which on a single-node box is everyone else's RAM too; bounded, it spills instead. Empty leaves DuckDB's default |
 | `DBT_DUCKDB_TEMP_DIR`       | _(empty)_    | Where DuckDB spills past that ceiling; empty = the run's temp dir, so a killed build leaves no spill behind |
 | `DBT_DUCKDB_MAX_TEMP_SIZE`  | `4GB`        | Cap on that spill, so a runaway model exhausts neither RAM nor the box's disk. Empty leaves DuckDB's default (90% of the filesystem) |
@@ -121,6 +124,26 @@ The control plane provides pipeline configurations that specify one of these sou
 - **`filesystem`** -- Reads files from S3-compatible storage via [dlt's filesystem source](https://dlthub.com/docs/dlt-ecosystem/verified-sources/filesystem).
 - **`duckdb`** -- Reads through a [DuckDB extension](https://duckdb.org/docs/stable/core_extensions/overview) and streams Arrow batches into the normal dlt load path. Config: `extension` (the image bakes `mysql`, `mssql`, `pdf`, `webbed`, `gdrive` (a `gdrive://` virtual filesystem for the readers), and the `httpfs` helper — anything else is autoinstalled at run time when egress allows) or `extensions` (a list, for when one extension's reader has to run over another's filesystem: `["gdrive", "pdf"]` reads a PDF in Google Drive, because DuckDB autoloads no community extension's functions — ordered, the first is the ATTACH `TYPE` and a secret's default type). Exactly one of the two, never both. `attach` (optional ATTACH template with `{placeholder}`s, attached read-only as `src`), `tables` (required; each with `name`, optional `query` defaulting to `SELECT * FROM src."<name>"`, optional `cursor_column`/`initial_value` for incremental loading, optional `primary_key` for merge). Credentials: `attach_params` (fills the ATTACH `{placeholder}`s) and/or `secret` (rendered as a DuckDB `CREATE SECRET`, `type` defaulting to the extension name). Extraction runs in a bounded in-memory DuckDB (`PIPELINE_DUCKDB_*` knobs) that spills to disk rather than growing.
 - **`google_sheets`** -- Reads spreadsheet ranges via the [Google Sheets API v4](https://developers.google.com/sheets/api) (read-only scope). Config: `spreadsheet_url_or_id` (required), `range_names` (optional -- tab names, `Tab!A1:D` ranges, or named ranges; defaults to every tab). Credentials: exactly one of `oauth` (a `{client_id, client_secret, refresh_token}` delegated-user grant from the "Sign in with Google" flow — the FairTier API injects the central client pair before serving) or `service_account_key` (a GCP service-account key JSON; share the spreadsheet read-only with the key's `client_email`). The first row of each range is used as the header row; one table is loaded per range.
+
+## Source tests ("Test connection")
+
+The Console can ask "can this thing read my source?" before a pipeline is ever
+saved. The probe runs **here**, not in the FairTier API: this is where the
+drivers, the baked DuckDB extensions, the box's network path and the
+credentials are, and a test that ran anywhere else would be testing a different
+thing than the one that runs at 03:00.
+
+So it is a queued job rather than a call. Between config polls the worker
+claims its tenant's queued tests (`GetPendingSourceTests`, every
+`SOURCE_TEST_POLL_SECONDS`), probes each one in the same subprocess isolation a
+run uses, and reports back (`ReportSourceTest`). Claiming happens server-side in
+one statement, so two overlapping polls never probe the same source twice.
+
+A probe opens the source, reads **at most one row per table** (10 tables at
+most), lands nothing, and reports a line per table — "connected" and "connected,
+and the table you named is there" being different answers. `duckdb` and
+`sql_database` have probes; any other type reports that it cannot be tested
+here. Every message goes through the same credential scrubber a failed run does.
 
 ## Transformations (dbt)
 
