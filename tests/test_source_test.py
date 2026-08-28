@@ -8,6 +8,8 @@ needs a live PostgreSQL, which the run path's own tests do not have either.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from dlt_worker import config
@@ -15,8 +17,8 @@ from dlt_worker.api_client import SourceTest
 from dlt_worker.source_test import MAX_PROBED_TABLES, probe_source
 
 
-def _test(**overrides):
-    defaults = {
+def _test(**overrides: Any) -> SourceTest:
+    defaults: dict[str, Any] = {
         "id": "t1",
         "source_type": "duckdb",
         "source_config": {
