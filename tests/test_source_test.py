@@ -61,9 +61,7 @@ class TestDuckDBProbe:
             _test(
                 source_config={
                     "extension": "json",
-                    "tables": [
-                        {"name": "a", "query": "SELECT 1 AS id WHERE false"}
-                    ],
+                    "tables": [{"name": "a", "query": "SELECT 1 AS id WHERE false"}],
                 }
             )
         )
@@ -90,7 +88,9 @@ class TestDuckDBProbe:
             {"name": f"t{i}", "query": "SELECT 1 AS id"}
             for i in range(MAX_PROBED_TABLES + 5)
         ]
-        report = probe_source(_test(source_config={"extension": "json", "tables": tables}))
+        report = probe_source(
+            _test(source_config={"extension": "json", "tables": tables})
+        )
         assert report.status == "success"
         assert report.details[-1] == "(5 more tables not checked)"
 

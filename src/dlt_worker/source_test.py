@@ -128,7 +128,7 @@ def _probe_duckdb(test: SourceTest) -> tuple[str, list[str]]:
         failures: list[str] = []
         for table in tables[:MAX_PROBED_TABLES]:
             name = str(table.get("name") or "")
-            query = table.get("query") or f'SELECT * FROM src.{_quote_ident(name)}'
+            query = table.get("query") or f"SELECT * FROM src.{_quote_ident(name)}"
             ok, line = _probe_query(con, name, query)
             details.append(line)
             if not ok:
@@ -179,9 +179,7 @@ def _probe_sql_database(test: SourceTest) -> tuple[str, list[str]]:
     if not connection_string:
         raise ValueError("source_credentials has no connection_string")
 
-    engine = create_engine(
-        pgurl.normalize_pg_connection_string(str(connection_string))
-    )
+    engine = create_engine(pgurl.normalize_pg_connection_string(str(connection_string)))
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
