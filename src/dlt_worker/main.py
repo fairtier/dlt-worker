@@ -11,6 +11,7 @@ import logging
 import signal
 import time
 import uuid
+from dataclasses import fields
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -643,10 +644,120 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
             )
 
 
+# Fields a retry's config re-read must NOT take from the checkout: the
+# run's identity belongs to the tick that started it. `id` is the key the
+# fresh copy was found by; the trigger fields were consumed when the run
+# was admitted (re-reading them could re-arm a Run-now that already
+# fired); `last_run_at` is the scheduler's, not the file's.
+_RUN_IDENTITY_FIELDS = frozenset({"id", "trigger_now", "pending_run_id", "last_run_at"})
+
+
+def _reload_definition(pipeline_id: str) -> PipelineConfig | None:
+    """The checkout's *current* definition for one pipeline, or None.
+
+    The filename is cosmetic, so there is no single file to stat — the
+    whole set is reloaded and matched on `id`, exactly as a tick does.
+    """
+    files = load_pipeline_configs(config.PIPELINES_DIR, config.AGE_KEY_FILE)
+    for cfg in files.configs:
+        if cfg.id == pipeline_id:
+            return cfg
+    return None
+
+
+def _repoll_credentials(cfg: PipelineConfig, client: APIClient) -> dict[str, Any]:
+    """Re-fetch this pipeline's credentials from the control plane.
+
+    Falls back to what the run started with: neither an unreachable API
+    nor a poll that no longer lists the pipeline is evidence that the
+    credentials changed, and blanking them would guarantee the next
+    attempt fails.
+    """
+    polled = client.try_get_pipeline_triggers()
+    if polled is None:
+        return cfg.source_credentials
+    for p in polled:
+        if p.id == cfg.id:
+            _creds_cache[p.id] = p.source_credentials
+            return p.source_credentials
+    return cfg.source_credentials
+
+
+def _refresh_config(cfg: PipelineConfig, client: APIClient) -> bool:
+    """Re-read one pipeline's definition and credentials before a retry.
+
+    By the time a retry fires, the snapshot the run started from is a poll
+    interval plus a backoff old, and the pipelines checkout syncs on its
+    own ~1-minute cadence. So a save made moments before the run — a fixed
+    dataset name, a reconnected OAuth credential — lands on disk *while*
+    the attempts are still failing against the stale copy. Re-reading
+    turns that into a self-healing second attempt instead of a run that
+    fails every attempt against a problem already fixed. Two real runs on
+    2026-08-22 lost exactly that race.
+
+    Mutates ``cfg`` in place so the run keeps one config object end to end
+    — the caller's span attributes and metrics then describe what actually
+    ran. Returns True when anything changed.
+
+    Never fails the run: any problem re-reading leaves ``cfg`` untouched,
+    which is precisely the behaviour without this. A definition that has
+    vanished from the checkout is one such case — the run in flight belongs
+    to the tick that started it, and abandoning it mid-retry would leave it
+    unreported.
+    """
+    try:
+        fresh = _reload_definition(cfg.id)
+        if fresh is None:
+            return False
+        if not fresh.has_file_credentials:
+            # Same precedence as a tick: git truth wins outright, and only
+            # a config without an .age file asks the poll.
+            fresh.source_credentials = _repoll_credentials(cfg, client)
+
+        changed = [
+            f.name
+            for f in fields(PipelineConfig)
+            if f.name not in _RUN_IDENTITY_FIELDS
+            and getattr(fresh, f.name) != getattr(cfg, f.name)
+        ]
+        if not changed:
+            return False
+        for name in changed:
+            setattr(cfg, name, getattr(fresh, name))
+    except Exception:
+        logger.warning(
+            "Pipeline %s: config re-read before retry failed — retrying with "
+            "the run-start snapshot",
+            cfg.name,
+            exc_info=True,
+        )
+        return False
+
+    # Field NAMES only: "source_credentials changed" is the whole signal
+    # and carries nothing secret — the values never leave this process.
+    telemetry.add_event(
+        "pipeline.config_refreshed",
+        {
+            telemetry.ATTR_PIPELINE_ID: cfg.id,
+            "dlt_worker.config.changed_fields": ",".join(changed),
+        },
+    )
+    logger.info(
+        "Pipeline %s: re-read before retry picked up a newer definition (%s)",
+        cfg.name,
+        ", ".join(changed),
+    )
+    return True
+
+
 def _run_with_retry(
     cfg: PipelineConfig, local_run_id: str, client: APIClient
 ) -> PipelineRunReport | None:
     """Run a pipeline with exponential-backoff retries on failure.
+
+    Every retry re-reads the definition and credentials first
+    (``_refresh_config``), so a fix that lands mid-run is picked up rather
+    than slept through.
 
     Returns the final run report."""
     max_attempts = config.PIPELINE_MAX_RETRIES + 1
@@ -709,6 +820,11 @@ def _run_with_retry(
                 _finalize_pipeline_run(report, local_run_id, client)
                 return report
             time.sleep(1)
+
+        # After the wait, not before it: the backoff is exactly the window
+        # in which a just-saved fix reaches the checkout, so re-reading on
+        # the far side is what makes the next attempt a different attempt.
+        _refresh_config(cfg, client)
 
     return report
 

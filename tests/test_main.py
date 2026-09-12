@@ -326,6 +326,241 @@ class TestRunWithRetry:
         assert sent.run_id == "local-only-1"
 
 
+# --- config/credential re-read between retries ---
+
+
+class TestRefreshBetweenRetries:
+    """A retry re-reads the checkout and the poll first.
+
+    The run-start snapshot can be a poll interval plus a backoff stale by
+    the time attempt 2 fires, and the checkout syncs on its own ~1-minute
+    cadence — so a fix saved moments before the run lands *during* the
+    retries. Without the re-read, every attempt repeats the same failure.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _files_mode(self, tmp_path: Path) -> Any:
+        self.checkout = tmp_path / "checkout"
+        (self.checkout / "pipelines").mkdir(parents=True)
+        config.PIPELINES_DIR = str(self.checkout)
+        config.AGE_KEY_FILE = ""
+        config.PIPELINE_MAX_RETRIES = 2
+        config.PIPELINE_RETRY_BASE_DELAY = 30
+        main._shutdown = False
+        main._recorder = None
+        main._creds_cache.clear()
+        yield
+        config.PIPELINES_DIR = ""
+        config.AGE_KEY_FILE = ""
+        main._creds_cache.clear()
+
+    def _client(self, polled: list[PipelineTrigger] | None) -> MagicMock:
+        client = MagicMock()
+        client.try_get_pipeline_triggers.return_value = polled
+        client.report_pipeline_run.return_value = True
+        return client
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_newer_definition_is_picked_up(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """The fix that lands mid-run reaches the next attempt."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", dataset_name="typo")
+        cfg = _make_config(id="p1", dataset_name="typo")
+        seen: list[str] = []
+
+        def attempt(c: PipelineConfig) -> PipelineRunReport:
+            seen.append(c.dataset_name)
+            if len(seen) == 1:
+                # The sync window lands the corrected definition.
+                _write_pipeline_yaml(
+                    self.checkout, "orders.yaml", "p1", dataset_name="raw"
+                )
+                return _failure_report(c)
+            return _success_report(c)
+
+        mock_run.side_effect = attempt
+
+        main._run_with_retry(cfg, "local-1", self._client([]))
+
+        assert seen == ["typo", "raw"]
+        assert cfg.dataset_name == "raw"
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_credentials_are_repolled(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """A reconnected credential self-heals the run that raced it."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        cfg = _make_config(id="p1", source_credentials={"token": "expired"})
+        client = self._client([_make_trigger(id="p1")])
+        client.try_get_pipeline_triggers.return_value = [
+            _make_trigger(id="p1", source_credentials={"token": "fresh"})
+        ]
+        seen: list[dict[str, Any]] = []
+
+        def attempt(c: PipelineConfig) -> PipelineRunReport:
+            seen.append(dict(c.source_credentials))
+            return _failure_report(c) if len(seen) == 1 else _success_report(c)
+
+        mock_run.side_effect = attempt
+
+        main._run_with_retry(cfg, "local-1", client)
+
+        assert seen == [{"token": "expired"}, {"token": "fresh"}]
+        # The re-poll also warms the outage cache, same as a tick's poll.
+        assert main._creds_cache["p1"] == {"token": "fresh"}
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_unreachable_api_keeps_run_start_credentials(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """A poll that does not answer is not evidence anything changed —
+        blanking the credentials would guarantee the retry fails."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        cfg = _make_config(id="p1", source_credentials={"token": "t"})
+        seen: list[dict[str, Any]] = []
+
+        def attempt(c: PipelineConfig) -> PipelineRunReport:
+            seen.append(dict(c.source_credentials))
+            return _failure_report(c)
+
+        mock_run.side_effect = attempt
+
+        main._run_with_retry(cfg, "local-1", self._client(None))
+
+        assert seen == [{"token": "t"}] * 3
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_pipeline_absent_from_poll_keeps_credentials(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """Deleted centrally mid-run: finish the run that started rather
+        than attempt it with empty credentials."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
+        cfg = _make_config(id="p1", source_credentials={"token": "t"})
+        seen: list[dict[str, Any]] = []
+
+        def attempt(c: PipelineConfig) -> PipelineRunReport:
+            seen.append(dict(c.source_credentials))
+            return _failure_report(c)
+
+        mock_run.side_effect = attempt
+
+        main._run_with_retry(cfg, "local-1", self._client([_make_trigger(id="other")]))
+
+        assert seen == [{"token": "t"}] * 3
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_file_credentials_are_not_overruled_by_the_poll(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """Git truth wins outright on a retry too — the poll isn't asked."""
+        cfg = _make_config(id="p1", source_credentials={"token": "file"})
+        client = self._client(
+            [_make_trigger(id="p1", source_credentials={"token": "poll"})]
+        )
+        mock_run.side_effect = lambda c: _failure_report(c)
+
+        from_file = _make_config(
+            id="p1",
+            source_credentials={"token": "file"},
+            has_file_credentials=True,
+        )
+        with patch("dlt_worker.main._reload_definition", return_value=from_file):
+            main._run_with_retry(cfg, "local-1", client)
+
+        assert cfg.source_credentials == {"token": "file"}
+        client.try_get_pipeline_triggers.assert_not_called()
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_vanished_definition_keeps_the_snapshot(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """No file (deleted, or a broken checkout) degrades to the old
+        behaviour — the run still finishes and is still reported."""
+        cfg = _make_config(id="p1", dataset_name="raw")
+        mock_run.side_effect = lambda c: _failure_report(c)
+        client = self._client([])
+
+        main._run_with_retry(cfg, "local-1", client)
+
+        assert mock_run.call_count == 3
+        assert cfg.dataset_name == "raw"
+        client.report_pipeline_run.assert_called_once()
+        assert client.report_pipeline_run.call_args[0][0].status == "failed"
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_broken_reload_never_fails_the_run(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """An exception in the re-read must not escape into the retry loop
+        — that would abandon the run unreported."""
+        cfg = _make_config(id="p1")
+        mock_run.side_effect = lambda c: _failure_report(c)
+        client = self._client([])
+
+        with patch("dlt_worker.main._reload_definition", side_effect=OSError("boom")):
+            main._run_with_retry(cfg, "local-1", client)
+
+        assert mock_run.call_count == 3
+        client.report_pipeline_run.assert_called_once()
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_run_identity_survives_the_refresh(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """The checkout carries no trigger or watermark, so the re-read
+        must not reset the ones the tick admitted the run with — that
+        would re-arm a Run-now that already fired."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", dataset_name="typo")
+        last_run = datetime(2026, 8, 22, 4, 0, tzinfo=timezone.utc)
+        cfg = _make_config(
+            id="p1",
+            dataset_name="typo",
+            trigger_now=True,
+            pending_run_id="run-9",
+            last_run_at=last_run,
+        )
+
+        def attempt(c: PipelineConfig) -> PipelineRunReport:
+            _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", dataset_name="raw")
+            return _failure_report(c)
+
+        mock_run.side_effect = attempt
+
+        main._run_with_retry(cfg, "local-1", self._client([]))
+
+        assert cfg.dataset_name == "raw"
+        assert cfg.trigger_now is True
+        assert cfg.pending_run_id == "run-9"
+        assert cfg.last_run_at == last_run
+
+    @patch("dlt_worker.main.time.sleep")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_no_re_read_when_the_first_attempt_succeeds(
+        self, mock_run: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        """The common path pays nothing: no reload, no extra poll."""
+        cfg = _make_config(id="p1")
+        mock_run.side_effect = lambda c: _success_report(c)
+        client = self._client([])
+
+        with patch("dlt_worker.main._reload_definition") as mock_reload:
+            main._run_with_retry(cfg, "local-1", client)
+
+        mock_reload.assert_not_called()
+        client.try_get_pipeline_triggers.assert_not_called()
+
+
 # --- files mode (_run_due_pipelines) ---
 
 
