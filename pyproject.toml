@@ -52,10 +52,18 @@ testpaths = ["tests"]
 target-version = "py312"
 
 [tool.ruff.lint]
-# ruff 0.16 expanded the implicit default from 59 rules to 413.
-# This is that old default, spelled out: the rule set is a
-# deliberate choice, not whatever the pinned ruff happens to ship.
-select = ["E4", "E7", "E9", "F"]
+# ruff's default rule set (413 rules as of 0.16), adopted deliberately.
+# It stays honest because ruff itself is pinned in uv.lock: a future
+# expansion of the defaults arrives with a lockfile bump someone chose
+# to make, not on its own.
+ignore = [
+    # Malformed input from the control plane is a bad *value*, not a type
+    # error in our own code. Every site that raises ValueError on a failed
+    # isinstance check does so to land in a local
+    # `except (RequestException, ValueError)` that degrades the response
+    # exactly like an unreachable control plane — which is the whole point.
+    "TRY004",
+]
 
 [tool.ty.environment]
 extra-paths = ["src", "typings"]
