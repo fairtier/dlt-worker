@@ -314,12 +314,15 @@ def test_poll_loop_imports_neither_dlt_nor_dbt() -> None:
         [
             sys.executable,
             "-c",
-            "import sys; import dlt_worker.main; "
-            "print(sorted(m for m in ('dlt', 'dbt') if m in sys.modules))",
+            (
+                "import sys; import dlt_worker.main; "
+                "print(sorted(m for m in ('dlt', 'dbt') if m in sys.modules))"
+            ),
         ],
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "[]", (

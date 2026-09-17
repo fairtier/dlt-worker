@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -12,8 +12,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from dlt_worker import config, main
-from dlt_worker.main import _should_run
-from dlt_worker.scheduler_state import SchedulerState
 from dlt_worker.api_client import (
     PipelineConfig,
     PipelineRunReport,
@@ -21,6 +19,8 @@ from dlt_worker.api_client import (
     TransformationConfig,
     TransformationRunReport,
 )
+from dlt_worker.main import _should_run
+from dlt_worker.scheduler_state import SchedulerState
 
 
 def _make_config(**overrides: Any) -> PipelineConfig:
@@ -44,23 +44,23 @@ def _make_config(**overrides: Any) -> PipelineConfig:
 
 def test_should_run_first_time() -> None:
     cfg = _make_config(enabled=True, schedule="*/5 * * * *", last_run_at=None)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     assert _should_run(cfg, now) is True
 
 
 def test_should_run_before_cron_tick() -> None:
     # Use a fixed time at minute :01 so last_run at :00 has next tick at :05.
-    now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
+    now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=UTC)
     cfg = _make_config(
         enabled=True,
         schedule="*/5 * * * *",
-        last_run_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        last_run_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC),
     )
     assert _should_run(cfg, now) is False
 
 
 def test_should_run_at_cron_tick() -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cfg = _make_config(
         enabled=True,
         schedule="*/5 * * * *",
@@ -71,25 +71,25 @@ def test_should_run_at_cron_tick() -> None:
 
 def test_should_run_disabled() -> None:
     cfg = _make_config(enabled=False, schedule="*/5 * * * *", last_run_at=None)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     assert _should_run(cfg, now) is False
 
 
 def test_should_run_no_schedule() -> None:
     cfg = _make_config(schedule=None, enabled=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     assert _should_run(cfg, now) is False
 
 
 def test_should_run_empty_schedule() -> None:
     cfg = _make_config(schedule="", enabled=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     assert _should_run(cfg, now) is False
 
 
 def test_should_run_trigger_now() -> None:
     cfg = _make_config(trigger_now=True, enabled=True, schedule=None)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     assert _should_run(cfg, now) is True
 
 
@@ -98,16 +98,16 @@ def test_should_run_invalid_cron_returns_false() -> None:
     raising into the tick loop and abandoning every other pipeline."""
     cfg = _make_config(
         schedule="not a cron",
-        last_run_at=datetime(2025, 6, 1, tzinfo=timezone.utc),
+        last_run_at=datetime(2025, 6, 1, tzinfo=UTC),
     )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     assert _should_run(cfg, now) is False
 
 
 def test_should_run_invalid_cron_never_run_before() -> None:
     """Even a never-run config must not fire on an invalid schedule."""
     cfg = _make_config(schedule="* * *", last_run_at=None)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     assert _should_run(cfg, now) is False
 
 
@@ -118,7 +118,7 @@ def test_should_run_backs_off_after_failure() -> None:
     Fixed timestamps — with a wall-clock `now`, a */5 boundary can land
     between `now - 1min` and `now` and flip the first assertion.
     """
-    now = datetime(2025, 6, 1, 12, 2, 30, tzinfo=timezone.utc)
+    now = datetime(2025, 6, 1, 12, 2, 30, tzinfo=UTC)
     cfg = _make_config(schedule="*/5 * * * *", last_run_at=now - timedelta(minutes=30))
     main._last_failure_at.clear()
     try:
@@ -135,7 +135,7 @@ def test_should_run_backs_off_after_failure() -> None:
 
 def test_should_run_trigger_now_bypasses_failure_backoff() -> None:
     """An explicit Run-now must fire even during failure backoff."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cfg = _make_config(trigger_now=True, schedule="*/5 * * * *")
     main._last_failure_at["p1"] = now
     try:
@@ -150,7 +150,7 @@ def test_should_run_trigger_now_disabled() -> None:
     disabled pipeline that has a pending run, so blocking it here left that
     run pending forever."""
     cfg = _make_config(trigger_now=True, enabled=False)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     assert _should_run(cfg, now) is True
 
 
@@ -522,7 +522,7 @@ class TestRefreshBetweenRetries:
         must not reset the ones the tick admitted the run with — that
         would re-arm a Run-now that already fired."""
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", dataset_name="typo")
-        last_run = datetime(2026, 8, 22, 4, 0, tzinfo=timezone.utc)
+        last_run = datetime(2026, 8, 22, 4, 0, tzinfo=UTC)
         cfg = _make_config(
             id="p1",
             dataset_name="typo",
@@ -664,7 +664,7 @@ class TestRunDuePipelinesFiles:
 
         # Second tick: central down, schedule due again after 6 minutes.
         state = SchedulerState.load(str(self.state_dir))
-        state.record("p1", datetime.now(timezone.utc) - timedelta(minutes=6))
+        state.record("p1", datetime.now(UTC) - timedelta(minutes=6))
         down = self._client(None)
         succeeded = main._run_due_pipelines(down)
 
@@ -758,7 +758,7 @@ class TestRunDuePipelinesFiles:
         # made this fail whenever the suite ran in the minute right after a
         # 5-minute boundary (the pipeline really was due then). An hourly
         # schedule anchored ~30 minutes away from "now" cannot come due.
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         schedule = f"{(now.minute + 30) % 60} * * * *"
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=schedule)
         recent = now - timedelta(minutes=1)
@@ -781,7 +781,7 @@ class TestRunDuePipelinesFiles:
         # Anchored-away hourly schedule for the same reason as in
         # test_migration_seeds_api_last_run_at_once: a fixed */5 schedule is
         # genuinely due right after every 5-minute wall-clock boundary.
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         schedule = f"{(now.minute + 30) % 60} * * * *"
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=schedule)
         state = SchedulerState.load(str(self.state_dir))
@@ -913,8 +913,8 @@ class TestRunDuePipelinesFiles:
     ) -> None:
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1")
         state = SchedulerState.load(str(self.state_dir))
-        state.record("p1", datetime.now(timezone.utc))
-        state.record("gone", datetime.now(timezone.utc))
+        state.record("p1", datetime.now(UTC))
+        state.record("gone", datetime.now(UTC))
         client = self._client([])
 
         main._run_due_pipelines(client)
@@ -931,7 +931,7 @@ class TestRunDuePipelinesFiles:
         """A transiently broken file must not lose its last_run_at."""
         (self.checkout / "pipelines" / "broken.yaml").write_text("id: [unclosed\n")
         state = SchedulerState.load(str(self.state_dir))
-        kept = datetime.now(timezone.utc)
+        kept = datetime.now(UTC)
         state.record("p-broken", kept)
         client = self._client([])
 
@@ -986,7 +986,7 @@ class TestRunDuePipelinesFiles:
         assert mock_run.call_count == calls_after_first_tick
 
         # A cron slot later the pipeline is due again.
-        main._last_failure_at["p1"] = datetime.now(timezone.utc) - timedelta(hours=25)
+        main._last_failure_at["p1"] = datetime.now(UTC) - timedelta(hours=25)
         main._run_due_pipelines(client)
         assert mock_run.call_count > calls_after_first_tick
 
@@ -1151,7 +1151,7 @@ class TestRunDueTransformations:
         assert mock_run.call_count == 2
 
     def test_should_run_works_for_transformations(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cfg = _make_tconfig(
             schedule="*/5 * * * *", last_run_at=now - timedelta(minutes=6)
         )
@@ -1182,7 +1182,7 @@ class TestLocalFirstRecording:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         main._execute_pipeline(cfg, now, client)
 
         rec = self.recorder
@@ -1204,7 +1204,7 @@ class TestLocalFirstRecording:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._execute_pipeline(cfg, datetime.now(timezone.utc), client)
+        main._execute_pipeline(cfg, datetime.now(UTC), client)
 
         assert self.recorder.record_pipeline_run_start.call_args[0][0] == "run-42"
 
@@ -1215,7 +1215,7 @@ class TestLocalFirstRecording:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        main._execute_pipeline(cfg, datetime.now(timezone.utc), client)
+        main._execute_pipeline(cfg, datetime.now(UTC), client)
 
         run_id = self.recorder.record_pipeline_run_start.call_args[0][0]
         uuid.UUID(run_id)  # raises if not a valid worker-generated UUID

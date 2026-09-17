@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
 import dlt
 import pytest
 
 from dlt_worker import config
+from dlt_worker.api_client import PipelineConfig
 from dlt_worker.pipeline_runner import (
     _build_filesystem_source,
     _build_google_sheets_source,
@@ -25,7 +26,6 @@ from dlt_worker.pipeline_runner import (
     _spreadsheet_id,
     run_pipeline,
 )
-from dlt_worker.api_client import PipelineConfig
 
 
 def _make_config(**overrides: Any) -> PipelineConfig:
@@ -457,7 +457,7 @@ class TestGoogleSheetsHelpers:
 class TestBuildGoogleSheetsSource:
     """Tests for _build_google_sheets_source (Sheets API mocked)."""
 
-    KEY = {
+    KEY: ClassVar[dict[str, str]] = {
         "type": "service_account",
         "client_email": "pipe@proj.iam.gserviceaccount.com",
         "private_key": "-----BEGIN PRIVATE KEY-----\nMII\n-----END PRIVATE KEY-----\n",

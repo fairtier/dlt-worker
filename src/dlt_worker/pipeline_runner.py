@@ -6,11 +6,10 @@ import json
 import logging
 import re
 import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import dlt
-
 from dlt.common.schema.typing import TMergeDispositionDict, TWriteDispositionConfig
 
 from dlt_worker import config, pgurl, scrub, telemetry
@@ -46,7 +45,7 @@ def _count_rows(normalize_info: Any) -> int:
 
 def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
     """Build and run a dlt pipeline from the given config. Returns a run report."""
-    started_at = datetime.now(timezone.utc)
+    started_at = datetime.now(UTC)
     rows_loaded = 0
 
     # The inner spans below are created with exception recording OFF on
@@ -123,11 +122,14 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
                 pipeline_id=cfg.id,
                 status="success",
                 started_at=started_at.isoformat(),
-                completed_at=datetime.now(timezone.utc).isoformat(),
+                completed_at=datetime.now(UTC).isoformat(),
                 rows_loaded=rows_loaded,
             )
 
-        except Exception as exc:
+        # Deliberately blind (BLE001): this is the child's outer boundary, and
+        # anything a source, a destination or dlt itself raises has to come
+        # back as a failed run report rather than a dead process.
+        except Exception as exc:  # noqa: BLE001
             # Scrub the log too — the traceback quotes the same exception text.
             logger.error(
                 "Pipeline %s failed:\n%s",
@@ -142,7 +144,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
                 pipeline_id=cfg.id,
                 status="failed",
                 started_at=started_at.isoformat(),
-                completed_at=datetime.now(timezone.utc).isoformat(),
+                completed_at=datetime.now(UTC).isoformat(),
                 error_message=error_message,
             )
 
@@ -607,8 +609,7 @@ def _http_batches(pipeline_name: str, fs: Any, urls: list[str]) -> Any:
                 read_options=pacsv.ReadOptions(block_size=1 << 20),
                 parse_options=options,
             )
-            for batch in reader:
-                yield batch
+            yield from reader
         else:
             raise ValueError(
                 f"Pipeline {pipeline_name!r}: unsupported file type over http(s): "

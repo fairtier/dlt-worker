@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
 from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pyarrow.dataset
 import pytest
-
 from dlt.common.destination.exceptions import (
     DestinationTerminalException,
     DestinationUndefinedEntity,
@@ -69,13 +68,13 @@ class _FakeTxn:
 
 
 class _FakeUpdateSchema:
-    def __init__(self, table: "_FakeTable") -> None:
+    def __init__(self, table: _FakeTable) -> None:
         self._table = table
 
-    def __enter__(self) -> "_FakeUpdateSchema":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         pass
 
     def make_column_optional(self, name: str) -> None:

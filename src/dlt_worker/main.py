@@ -11,13 +11,21 @@ import logging
 import signal
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import fields
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from croniter import croniter
 
 from dlt_worker import config, iceberg_stream, telemetry, workspace_db
+from dlt_worker.api_client import (
+    APIClient,
+    PipelineConfig,
+    PipelineRunReport,
+    PipelineTrigger,
+    TransformationConfig,
+)
 from dlt_worker.health import start_health_server
 from dlt_worker.pipeline_files import load_pipeline_configs
 from dlt_worker.run_isolation import (
@@ -27,13 +35,6 @@ from dlt_worker.run_isolation import (
 )
 from dlt_worker.scheduler_state import SchedulerState
 from dlt_worker.snapshot import trigger_snapshot
-from dlt_worker.api_client import (
-    PipelineConfig,
-    PipelineRunReport,
-    PipelineTrigger,
-    TransformationConfig,
-    APIClient,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -428,7 +429,7 @@ def _run_due_pipelines(client: APIClient) -> set[str]:
                 if stale_id not in file_ids and stale_id not in by_id:
                     del _creds_cache[stale_id]
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     for cfg in files.configs:
         if _shutdown:
@@ -562,7 +563,7 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
     if not configs:
         return
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     ran: set[str] = set()
 
     for cfg in configs:
@@ -602,7 +603,7 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
             ) as span:
                 if _recorder:
                     _recorder.record_transformation_run_start(
-                        local_run_id, cfg.id, datetime.now(timezone.utc)
+                        local_run_id, cfg.id, datetime.now(UTC)
                     )
 
                 report = run_transformation_isolated(cfg)

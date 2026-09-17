@@ -56,7 +56,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from dlt_worker import telemetry
 from dlt_worker.memory import release_memory
@@ -394,12 +395,12 @@ def _streamed_run(
     # ~4MB retained per 200k-row chunk of taxi data; killed the 41M-row
     # Minimal-tier run at chunk 100 with 487MB of pool). With it off the pool
     # stays flat at ~one batch. Non-parquet datasets ignore the option.
-    scanner_kwargs: dict[str, Any] = dict(
-        batch_size=chunk_rows,
-        batch_readahead=0,
-        fragment_readahead=0,
-        use_threads=False,
-    )
+    scanner_kwargs: dict[str, Any] = {
+        "batch_size": chunk_rows,
+        "batch_readahead": 0,
+        "fragment_readahead": 0,
+        "use_threads": False,
+    }
     try:
         import pyarrow.dataset as pads
 

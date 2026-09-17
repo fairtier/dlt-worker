@@ -32,7 +32,6 @@ from dataclasses import dataclass
 
 import pyrage
 import yaml
-
 from croniter import croniter
 
 from dlt_worker.api_client import PipelineConfig
@@ -82,7 +81,7 @@ def load_pipeline_configs(
     try:
         paths = sorted(glob.glob(pattern))
     except OSError:
-        logger.error("Failed to list pipeline files at %s", pattern, exc_info=True)
+        logger.exception("Failed to list pipeline files at %s", pattern)
         return PipelineFilesResult(configs=[], had_errors=True)
 
     if not checkout_present(pipelines_dir):

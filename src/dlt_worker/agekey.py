@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pyrage import x25519
 
@@ -32,7 +32,7 @@ def generate(outdir: str) -> int:
 
     identity = x25519.Identity.generate()
     recipient = str(identity.to_public())
-    created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    created = datetime.now(UTC).isoformat(timespec="seconds")
 
     # Standard age identity-file layout (age-keygen compatible).
     key_body = f"# created: {created}\n# public key: {recipient}\n{identity}\n"

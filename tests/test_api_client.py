@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import requests
 
-from dlt_worker.api_client import PipelineRunReport, APIClient
+from dlt_worker.api_client import APIClient, PipelineRunReport
 
 
 def _make_client() -> APIClient:

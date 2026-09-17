@@ -56,7 +56,8 @@ import os
 import re
 import shutil
 import tempfile
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import dlt
 
@@ -282,10 +283,15 @@ def _table_resource(
                 f"{cursor_column!r} for table {name!r}"
             )
 
+        initial_value = table.get("initial_value")
+
+        # The call in the default is dlt's API, not an oversight (B008): dlt
+        # reads the cursor off the signature to wire up incremental state, so
+        # it cannot move into the body.
         def read(
-            incremental: Any = dlt.sources.incremental(
+            incremental: Any = dlt.sources.incremental(  # noqa: B008
                 cursor_path=str(cursor_column),
-                initial_value=table.get("initial_value"),
+                initial_value=initial_value,
             ),
         ) -> Iterator[Any]:
             # Push the cursor down into the query so the source only sends

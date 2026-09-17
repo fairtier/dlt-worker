@@ -45,9 +45,7 @@ class SchedulerState:
             with open(path, encoding="utf-8") as f:
                 raw = json.load(f)
             for pipeline_id, stamp in raw.items():
-                entries[pipeline_id] = datetime.fromisoformat(
-                    str(stamp).replace("Z", "+00:00")
-                )
+                entries[pipeline_id] = datetime.fromisoformat(str(stamp))
         except FileNotFoundError:
             pass
         except (OSError, ValueError, AttributeError):
@@ -94,9 +92,8 @@ class SchedulerState:
                 f.write("\n")
             os.replace(tmp_path, path)
         except OSError:
-            logger.error(
+            logger.exception(
                 "Failed to persist %s — scheduling state is in-memory only "
                 "until the next successful save",
                 path,
-                exc_info=True,
             )

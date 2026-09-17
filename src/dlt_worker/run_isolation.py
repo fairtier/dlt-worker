@@ -42,8 +42,9 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import signal
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Mapping, TypeVar
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 from dlt_worker import config, iceberg_stream, telemetry
 from dlt_worker.api_client import (
@@ -59,10 +60,6 @@ if TYPE_CHECKING:
     from multiprocessing.connection import Connection
 
 logger = logging.getLogger(__name__)
-
-_Report = TypeVar(
-    "_Report", PipelineRunReport, TransformationRunReport, SourceTestReport
-)
 
 
 def _child_setup(trace_context: Mapping[str, str]) -> None:
@@ -141,15 +138,15 @@ def _source_test_child_main(
         telemetry.flush()
 
 
-def _supervise(
+def _supervise[Report: (PipelineRunReport, TransformationRunReport, SourceTestReport)](
     target: Callable[..., None],
     cfg: Any,
     *,
     kind: str,
     label: str,
     timeout: int,
-    failed: Callable[[datetime, str], _Report],
-) -> _Report:
+    failed: Callable[[datetime, str], Report],
+) -> Report:
     """Run one child to completion and return its report.
 
     ``kind`` names the workload in messages ("pipeline"/"transformation"),
@@ -157,7 +154,7 @@ def _supervise(
     the two ways a child can fail to produce one itself: the deadline
     expiring, and dying without sending.
     """
-    started_at = datetime.now(timezone.utc)
+    started_at = datetime.now(UTC)
 
     # spawn, not fork: forking a process that holds the health-server thread
     # and live HTTP sessions is unsafe, and a forked child would start with
@@ -174,7 +171,7 @@ def _supervise(
     # of blocking forever) when the child dies without sending.
     send_conn.close()
 
-    report: _Report | None = None
+    report: Report | None = None
     timed_out = False
     try:
         # A wall-clock deadline on the run: neither dlt sources nor a dbt
@@ -255,7 +252,7 @@ def run_pipeline_isolated(cfg: PipelineConfig) -> PipelineRunReport:
             pipeline_id=cfg.id,
             status="failed",
             started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
             error_message=message,
         )
 
@@ -313,7 +310,7 @@ def run_transformation_isolated(
             transformation_id=cfg.id,
             status="failed",
             started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
             error_message=message,
             run_id=cfg.pending_run_id,
         )

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Self
 from unittest.mock import MagicMock, patch
 
 from dlt_worker import config, workspace_db
@@ -18,7 +18,7 @@ class FakeConnection:
         self.executed: list[tuple[str, tuple[Any, ...]]] = []
         self.rowcount = rowcount
 
-    def __enter__(self) -> FakeConnection:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> bool:
@@ -82,7 +82,7 @@ def test_timestamp_empty_is_none() -> None:
 
 def test_timestamp_parses_zulu_suffix() -> None:
     parsed = _timestamp("2026-01-01T00:00:00Z")
-    assert parsed == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert parsed == datetime(2026, 1, 1, tzinfo=UTC)
 
 
 # --- write protocol ---
@@ -98,7 +98,7 @@ class TestWrites:
         return self.conn.executed[0]
 
     def test_pipeline_run_start_inserts_running_row(self) -> None:
-        started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        started = datetime(2026, 1, 1, tzinfo=UTC)
         with patch("dlt_worker.workspace_db.psycopg.connect", return_value=self.conn):
             self.recorder.record_pipeline_run_start("run-1", "p1", started)
 
@@ -120,7 +120,7 @@ class TestWrites:
         assert params[0] == "run-1"
         assert params[1] == "p1"
         assert params[2] == "failed"
-        assert params[3] == datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert params[3] == datetime(2026, 1, 1, tzinfo=UTC)
         assert params[5] == 42
         assert params[6] == "boom"
 
@@ -142,9 +142,7 @@ class TestWrites:
             "dlt_worker.workspace_db.psycopg.connect",
             side_effect=RuntimeError("connection refused"),
         ):
-            self.recorder.record_pipeline_run_start(
-                "run-1", "p1", datetime.now(timezone.utc)
-            )
+            self.recorder.record_pipeline_run_start("run-1", "p1", datetime.now(UTC))
             self.recorder.record_pipeline_run_end("run-1", _pipeline_report())
             self.recorder.finalize_stale_runs()
 

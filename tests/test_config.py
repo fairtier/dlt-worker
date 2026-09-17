@@ -5,7 +5,8 @@ from __future__ import annotations
 import glob
 import os
 import tempfile
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq

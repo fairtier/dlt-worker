@@ -17,8 +17,8 @@ from dlt_worker import config
 from dlt_worker.api_client import TransformationConfig
 from dlt_worker.transformation_runner import (
     _clone_repo,
-    _git_auth_env,
     _count_nodes,
+    _git_auth_env,
     _read_profile_name,
     _resolve_repo,
     _sanitize,

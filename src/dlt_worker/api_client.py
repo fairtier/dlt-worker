@@ -19,7 +19,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -285,12 +285,12 @@ class APIClient:
     def _mark_healthy(self) -> None:
         self._healthy = True
         self._last_error = ""
-        self._last_check_at = datetime.now(timezone.utc).isoformat()
+        self._last_check_at = datetime.now(UTC).isoformat()
 
     def _mark_unhealthy(self, err: Exception) -> None:
         self._healthy = False
         self._last_error = str(err)
-        self._last_check_at = datetime.now(timezone.utc).isoformat()
+        self._last_check_at = datetime.now(UTC).isoformat()
 
     def try_get_pipeline_triggers(self) -> list[PipelineTrigger] | None:
         """Fetch the poll's per-pipeline triggers, or None when the FairTier
@@ -510,7 +510,7 @@ def _parse_last_run_at(record: dict[str, Any]) -> datetime | None:
     last_run_at_str = record.get("lastRunAt", "")
     if not last_run_at_str:
         return None
-    return datetime.fromisoformat(last_run_at_str.replace("Z", "+00:00"))
+    return datetime.fromisoformat(last_run_at_str)
 
 
 def _parse_trigger_record(p: dict[str, Any]) -> PipelineTrigger:

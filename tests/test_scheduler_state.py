@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dlt_worker.scheduler_state import SchedulerState
 
-_T1 = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
-_T2 = datetime(2026, 7, 2, 12, 0, 0, tzinfo=timezone.utc)
+_T1 = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+_T2 = datetime(2026, 7, 2, 12, 0, 0, tzinfo=UTC)
 
 
 def test_record_and_load_roundtrip(tmp_path: Path) -> None:

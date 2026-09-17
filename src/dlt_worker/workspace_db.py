@@ -47,7 +47,7 @@ def _timestamp(value: str) -> datetime | None:
     """Parse a report's ISO timestamp; empty string means NULL."""
     if not value:
         return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return datetime.fromisoformat(value)
 
 
 class WorkspaceRecorder:

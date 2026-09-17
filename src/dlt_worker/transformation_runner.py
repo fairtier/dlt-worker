@@ -17,7 +17,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -59,7 +59,7 @@ def _step_span(name: str) -> Any:
 
 def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
     """Clone and run a dbt project from the given config. Returns a run report."""
-    started_at = datetime.now(timezone.utc)
+    started_at = datetime.now(UTC)
     token = ""
     commit_sha = ""
     tmpdir = tempfile.mkdtemp(prefix="dbt-run-")
@@ -129,7 +129,7 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
             transformation_id=cfg.id,
             status="success" if success else "failed",
             started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
             commit_sha=commit_sha,
             models_total=models_total,
             models_failed=models_failed,
@@ -149,7 +149,7 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
             transformation_id=cfg.id,
             status="failed",
             started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
             commit_sha=commit_sha,
             error_message=_sanitize(str(exc), token),
             run_id=cfg.pending_run_id,
@@ -226,6 +226,7 @@ def _clone_repo(url: str, ref: str, username: str, token: str, dest: str) -> str
             text=True,
             timeout=_GIT_TIMEOUT,
             env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"git clone timed out after {_GIT_TIMEOUT}s") from None
@@ -239,6 +240,7 @@ def _clone_repo(url: str, ref: str, username: str, token: str, dest: str) -> str
         capture_output=True,
         text=True,
         timeout=_GIT_TIMEOUT,
+        check=False,
     )
     if result.returncode != 0:
         raise RuntimeError(

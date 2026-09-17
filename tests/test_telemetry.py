@@ -10,8 +10,9 @@ from __future__ import annotations
 import subprocess
 import sys
 import textwrap
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -178,7 +179,11 @@ def test_setup_installs_sdk_providers_when_enabled() -> None:
         """
     )
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
@@ -234,15 +239,15 @@ def test_pipeline_run_span_carries_run_attributes(
     report = PipelineRunReport(
         pipeline_id=cfg.id,
         status="success",
-        started_at=datetime.now(timezone.utc).isoformat(),
-        completed_at=datetime.now(timezone.utc).isoformat(),
+        started_at=datetime.now(UTC).isoformat(),
+        completed_at=datetime.now(UTC).isoformat(),
         rows_loaded=42,
     )
     client = MagicMock()
     client.report_pipeline_run.return_value = True
 
     with patch("dlt_worker.main.run_pipeline_isolated", return_value=report):
-        main._execute_pipeline(cfg, datetime.now(timezone.utc), client)
+        main._execute_pipeline(cfg, datetime.now(UTC), client)
 
     span = _named(spans, "dlt_worker.pipeline.run")
     assert span.attributes is not None
@@ -273,14 +278,14 @@ def test_failed_run_span_carries_only_the_scrubbed_message(
     report = PipelineRunReport(
         pipeline_id=cfg.id,
         status="failed",
-        started_at=datetime.now(timezone.utc).isoformat(),
-        completed_at=datetime.now(timezone.utc).isoformat(),
+        started_at=datetime.now(UTC).isoformat(),
+        completed_at=datetime.now(UTC).isoformat(),
         error_message="could not connect to postgresql://u:***@host/db",
     )
     client = MagicMock()
 
     with patch("dlt_worker.main.run_pipeline_isolated", return_value=report):
-        main._execute_pipeline(cfg, datetime.now(timezone.utc), client)
+        main._execute_pipeline(cfg, datetime.now(UTC), client)
 
     span = _named(spans, "dlt_worker.pipeline.run")
     assert span.status.status_code is StatusCode.ERROR
@@ -303,14 +308,14 @@ def test_retry_is_an_event_on_the_run_span(
     failed = PipelineRunReport(
         pipeline_id=cfg.id,
         status="failed",
-        started_at=datetime.now(timezone.utc).isoformat(),
-        completed_at=datetime.now(timezone.utc).isoformat(),
+        started_at=datetime.now(UTC).isoformat(),
+        completed_at=datetime.now(UTC).isoformat(),
         error_message="boom",
     )
     client = MagicMock()
 
     with patch("dlt_worker.main.run_pipeline_isolated", return_value=failed):
-        main._execute_pipeline(cfg, datetime.now(timezone.utc), client)
+        main._execute_pipeline(cfg, datetime.now(UTC), client)
 
     span = _named(spans, "dlt_worker.pipeline.run")
     assert [e.name for e in span.events] == ["pipeline.retry"]
