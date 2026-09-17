@@ -90,7 +90,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
             if cfg.write_disposition == "merge" and cfg.merge_strategy:
                 write_disp = TMergeDispositionDict(
                     disposition="merge",
-                    strategy=cfg.merge_strategy,  # type: ignore[arg-type]
+                    strategy=cfg.merge_strategy,  # ty: ignore[invalid-argument-type]
                 )
 
             # dlt's own extract/normalize/load stages live under this span;
