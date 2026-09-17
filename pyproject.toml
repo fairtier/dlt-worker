@@ -51,6 +51,12 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py312"
 
+[tool.ruff.lint]
+# ruff 0.16 expanded the implicit default from 59 rules to 413.
+# This is that old default, spelled out: the rule set is a
+# deliberate choice, not whatever the pinned ruff happens to ship.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.ty.environment]
 extra-paths = ["src", "typings"]
 
