@@ -1,7 +1,7 @@
 ############################
 # STEP 1: Build with uv
 ############################
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.15 /uv /usr/local/bin/uv
 
@@ -37,7 +37,7 @@ con = duckdb.connect(config={'extension_directory': '/opt/duckdb-extensions'}); 
 ############################
 # STEP 2: Runtime image
 ############################
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # git is needed at run time to shallow-clone dbt transformation repos
 # (the builder stage doesn't need it — no git dependencies in uv.lock)
