@@ -1,0 +1,85 @@
+{
+  "metadata": {
+    "dbt_version": "2.0.5"
+  },
+  "results": [
+    {
+      "status": "success",
+      "unique_id": "model.analytics.stg_trips",
+      "execution_time": 75.633568082,
+      "message": "Succeeded"
+    },
+    {
+      "status": "success",
+      "unique_id": "model.analytics.stg_zones",
+      "execution_time": 0.314526052,
+      "message": "Succeeded"
+    },
+    {
+      "status": "success",
+      "unique_id": "model.analytics.fct_trips",
+      "execution_time": 87.135234507,
+      "message": "Succeeded"
+    },
+    {
+      "status": "success",
+      "unique_id": "model.analytics.agg_daily_zone",
+      "execution_time": 11.91734359,
+      "message": "Succeeded"
+    },
+    {
+      "status": "success",
+      "unique_id": "model.analytics.agg_hourly_patterns",
+      "execution_time": 13.171005694,
+      "message": "Succeeded"
+    },
+    {
+      "status": "success",
+      "unique_id": "model.analytics.stg_example",
+      "execution_time": 0.133624,
+      "message": "Succeeded"
+    },
+    {
+      "status": "success",
+      "unique_id": "model.analytics.example",
+      "execution_time": 0.131594305,
+      "message": "Succeeded"
+    },
+    {
+      "status": "success",
+      "unique_id": "model.analytics.zone_flows",
+      "execution_time": 20.930719028,
+      "message": "Succeeded"
+    },
+    {
+      "status": "pass",
+      "unique_id": "test.analytics.not_null_agg_daily_zone_pickup_date.741a6dc22f",
+      "execution_time": 0.03084821,
+      "message": "Pass"
+    },
+    {
+      "status": "pass",
+      "unique_id": "test.analytics.not_null_example_id.96691fbe5c",
+      "execution_time": 0.022099273,
+      "message": "Pass"
+    },
+    {
+      "status": "pass",
+      "unique_id": "test.analytics.not_null_fct_trips_pickup_at.444dea6a87",
+      "execution_time": 0.075123692,
+      "message": "Pass"
+    },
+    {
+      "status": "pass",
+      "unique_id": "test.analytics.not_null_fct_trips_total_amount.0e8ec5477d",
+      "execution_time": 0.094129302,
+      "message": "Pass"
+    },
+    {
+      "status": "pass",
+      "unique_id": "test.analytics.unique_example_id.50f543cf6e",
+      "execution_time": 0.0312949,
+      "message": "Pass"
+    }
+  ]
+}

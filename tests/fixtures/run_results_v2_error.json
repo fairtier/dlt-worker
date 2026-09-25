@@ -1,0 +1,19 @@
+{
+  "metadata": {
+    "dbt_version": "2.0.5"
+  },
+  "results": [
+    {
+      "status": "success",
+      "unique_id": "model.probe.settings_probe",
+      "execution_time": 0.196437919,
+      "message": "Succeeded"
+    },
+    {
+      "status": "error",
+      "unique_id": "model.probe.broken_probe",
+      "execution_time": 1.046124741,
+      "message": "Database Error in model broken_probe (target/run/probe/models/broken_probe.sql)\n  Binder Error: Referenced column \"no_such_column\" not found in FROM clause!\n  Candidate bindings: \"memory_limit\", \"duckdb_version\"\n  \n  LINE 3:         select no_such_column from \"lake\".\"probe\".\"settings_probe\"\n                         ^\n  (in run/probe/models/broken_probe.sql)"
+    }
+  ]
+}
