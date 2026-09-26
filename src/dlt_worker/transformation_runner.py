@@ -26,6 +26,7 @@ from dbt.cli.main import dbtRunner
 
 from dlt_worker import config, telemetry
 from dlt_worker.api_client import TransformationConfig, TransformationRunReport
+from dlt_worker.dbt_project import SECRET_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -261,15 +262,19 @@ def _read_profile_name(project_dir: str) -> str:
 
 
 def _duckdb_settings(tmpdir: str) -> dict[str, Any]:
-    """DuckDB SET statements applied when dbt opens its connection.
+    """DuckDB SET statements applied when dbt opens its database.
 
-    Each is skippable by configuring it empty, which restores DuckDB's own
-    default — the pre-0.7.0 behavior, and the rollback if a bound turns out
-    to be too tight for a real project.
+    Only settings that are global in DuckDB belong here: dbt runs these on
+    a connection it then closes, so a session-scoped setting would be lost
+    before the first model (see dbt_project.py for the one that is). Each
+    bound is skippable by configuring it empty, which restores DuckDB's own
+    default — the rollback if a bound turns out too tight.
     """
     settings: dict[str, Any] = {}
     if config.DBT_DUCKDB_MEMORY_LIMIT:
         settings["memory_limit"] = config.DBT_DUCKDB_MEMORY_LIMIT
+    if config.DBT_DUCKDB_THREADS:
+        settings["threads"] = int(config.DBT_DUCKDB_THREADS)
     # Spill inside the run's temp dir by default: it is removed with the
     # run, so a killed build can't leave its spill behind on the box.
     settings["temp_directory"] = config.DBT_DUCKDB_TEMP_DIR or os.path.join(
@@ -277,6 +282,11 @@ def _duckdb_settings(tmpdir: str) -> dict[str, Any]:
     )
     if config.DBT_DUCKDB_MAX_TEMP_SIZE:
         settings["max_temp_directory_size"] = config.DBT_DUCKDB_MAX_TEMP_SIZE
+    # The remote-file cache keeps what a build read resident after the read
+    # (110-120 MiB measured on a 192MB limit): memory the writer then lacks.
+    settings["enable_external_file_cache"] = False
+    # The extensions are baked; a missing one must fail, not be downloaded.
+    settings["autoinstall_known_extensions"] = False
     return settings
 
 
@@ -284,9 +294,10 @@ def _write_profiles(project_dir: str, tmpdir: str) -> str:
     """Generate profiles.yml in the temp dir and return its directory.
 
     Always generated at run time — never taken from the repo — so catalog
-    credentials stay out of git. The profile targets the box's DuckDB with
-    the Lakekeeper Iceberg catalog attached; data-file access uses
-    credentials vended by the catalog, so no S3 secret is written.
+    credentials stay out of git. The profile targets the box's DuckDB and
+    carries the catalog's OAuth2 client; the catalog itself is attached
+    from catalogs.yml (dbt_project.py). Data-file access uses credentials
+    vended by the catalog, so no S3 secret is written.
 
     The profile is also where DuckDB is told how much memory it may use.
     Left alone it sizes its buffer manager from *host* RAM, which on a
@@ -308,21 +319,10 @@ def _write_profiles(project_dir: str, tmpdir: str) -> str:
                     "secrets": [
                         {
                             "type": "iceberg",
-                            "name": "lakekeeper",
+                            "name": SECRET_NAME,
                             "client_id": config.OIDC_CLIENT_ID,
                             "client_secret": config.OIDC_CLIENT_SECRET,
                             "oauth2_server_uri": config.OIDC_TOKEN_URL,
-                        },
-                    ],
-                    "attach": [
-                        {
-                            "path": config.LAKEKEEPER_WAREHOUSE,
-                            "alias": "lake",
-                            "options": {
-                                "type": "iceberg",
-                                "secret": "lakekeeper",
-                                "endpoint": f"{config.LAKEKEEPER_URL}/catalog",
-                            },
                         },
                     ],
                 },
@@ -335,6 +335,50 @@ def _write_profiles(project_dir: str, tmpdir: str) -> str:
     with open(os.path.join(profiles_dir, "profiles.yml"), "w") as f:
         yaml.safe_dump(profiles, f, sort_keys=False)
     return profiles_dir
+
+
+# The only variables the dbt subprocess inherits. A customer model can read
+# any environment variable through env_var(), and the worker's own holds
+# the box's catalog, database and git credentials.
+_DBT_ENV_PASSTHROUGH = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+
+
+def _dbt_env(home: str) -> dict[str, str]:
+    """The environment of the dbt subprocess: an allowlist, never a copy."""
+    env = {k: os.environ[k] for k in _DBT_ENV_PASSTHROUGH if k in os.environ}
+    env["HOME"] = home
+    # dbt-oss v2 sends usage data by default and does not honour DO_NOT_TRACK.
+    env["DBT_ENGINE_SEND_ANONYMOUS_USAGE_STATS"] = "false"
+    env["DO_NOT_TRACK"] = "1"
+    return env
+
+
+def _dbt_home(tmpdir: str) -> str:
+    """A writable per-run HOME whose .duckdb links to the baked extensions.
+
+    DuckDB loads extensions from $HOME/.duckdb/extensions before any profile
+    setting applies, so the directory has to be there by HOME; the link
+    keeps the baked set read-only while dbt writes what it needs to HOME.
+    """
+    home = os.path.join(tmpdir, "home")
+    os.makedirs(home, exist_ok=True)
+    baked = os.path.join(config.DBT_DUCKDB_HOME, ".duckdb")
+    if os.path.isdir(baked):
+        os.symlink(baked, os.path.join(home, ".duckdb"))
+    return home
 
 
 def _run_deps(

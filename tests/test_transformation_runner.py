@@ -18,6 +18,8 @@ from dlt_worker.api_client import TransformationConfig
 from dlt_worker.transformation_runner import (
     _clone_repo,
     _count_nodes,
+    _dbt_env,
+    _dbt_home,
     _git_auth_env,
     _read_profile_name,
     _resolve_repo,
@@ -145,8 +147,6 @@ def test_write_profiles_shape(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(config, "OIDC_CLIENT_ID", "cid")
     monkeypatch.setattr(config, "OIDC_CLIENT_SECRET", "secret")
     monkeypatch.setattr(config, "OIDC_TOKEN_URL", "https://auth/token")
-    monkeypatch.setattr(config, "LAKEKEEPER_URL", "http://lakekeeper:8181")
-    monkeypatch.setattr(config, "LAKEKEEPER_WAREHOUSE", "default")
 
     project_dir = tmp_path / "repo"
     project_dir.mkdir()
@@ -159,28 +159,23 @@ def test_write_profiles_shape(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) ->
     output = profiles["fairtier"]["outputs"]["box"]
     assert output["type"] == "duckdb"
     assert output["extensions"] == ["iceberg", "httpfs"]
+    # The catalog is attached from catalogs.yml (dbt_project.py), not here.
+    assert "attach" not in output
 
     (secret,) = output["secrets"]
     assert secret["type"] == "iceberg"
+    assert secret["name"] == "lakekeeper"
     assert secret["client_id"] == "cid"
     assert secret["oauth2_server_uri"] == "https://auth/token"
 
-    (attach,) = output["attach"]
-    assert attach["path"] == "default"
-    assert attach["alias"] == "lake"
-    assert attach["options"] == {
-        "type": "iceberg",
-        "secret": "lakekeeper",
-        "endpoint": "http://lakekeeper:8181/catalog",
-    }
 
-
-def test_write_profiles_bounds_duckdb_memory(
+def test_write_profiles_bounds_duckdb(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DuckDB must be told a ceiling: unbounded it sizes its buffer manager
-    from host RAM, which on a single-node box is everyone else's RAM too."""
-    monkeypatch.setattr(config, "DBT_DUCKDB_MEMORY_LIMIT", "512MB")
+    """DuckDB must be told a ceiling and a thread count: unbounded it sizes
+    its buffer manager from host RAM and its threads from host cores."""
+    monkeypatch.setattr(config, "DBT_DUCKDB_MEMORY_LIMIT", "192MB")
+    monkeypatch.setattr(config, "DBT_DUCKDB_THREADS", "2")
     monkeypatch.setattr(config, "DBT_DUCKDB_TEMP_DIR", "")
     monkeypatch.setattr(config, "DBT_DUCKDB_MAX_TEMP_SIZE", "4GB")
 
@@ -192,11 +187,14 @@ def test_write_profiles_bounds_duckdb_memory(
         profiles = yaml.safe_load(f)
 
     settings = profiles["fairtier"]["outputs"]["box"]["settings"]
-    assert settings["memory_limit"] == "512MB"
-    assert settings["max_temp_directory_size"] == "4GB"
-    # Spilling inside the run's temp dir means a killed build leaves no
-    # spill behind on the box.
-    assert settings["temp_directory"] == os.path.join(str(tmp_path), "duckdb-temp")
+    assert settings == {
+        "memory_limit": "192MB",
+        "threads": 2,
+        "temp_directory": os.path.join(str(tmp_path), "duckdb-temp"),
+        "max_temp_directory_size": "4GB",
+        "enable_external_file_cache": False,
+        "autoinstall_known_extensions": False,
+    }
 
 
 def test_write_profiles_empty_bounds_leave_duckdb_defaults(
@@ -204,6 +202,7 @@ def test_write_profiles_empty_bounds_leave_duckdb_defaults(
 ) -> None:
     """Each bound is skippable — the rollback if one is too tight."""
     monkeypatch.setattr(config, "DBT_DUCKDB_MEMORY_LIMIT", "")
+    monkeypatch.setattr(config, "DBT_DUCKDB_THREADS", "")
     monkeypatch.setattr(config, "DBT_DUCKDB_TEMP_DIR", "/spill")
     monkeypatch.setattr(config, "DBT_DUCKDB_MAX_TEMP_SIZE", "")
 
@@ -215,7 +214,58 @@ def test_write_profiles_empty_bounds_leave_duckdb_defaults(
         profiles = yaml.safe_load(f)
 
     settings = profiles["fairtier"]["outputs"]["box"]["settings"]
-    assert settings == {"temp_directory": "/spill"}
+    assert settings == {
+        "temp_directory": "/spill",
+        "enable_external_file_cache": False,
+        "autoinstall_known_extensions": False,
+    }
+
+
+def test_dbt_env_passes_only_what_dbt_needs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S3: a customer model can read any env var through env_var(), so the
+    worker's credentials must never be in dbt's environment."""
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("OIDC_CLIENT_SECRET", "oidc-secret")
+    monkeypatch.setenv("TRANSFORM_GIT_TOKEN", "git-token")
+    monkeypatch.setenv("WORKSPACE_DB_URL", "postgresql://u:p@db/ws")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy:3128")
+
+    env = _dbt_env("/tmp/run/home")
+
+    assert env["PATH"] == "/usr/local/bin:/usr/bin"
+    assert env["HOME"] == "/tmp/run/home"
+    assert env["HTTPS_PROXY"] == "http://proxy:3128"
+    # v2 sends usage data by default and ignores DO_NOT_TRACK.
+    assert env["DBT_ENGINE_SEND_ANONYMOUS_USAGE_STATS"] == "false"
+    leaked = {"oidc-secret", "git-token", "postgresql://u:p@db/ws", "aws-secret"}
+    assert leaked.isdisjoint(env.values())
+
+
+def test_dbt_home_links_the_baked_extensions(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baked = tmp_path / "baked"
+    (baked / ".duckdb" / "extensions").mkdir(parents=True)
+    monkeypatch.setattr(config, "DBT_DUCKDB_HOME", str(baked))
+    run = tmp_path / "run"
+    run.mkdir()
+
+    home = _dbt_home(str(run))
+
+    assert home == str(run / "home")
+    link = run / "home" / ".duckdb"
+    assert link.is_symlink()
+    assert os.path.realpath(link) == str(baked / ".duckdb")
+
+
+def test_dbt_home_without_baked_extensions_is_plain(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "DBT_DUCKDB_HOME", str(tmp_path / "absent"))
+    home = _dbt_home(str(tmp_path))
+    assert os.path.isdir(home)
+    assert not os.path.exists(os.path.join(home, ".duckdb"))
 
 
 # --- node counting ---

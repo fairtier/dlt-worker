@@ -157,6 +157,10 @@ DBT_S3_UPLOADER_MAX_FILESIZE: str = "1GB"
 # The `stage_create_tables` option of the lake catalog: a CTAS in place
 # instead of dbt's default empty CREATE followed by INSERT.
 DBT_STAGE_CREATE_TABLES: bool = False
+# Directory whose .duckdb/extensions holds the extensions baked for the
+# dbt binary's DuckDB (see the Dockerfile's dbt stage). A run's HOME links
+# to it, because that is where DuckDB looks when the profile LOADs them.
+DBT_DUCKDB_HOME: str = "/opt/dbt-duckdb"
 # The same three bounds for the `duckdb` source type's extraction engine
 # (see duckdb_source.py). Separate knobs from the dbt trio because an
 # extraction is a different workload: it streams batches out and should
@@ -228,6 +232,7 @@ def load() -> None:
     global SOURCE_TEST_SUBPROCESS
     global DBT_DUCKDB_MEMORY_LIMIT, DBT_DUCKDB_TEMP_DIR, DBT_DUCKDB_MAX_TEMP_SIZE
     global DBT_DUCKDB_THREADS, DBT_S3_UPLOADER_MAX_FILESIZE, DBT_STAGE_CREATE_TABLES
+    global DBT_DUCKDB_HOME
     global PIPELINE_DUCKDB_MEMORY_LIMIT, PIPELINE_DUCKDB_TEMP_DIR
     global PIPELINE_DUCKDB_MAX_TEMP_SIZE, DUCKDB_EXTENSION_DIR
     global WORKSPACE_DB_URL
@@ -289,6 +294,7 @@ def load() -> None:
     DBT_STAGE_CREATE_TABLES = os.environ.get(
         "DBT_STAGE_CREATE_TABLES", "0"
     ).lower() in ("1", "true", "yes")
+    DBT_DUCKDB_HOME = os.environ.get("DBT_DUCKDB_HOME", "/opt/dbt-duckdb")
     PIPELINE_DUCKDB_MEMORY_LIMIT = os.environ.get(
         "PIPELINE_DUCKDB_MEMORY_LIMIT", "512MB"
     )
