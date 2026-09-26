@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -19,12 +21,14 @@ import yaml
 from dlt_worker import config
 from dlt_worker.api_client import TransformationConfig
 from dlt_worker.transformation_runner import (
+    _OUTPUT_TAIL_CHARS,
     _clone_repo,
     _dbt_env,
     _dbt_home,
     _git_auth_env,
     _read_profile_name,
     _resolve_repo,
+    _run_dbt,
     _sanitize,
     _write_profiles,
     run_transformation,
@@ -124,6 +128,12 @@ def test_clone_repo_keeps_token_out_of_argv() -> None:
     assert "https://gitea/acme/dbt.git" in clone_argv
     env = clone_kwargs["env"]
     assert env["GIT_CONFIG_KEY_0"] == "http.extraheader"
+
+
+def test_sanitize_masks_every_secret_and_skips_empty_ones() -> None:
+    text = "tok=a/b cat=c-sec aws=d-sec"
+    assert _sanitize(text, "a/b", "", "c-sec", "d-sec") == "tok=*** cat=*** aws=***"
+    assert _sanitize(text, "", "") == text
 
 
 def test_sanitize_masks_raw_and_quoted_token() -> None:
@@ -275,8 +285,22 @@ def test_dbt_home_without_baked_extensions_is_plain(
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+class _FakeProc:
+    """A finished dbt process as subprocess.Popen returns it."""
+
+    def __init__(self, returncode: int, output: str) -> None:
+        self.returncode = returncode
+        self.stdout = io.StringIO(output)
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def poll(self) -> int:
+        return self.returncode
+
+
 class _FakeDbt:
-    """Stands in for subprocess.run of the dbt binary: records each call and
+    """Stands in for subprocess.Popen of the dbt binary: records each call and
     writes the given run_results.json fixture where dbt would."""
 
     def __init__(self, fixture: str | None, returncode: int, output: str = "") -> None:
@@ -285,16 +309,14 @@ class _FakeDbt:
         self.output = output
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
 
-    def __call__(
-        self, argv: list[str], **kwargs: Any
-    ) -> subprocess.CompletedProcess[str]:
+    def __call__(self, argv: list[str], **kwargs: Any) -> _FakeProc:
         self.calls.append((argv, kwargs))
         if argv[1] == "build" and self.fixture:
             project_dir = argv[argv.index("--project-dir") + 1]
             target = Path(project_dir) / "target"
             target.mkdir(exist_ok=True)
             shutil.copy(FIXTURES / self.fixture, target / "run_results.json")
-        return subprocess.CompletedProcess(argv, self.returncode, self.output, "")
+        return _FakeProc(self.returncode, self.output)
 
 
 def _fake_clone(url: str, ref: str, username: str, token: str, dest: str) -> str:
@@ -323,7 +345,7 @@ def test_run_transformation_success() -> None:
 
     with (
         patch("dlt_worker.transformation_runner._clone_repo", _fake_clone),
-        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
+        patch("dlt_worker.transformation_runner.subprocess.Popen", dbt),
     ):
         report = run_transformation(cfg)
 
@@ -341,8 +363,11 @@ def test_run_transformation_success() -> None:
     # dbt runs from the writable temp dir (the container cwd is read-only
     # and DuckDB's iceberg extension mkdirs relative to cwd) ...
     assert kwargs["cwd"].startswith(tempfile.gettempdir())
-    # ... with the allowlisted env, never the worker's own.
+    # ... with the allowlisted env, never the worker's own ...
     assert kwargs["env"]["DBT_ENGINE_SEND_ANONYMOUS_USAGE_STATS"] == "false"
+    # ... and its output streamed through one pipe, line by line.
+    assert kwargs["stdout"] is subprocess.PIPE
+    assert kwargs["stderr"] is subprocess.STDOUT
     assert kwargs["env"]["HOME"].startswith(kwargs["cwd"])
     assert os.getcwd() == cwd_before
 
@@ -351,16 +376,16 @@ def test_run_transformation_rewrites_the_clone_before_building() -> None:
     cfg = _make_config(repo_url="https://git/x.git")
     seen: dict[str, Any] = {}
 
-    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def fake_popen(argv: list[str], **kwargs: Any) -> _FakeProc:
         project_dir = argv[argv.index("--project-dir") + 1]
         with open(os.path.join(project_dir, "dbt_project.yml")) as f:
             seen["project"] = yaml.safe_load(f)
         seen["catalogs"] = os.path.exists(os.path.join(project_dir, "catalogs.yml"))
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return _FakeProc(0, "")
 
     with (
         patch("dlt_worker.transformation_runner._clone_repo", _fake_clone),
-        patch("dlt_worker.transformation_runner.subprocess.run", fake_run),
+        patch("dlt_worker.transformation_runner.subprocess.Popen", fake_popen),
     ):
         run_transformation(cfg)
 
@@ -374,7 +399,7 @@ def test_run_transformation_node_failure() -> None:
 
     with (
         patch("dlt_worker.transformation_runner._clone_repo", _fake_clone),
-        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
+        patch("dlt_worker.transformation_runner.subprocess.Popen", dbt),
     ):
         report = run_transformation(cfg)
 
@@ -394,7 +419,7 @@ def test_run_transformation_failure_before_any_node_reports_dbt_output() -> None
 
     with (
         patch("dlt_worker.transformation_runner._clone_repo", _fake_clone),
-        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
+        patch("dlt_worker.transformation_runner.subprocess.Popen", dbt),
     ):
         report = run_transformation(cfg)
 
@@ -416,7 +441,7 @@ def test_run_transformation_runs_deps_when_packages_declared() -> None:
 
     with (
         patch("dlt_worker.transformation_runner._clone_repo", clone_with_packages),
-        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
+        patch("dlt_worker.transformation_runner.subprocess.Popen", dbt),
     ):
         report = run_transformation(cfg)
 
@@ -439,13 +464,89 @@ def test_run_transformation_deps_failure_is_sanitized() -> None:
 
     with (
         patch("dlt_worker.transformation_runner._clone_repo", clone_with_packages),
-        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
+        patch("dlt_worker.transformation_runner.subprocess.Popen", dbt),
     ):
         report = run_transformation(cfg)
 
     assert report.status == "failed"
     assert "dbt deps failed" in report.error_message
     assert "sekret" not in report.error_message
+
+
+def test_run_transformation_logs_dbt_output_sanitized(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful run's dbt output reaches the log as it arrives — the
+    only trace of a run's progress — with the git token scrubbed."""
+    cfg = _make_config(
+        repo_url="https://git/x.git",
+        git_credentials={"username": "u", "token": "sekret"},
+    )
+    dbt = _FakeDbt(
+        "run_results_v2_build.json",
+        0,
+        output="1 of 8 OK created stg_trips\nfetched https://u:sekret@git/x\n",
+    )
+
+    with (
+        caplog.at_level(logging.INFO, logger="dlt_worker.transformation_runner"),
+        patch("dlt_worker.transformation_runner._clone_repo", _fake_clone),
+        patch("dlt_worker.transformation_runner.subprocess.Popen", dbt),
+    ):
+        report = run_transformation(cfg)
+
+    assert report.status == "success"
+    messages = [r.getMessage() for r in caplog.records]
+    assert "dbt: 1 of 8 OK created stg_trips" in messages
+    assert "dbt: fetched https://u:***@git/x" in messages
+    assert "sekret" not in caplog.text
+
+
+@pytest.mark.parametrize("step", ["deps", "build"])
+def test_run_transformation_scrubs_catalog_and_storage_secrets(
+    step: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The profile carries the catalog's client secret and dbt can quote it:
+    it must reach neither the run report nor the log, whichever step fails."""
+    monkeypatch.setattr(config, "OIDC_CLIENT_SECRET", "oidc-shh")
+    monkeypatch.setattr(config, "AWS_SECRET_ACCESS_KEY", "aws-shh")
+    cfg = _make_config(repo_url="https://git/x.git")
+    dbt = _FakeDbt(None, 1, output="secret: oidc-shh key=aws-shh\n")
+
+    def clone(*args: Any) -> str:
+        sha = _fake_clone(*args)
+        if step == "deps":
+            with open(os.path.join(args[4], "packages.yml"), "w") as f:
+                f.write("packages: []\n")
+        return sha
+
+    with (
+        caplog.at_level(logging.INFO, logger="dlt_worker.transformation_runner"),
+        patch("dlt_worker.transformation_runner._clone_repo", clone),
+        patch("dlt_worker.transformation_runner.subprocess.Popen", dbt),
+    ):
+        report = run_transformation(cfg)
+
+    assert report.status == "failed"
+    assert f"dbt {step} failed" in report.error_message
+    assert "secret: *** key=***" in report.error_message
+    for secret in ("oidc-shh", "aws-shh"):
+        assert secret not in report.error_message
+        assert secret not in caplog.text
+
+
+def test_run_dbt_keeps_a_bounded_tail() -> None:
+    """Only the end of dbt's output is kept for the report, never all of it."""
+    lines = "".join(f"line {i}\n" for i in range(5000))
+    with patch(
+        "dlt_worker.transformation_runner.subprocess.Popen",
+        return_value=_FakeProc(2, lines),
+    ):
+        res = _run_dbt(["build"], "/p", "/pr", "/c", {}, ())
+
+    assert res.returncode == 2
+    assert res.tail.endswith("line 4999\n")
+    assert len(res.tail) == _OUTPUT_TAIL_CHARS
 
 
 def test_run_transformation_clone_failure_is_sanitized(

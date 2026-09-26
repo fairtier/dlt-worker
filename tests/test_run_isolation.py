@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -233,12 +235,15 @@ def test_transformation_child_main_sends_report_over_pipe() -> None:
         # process itself a new session leader (and fail outright if a
         # previous in-process test already made it one).
         patch("dlt_worker.run_isolation.os.setsid"),
+        # Nor may it replace pytest's own SIGTERM handling.
+        patch("dlt_worker.run_isolation.signal.signal") as m_signal,
         patch(
             "dlt_worker.transformation_runner.run_transformation", return_value=report
         ) as m_run,
     ):
         _transformation_child_main(send_conn, cfg, {})
 
+    assert m_signal.call_args.args[0] == signal.SIGTERM
     mock_config.load.assert_called_once_with()
     mock_stream.apply.assert_not_called()
     m_run.assert_called_once_with(cfg)
@@ -384,3 +389,80 @@ def test_deadline_kills_the_runs_grandchildren(tmp_path: Path) -> None:
             break
         time.sleep(0.1)
     assert _gone(pid), f"grandchild {pid} outlived its run"
+
+
+def _sigtermed_transformation_target(
+    conn: Any, paths: tuple[str, str], trace_context: Any
+) -> None:
+    """A transformation child whose dbt runs until the deadline, as a build
+    wedged on a query would. ``paths`` is (temp root, fake dbt binary)."""
+    import tempfile
+
+    from dlt_worker import transformation_runner
+    from dlt_worker.run_isolation import _child_setup_session, _exit_on_sigterm
+
+    _child_setup_session()
+    _exit_on_sigterm()
+    root, dbt = paths
+
+    def clone(url: str, ref: str, username: str, token: str, dest: str) -> str:
+        os.makedirs(dest)
+        Path(dest, "dbt_project.yml").write_text("name: t\nprofile: t\n")
+        return "abc123"
+
+    with (
+        patch.object(tempfile, "tempdir", root),
+        patch.object(transformation_runner, "_DBT", dbt),
+        patch.object(transformation_runner, "_clone_repo", clone),
+    ):
+        transformation_runner.run_transformation(
+            TransformationConfig(
+                id="t",
+                name="t",
+                repo_url="https://git/x.git",
+                repo_ref="main",
+                git_credentials={},
+                schedule=None,
+                trigger_after_pipeline_id="",
+                dbt_selector="",
+                enabled=True,
+            )
+        )
+
+
+def test_deadline_kill_removes_the_transformation_temp_dir(tmp_path: Path) -> None:
+    """The deadline's SIGTERM must still run the transformation's cleanup:
+    the clone and DuckDB's spill would otherwise stay on the box."""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    marker = tmp_path / "run_dir"
+    dbt = tmp_path / "dbt"
+    # Records the run's temp dir (dbt's cwd), leaves spill in it, then hangs.
+    dbt.write_text(
+        f"#!/bin/sh\npwd > {marker}\nmkdir duckdb-temp\n"
+        "echo spill > duckdb-temp/spill.tmp\nexec sleep 300\n"
+    )
+    dbt.chmod(0o755)
+
+    def failed(started_at: Any, message: str) -> TransformationRunReport:
+        return TransformationRunReport(
+            transformation_id="t",
+            status="failed",
+            started_at="",
+            completed_at="",
+            error_message=message,
+        )
+
+    report = _supervise(
+        _sigtermed_transformation_target,
+        (str(root), str(dbt)),
+        kind="transformation",
+        label="t",
+        timeout=5,
+        failed=failed,
+    )
+
+    assert "wall-clock limit" in report.error_message
+    assert marker.exists(), "dbt never started before the deadline"
+    assert Path(marker.read_text().strip()).parent == root
+    assert list(root.iterdir()) == []

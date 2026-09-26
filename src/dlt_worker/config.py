@@ -98,7 +98,7 @@ PIPELINE_RUN_TIMEOUT_SECONDS: int = 21_600
 # Wall-clock limit for one dbt transformation run, in seconds. Same purpose
 # as PIPELINE_RUN_TIMEOUT_SECONDS and a separate knob because a dbt build is
 # a different workload: a model that queries a warehouse table has no
-# timeout of its own. Only enforced in subprocess mode. 0 disables.
+# timeout of its own. 0 disables.
 TRANSFORMATION_RUN_TIMEOUT_SECONDS: int = 7_200
 # How often, in seconds, to ask the FairTier API for queued source tests
 # ("Test connection" in the Console). Much shorter than POLL_INTERVAL_SECONDS

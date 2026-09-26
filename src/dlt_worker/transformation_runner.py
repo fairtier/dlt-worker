@@ -18,8 +18,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections import deque
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote
 
 import yaml
@@ -80,7 +81,8 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
         # dbt (and DuckDB's iceberg extension) resolve relative paths against
         # the process cwd, which in the container is a non-writable /app —
         # the extension's staging mkdir fails there. Run from the temp dir.
-        _run_deps(clone_dir, profiles_dir, tmpdir, env, token)
+        secrets = _run_secrets(token)
+        _run_deps(clone_dir, profiles_dir, tmpdir, env, secrets)
 
         build_args = ["build"]
         if cfg.dbt_selector:
@@ -89,7 +91,7 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
         # here, and "clone was slow" vs "the build was slow" is the first
         # question asked of a long run.
         with _step_span("dlt_worker.dbt.build"):
-            res = _run_dbt(build_args, clone_dir, profiles_dir, tmpdir, env)
+            res = _run_dbt(build_args, clone_dir, profiles_dir, tmpdir, env, secrets)
 
         nodes = read_run_results(clone_dir)
         models_total, models_failed, tests_total, tests_failed = count_nodes(nodes)
@@ -111,11 +113,7 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
                     f"and {tests_failed} tests failed"
                 )
             else:
-                tail = (res.stdout + res.stderr)[-_OUTPUT_TAIL_CHARS:]
-                error_message = (
-                    f"dbt build failed (exit {res.returncode}): "
-                    f"{_sanitize(tail, token)}"
-                )
+                error_message = f"dbt build failed (exit {res.returncode}): {res.tail}"
             logger.error("Transformation %s failed: %s", cfg.name, error_message)
 
         return TransformationRunReport(
@@ -144,7 +142,7 @@ def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
             started_at=started_at.isoformat(),
             completed_at=datetime.now(UTC).isoformat(),
             commit_sha=commit_sha,
-            error_message=_sanitize(str(exc), token),
+            error_message=_sanitize(str(exc), *_run_secrets(token)),
             run_id=cfg.pending_run_id,
         )
 
@@ -195,12 +193,20 @@ def _git_auth_env(username: str, token: str) -> dict[str, str]:
     }
 
 
-def _sanitize(text: str, token: str) -> str:
-    """Replace the git token in text with *** so it never leaks into
-    logs or run reports (git echoes the clone URL in its errors)."""
-    if not token:
-        return text
-    return text.replace(token, "***").replace(quote(token, safe=""), "***")
+def _sanitize(text: str, *secrets: str) -> str:
+    """Replace each secret in text with *** so it never leaks into logs or
+    run reports (git echoes the clone URL in its errors, dbt can quote its
+    profile). Empty secrets are skipped: replacing "" would mangle all."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***").replace(quote(secret, safe=""), "***")
+    return text
+
+
+def _run_secrets(token: str) -> tuple[str, ...]:
+    """Every secret a run's dbt output can quote: the git token, and the
+    catalog and storage credentials the worker holds."""
+    return (token, config.OIDC_CLIENT_SECRET, config.AWS_SECRET_ACCESS_KEY)
 
 
 def _clone_repo(url: str, ref: str, username: str, token: str, dest: str) -> str:
@@ -380,15 +386,34 @@ _DBT = "dbt"
 _OUTPUT_TAIL_CHARS = 2000
 
 
-def _run_dbt(
-    args: list[str], project_dir: str, profiles_dir: str, cwd: str, env: dict[str, str]
-) -> subprocess.CompletedProcess[str]:
-    """Run one dbt command to completion.
+class _DbtResult(NamedTuple):
+    returncode: int
+    # The last _OUTPUT_TAIL_CHARS of dbt's output, already sanitized.
+    tail: str
 
-    No timeout here: the run's wall-clock deadline is enforced by the parent
-    (run_isolation), which kills this whole process group.
+
+# Longest piece of one output line read at a time, so a single huge line
+# can't grow the worker's memory without bound.
+_READ_CHUNK_CHARS = 8192
+
+
+def _run_dbt(
+    args: list[str],
+    project_dir: str,
+    profiles_dir: str,
+    cwd: str,
+    env: dict[str, str],
+    secrets: tuple[str, ...],
+) -> _DbtResult:
+    """Run one dbt command to completion, streaming its output to the log.
+
+    Each line is sanitized and logged as it arrives, so a run's progress
+    reaches the container logs even if the run is later killed; only a
+    bounded tail is kept for the report. No timeout here: the run's
+    wall-clock deadline is enforced by the parent (run_isolation), which
+    kills this whole process group.
     """
-    return subprocess.run(
+    proc = subprocess.Popen(
         [
             _DBT,
             *args,
@@ -401,14 +426,46 @@ def _run_dbt(
         ],
         cwd=cwd,
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        check=False,
+        bufsize=1,
     )
+    tail: deque[str] = deque()
+    tail_chars = 0
+    try:
+        stdout = proc.stdout
+        assert stdout is not None  # stdout=PIPE always sets it
+        for line in iter(lambda: stdout.readline(_READ_CHUNK_CHARS), ""):
+            line = _sanitize(line, *secrets)
+            logger.info("dbt: %s", line.rstrip())
+            tail.append(line)
+            tail_chars += len(line)
+            while tail_chars - len(tail[0]) >= _OUTPUT_TAIL_CHARS:
+                tail_chars -= len(tail.popleft())
+        returncode = proc.wait()
+    finally:
+        # Reached with dbt still running only when this process is being
+        # stopped (SIGTERM → SystemExit) or reading failed. Stop dbt within
+        # the parent's SIGKILL grace so the caller's cleanup can run.
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()
+    return _DbtResult(returncode, "".join(tail)[-_OUTPUT_TAIL_CHARS:])
 
 
 def _run_deps(
-    project_dir: str, profiles_dir: str, cwd: str, env: dict[str, str], token: str
+    project_dir: str,
+    profiles_dir: str,
+    cwd: str,
+    env: dict[str, str],
+    secrets: tuple[str, ...],
 ) -> None:
     """Run ``dbt deps`` when the project declares packages."""
     has_packages = any(
@@ -419,7 +476,6 @@ def _run_deps(
         return
 
     with _step_span("dlt_worker.dbt.deps"):
-        res = _run_dbt(["deps"], project_dir, profiles_dir, cwd, env)
+        res = _run_dbt(["deps"], project_dir, profiles_dir, cwd, env, secrets)
     if res.returncode != 0:
-        tail = (res.stdout + res.stderr)[-_OUTPUT_TAIL_CHARS:]
-        raise RuntimeError(f"dbt deps failed: {_sanitize(tail, token)}")
+        raise RuntimeError(f"dbt deps failed: {res.tail}")

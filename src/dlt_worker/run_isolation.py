@@ -27,7 +27,7 @@ and scheduler state survive, and the failure lands in run history with the
 exit code. Previously an OOM during a big load killed the whole worker.
 
 Because only children run dlt, its import is deferred to the child:
-importing dlt costs ~115 MB of RSS, and the poll loop needs neither. A
+importing dlt costs ~115 MB of RSS, and the poll loop never needs it. A
 parent that never imports it idles at ~35 MB instead of ~150 MB — memory
 that on a 4 GB box is the difference between headroom and none. The cost
 is that a broken dependency surfaces as a failed run rather than at
@@ -73,6 +73,22 @@ def _child_setup_session() -> None:
     with the child's pid as the group id, killpg reaches the whole run.
     """
     os.setsid()
+
+
+def _exit_on_sigterm() -> None:
+    """Turn SIGTERM into SystemExit, so the run's ``finally`` blocks run.
+
+    The default action ends the process on the spot, and a transformation's
+    cleanup — stopping dbt, removing the clone and DuckDB's spill — lives in
+    ``finally``. The deadline's SIGTERM reaches dbt too (same process
+    group); what is left of it is stopped by that cleanup, well inside the
+    parent's grace before SIGKILL.
+    """
+
+    def _raise(signum: int, frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _raise)
 
 
 def _child_setup(trace_context: Mapping[str, str]) -> None:
@@ -125,6 +141,7 @@ def _transformation_child_main(
     iceberg extension, not PyIceberg.
     """
     _child_setup(trace_context)
+    _exit_on_sigterm()
     from dlt_worker.transformation_runner import run_transformation
 
     try:
