@@ -5,7 +5,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
+import subprocess
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -17,7 +20,6 @@ from dlt_worker import config
 from dlt_worker.api_client import TransformationConfig
 from dlt_worker.transformation_runner import (
     _clone_repo,
-    _count_nodes,
     _dbt_env,
     _dbt_home,
     _git_auth_env,
@@ -268,106 +270,182 @@ def test_dbt_home_without_baked_extensions_is_plain(
     assert not os.path.exists(os.path.join(home, ".duckdb"))
 
 
-# --- node counting ---
-
-
-def test_count_nodes() -> None:
-    nodes = [
-        {"resource_type": "model", "status": "success"},
-        {"resource_type": "model", "status": "error"},
-        {"resource_type": "seed", "status": "success"},
-        {"resource_type": "test", "status": "pass"},
-        {"resource_type": "test", "status": "fail"},
-        {"resource_type": "unit_test", "status": "pass"},
-    ]
-    assert _count_nodes(nodes) == (3, 1, 3, 1)
-
-
 # --- run_transformation ---
 
-
-def _fake_node(resource_type: str, name: str, status: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        node=SimpleNamespace(resource_type=resource_type, name=name),
-        status=status,
-        execution_time=0.5,
-        message="ok" if status in ("success", "pass") else "boom",
-    )
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def _fake_dbt_result(nodes: list[SimpleNamespace], success: bool) -> SimpleNamespace:
-    return SimpleNamespace(
-        success=success,
-        exception=None,
-        result=SimpleNamespace(results=nodes),
-    )
+class _FakeDbt:
+    """Stands in for subprocess.run of the dbt binary: records each call and
+    writes the given run_results.json fixture where dbt would."""
+
+    def __init__(self, fixture: str | None, returncode: int, output: str = "") -> None:
+        self.fixture = fixture
+        self.returncode = returncode
+        self.output = output
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def __call__(
+        self, argv: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append((argv, kwargs))
+        if argv[1] == "build" and self.fixture:
+            project_dir = argv[argv.index("--project-dir") + 1]
+            target = Path(project_dir) / "target"
+            target.mkdir(exist_ok=True)
+            shutil.copy(FIXTURES / self.fixture, target / "run_results.json")
+        return subprocess.CompletedProcess(argv, self.returncode, self.output, "")
 
 
-def test_run_transformation_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def _fake_clone(url: str, ref: str, username: str, token: str, dest: str) -> str:
+    os.makedirs(dest)
+    with open(os.path.join(dest, "dbt_project.yml"), "w") as f:
+        yaml.safe_dump(
+            {
+                "name": "fairtier",
+                "profile": "fairtier",
+                "models": {"fairtier": {"+materialized": "table"}},
+            },
+            f,
+        )
+    return "abc123"
+
+
+def test_run_transformation_success() -> None:
     cfg = _make_config(
         repo_url="https://git/x.git",
         git_credentials={"username": "u", "token": "tok"},
         dbt_selector="tag:daily",
         pending_run_id="run-9",
     )
-    runner = MagicMock()
-    invoke_cwds: list[str] = []
-
-    def _invoke(args: list[str]) -> SimpleNamespace:
-        invoke_cwds.append(os.getcwd())
-        return _fake_dbt_result(
-            [
-                _fake_node("model", "stg_orders", "success"),
-                _fake_node("test", "unique_id", "pass"),
-            ],
-            success=True,
-        )
-
-    runner.invoke.side_effect = _invoke
+    dbt = _FakeDbt("run_results_v2_build.json", 0)
     cwd_before = os.getcwd()
 
     with (
-        patch("dlt_worker.transformation_runner._clone_repo", return_value="abc123"),
-        patch("dlt_worker.transformation_runner.dbtRunner", return_value=runner),
+        patch("dlt_worker.transformation_runner._clone_repo", _fake_clone),
+        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
     ):
         report = run_transformation(cfg)
 
     assert report.status == "success"
     assert report.commit_sha == "abc123"
-    assert report.models_total == 1
-    assert report.tests_total == 1
+    assert (report.models_total, report.tests_total) == (8, 5)
     assert report.run_id == "run-9"
-    results = json.loads(report.model_results)
-    assert results[0]["name"] == "stg_orders"
+    names = {n["name"] for n in json.loads(report.model_results)}
+    assert "stg_trips" in names
 
-    build_args = runner.invoke.call_args[0][0]
-    assert build_args[0] == "build"
-    assert build_args[-2:] == ["--select", "tag:daily"]
-    assert "--target" in build_args
-
-    # dbt must run from the writable temp dir (the container cwd is
-    # read-only and DuckDB's iceberg extension mkdirs relative to cwd),
-    # and the previous cwd must be restored afterwards.
-    assert all(c.startswith(tempfile.gettempdir()) for c in invoke_cwds)
+    ((argv, kwargs),) = dbt.calls  # no packages.yml → no deps call
+    assert argv[:2] == ["dbt", "build"]
+    assert argv[argv.index("--select") + 1] == "tag:daily"
+    assert argv[argv.index("--target") + 1] == "box"
+    # dbt runs from the writable temp dir (the container cwd is read-only
+    # and DuckDB's iceberg extension mkdirs relative to cwd) ...
+    assert kwargs["cwd"].startswith(tempfile.gettempdir())
+    # ... with the allowlisted env, never the worker's own.
+    assert kwargs["env"]["DBT_ENGINE_SEND_ANONYMOUS_USAGE_STATS"] == "false"
+    assert kwargs["env"]["HOME"].startswith(kwargs["cwd"])
     assert os.getcwd() == cwd_before
 
 
-def test_run_transformation_dbt_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_transformation_rewrites_the_clone_before_building() -> None:
     cfg = _make_config(repo_url="https://git/x.git")
-    runner = MagicMock()
-    runner.invoke.return_value = _fake_dbt_result(
-        [_fake_node("model", "bad_model", "error")], success=False
-    )
+    seen: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        project_dir = argv[argv.index("--project-dir") + 1]
+        with open(os.path.join(project_dir, "dbt_project.yml")) as f:
+            seen["project"] = yaml.safe_load(f)
+        seen["catalogs"] = os.path.exists(os.path.join(project_dir, "catalogs.yml"))
+        return subprocess.CompletedProcess(argv, 0, "", "")
 
     with (
-        patch("dlt_worker.transformation_runner._clone_repo", return_value="abc123"),
-        patch("dlt_worker.transformation_runner.dbtRunner", return_value=runner),
+        patch("dlt_worker.transformation_runner._clone_repo", _fake_clone),
+        patch("dlt_worker.transformation_runner.subprocess.run", fake_run),
+    ):
+        run_transformation(cfg)
+
+    assert seen["project"]["flags"]["use_catalogs_v2"] is True
+    assert seen["catalogs"] is True
+
+
+def test_run_transformation_node_failure() -> None:
+    cfg = _make_config(repo_url="https://git/x.git")
+    dbt = _FakeDbt("run_results_v2_error.json", 1)
+
+    with (
+        patch("dlt_worker.transformation_runner._clone_repo", _fake_clone),
+        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
     ):
         report = run_transformation(cfg)
 
     assert report.status == "failed"
     assert report.models_failed == 1
-    assert "1 models" in report.error_message
+    assert report.error_message == "dbt build failed: 1 models and 0 tests failed"
+
+
+def test_run_transformation_failure_before_any_node_reports_dbt_output() -> None:
+    """dbt that fails before building anything (bad YAML, unreachable
+    catalog) writes no results: its own output is the only explanation."""
+    cfg = _make_config(
+        repo_url="https://git/x.git",
+        git_credentials={"username": "u", "token": "sekret"},
+    )
+    dbt = _FakeDbt(None, 2, output="Error: could not reach https://u:sekret@git/x\n")
+
+    with (
+        patch("dlt_worker.transformation_runner._clone_repo", _fake_clone),
+        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
+    ):
+        report = run_transformation(cfg)
+
+    assert report.status == "failed"
+    assert report.error_message.startswith("dbt build failed (exit 2): ")
+    assert "could not reach" in report.error_message
+    assert "sekret" not in report.error_message
+
+
+def test_run_transformation_runs_deps_when_packages_declared() -> None:
+    cfg = _make_config(repo_url="https://git/x.git")
+    dbt = _FakeDbt("run_results_v2_build.json", 0)
+
+    def clone_with_packages(*args: Any) -> str:
+        sha = _fake_clone(*args)
+        with open(os.path.join(args[4], "packages.yml"), "w") as f:
+            f.write("packages: []\n")
+        return sha
+
+    with (
+        patch("dlt_worker.transformation_runner._clone_repo", clone_with_packages),
+        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
+    ):
+        report = run_transformation(cfg)
+
+    assert report.status == "success"
+    assert [argv[1] for argv, _ in dbt.calls] == ["deps", "build"]
+
+
+def test_run_transformation_deps_failure_is_sanitized() -> None:
+    cfg = _make_config(
+        repo_url="https://git/x.git",
+        git_credentials={"username": "u", "token": "sekret"},
+    )
+    dbt = _FakeDbt(None, 1, output="deps: 401 for https://u:sekret@hub\n")
+
+    def clone_with_packages(*args: Any) -> str:
+        sha = _fake_clone(*args)
+        with open(os.path.join(args[4], "packages.yml"), "w") as f:
+            f.write("packages: []\n")
+        return sha
+
+    with (
+        patch("dlt_worker.transformation_runner._clone_repo", clone_with_packages),
+        patch("dlt_worker.transformation_runner.subprocess.run", dbt),
+    ):
+        report = run_transformation(cfg)
+
+    assert report.status == "failed"
+    assert "dbt deps failed" in report.error_message
+    assert "sekret" not in report.error_message
 
 
 def test_run_transformation_clone_failure_is_sanitized(
