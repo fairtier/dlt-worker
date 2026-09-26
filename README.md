@@ -79,14 +79,17 @@ All configuration is via environment variables.
 | `DATA_WRITER_CHUNK_ROWS`    | `100000`     | Rows per parquet row group for dlt's intermediate extract/normalize files (sets the global `DATA_WRITER__ROW_GROUP_SIZE`) — bounds peak memory *before* the load stage, since normalize rewrites one row group at a time; `0` restores dlt's default (unbounded row groups) |
 | `PIPELINE_SUBPROCESS`       | `1`          | Run each pipeline in a short-lived spawned subprocess so the memory a big run leaves behind (Arrow buffers, dlt caches) is returned to the OS at process exit, and an OOM kill takes down the run — reported as a failed run — instead of the worker; `0` runs pipelines in-process (pre-0.3.0 behavior) |
 | `PIPELINE_RUN_TIMEOUT_SECONDS` | `21600`   | Wall-clock limit for one pipeline run attempt — on expiry the run subprocess is killed and a failed run is reported, so a source stuck in a read can't wedge the poll loop forever; only enforced in subprocess mode; `0` disables |
-| `TRANSFORMATION_SUBPROCESS` | `1`          | Run each dbt transformation in a short-lived spawned subprocess, for the same reason pipelines are: dbt + DuckDB over a big table retains hundreds of MB the worker otherwise never gives back (and stays *under* its container limit while doing it, so nothing kills it); `0` runs transformations in-process (pre-0.7.0 behavior) |
-| `TRANSFORMATION_RUN_TIMEOUT_SECONDS` | `7200` | Wall-clock limit for one dbt run — a model querying the warehouse has no timeout of its own; on expiry the subprocess is killed and a failed run is reported. Only enforced in subprocess mode; `0` disables |
+| `TRANSFORMATION_RUN_TIMEOUT_SECONDS` | `7200` | Wall-clock limit for one dbt run — a model querying the warehouse has no timeout of its own; on expiry the run's whole process group is killed, dbt included; `0` disables |
 | `SOURCE_TEST_POLL_SECONDS`  | `10`         | How often to claim queued source tests ("Test connection" in the Console) between config polls — much shorter than `POLL_INTERVAL_SECONDS` because a person is watching a spinner. `0` disables source tests |
 | `SOURCE_TEST_TIMEOUT_SECONDS` | `60`       | Wall-clock limit for one probe. A test that has not answered in a minute has answered: the source is not reachable from this box. Only enforced in subprocess mode; `0` disables |
 | `SOURCE_TEST_SUBPROCESS`    | `1`         | Run each probe in a short-lived spawned subprocess. A probe opens exactly the connections a wrong config makes hang; `0` runs it in the poll loop |
 | `DBT_DUCKDB_MEMORY_LIMIT`   | `512MB`      | DuckDB `memory_limit` for a dbt run. Unbounded, DuckDB sizes its buffer manager from *host* RAM — which on a single-node box is everyone else's RAM too; bounded, it spills instead. Empty leaves DuckDB's default |
 | `DBT_DUCKDB_TEMP_DIR`       | _(empty)_    | Where DuckDB spills past that ceiling; empty = the run's temp dir, so a killed build leaves no spill behind |
 | `DBT_DUCKDB_MAX_TEMP_SIZE`  | `4GB`        | Cap on that spill, so a runaway model exhausts neither RAM nor the box's disk. Empty leaves DuckDB's default (90% of the filesystem) |
+| `DBT_DUCKDB_THREADS`        | `2`          | DuckDB's own thread count for a dbt run. Left alone DuckDB takes the host's core count, and each thread holds its own scan and writer state — enough, on a many-core host, to run a tightly bounded build out of memory. Not the profile's `threads:`, which is dbt's model concurrency. Empty leaves DuckDB's default |
+| `DBT_S3_UPLOADER_MAX_FILESIZE` | `1GB`     | Sizes httpfs's S3 multipart part buffer (this ÷ 10000), one per file being written. DuckDB's default (`800GB`) makes it 76.5 MiB per Iceberg data file; `1GB` clamps it to 5 MiB. Applied with `SET GLOBAL` from an `on-run-start` hook, because a profile `SET` of it does not reach dbt's statements. Empty leaves DuckDB's default |
+| `DBT_STAGE_CREATE_TABLES`   | `0`          | `1` builds `lake` tables with a CTAS in place (`stage_create_tables`) instead of an empty `CREATE` followed by `INSERT` |
+| `DBT_DUCKDB_HOME`           | `/opt/dbt-duckdb` | Directory whose `.duckdb/extensions` holds the extensions baked for dbt's DuckDB; a run's `HOME` links to it |
 | `PIPELINE_DUCKDB_MEMORY_LIMIT` | `512MB`   | DuckDB `memory_limit` for a `duckdb`-source extraction — same reasoning as the dbt bound, and safe to keep tight because the extraction streams batches out rather than materializing. Empty leaves DuckDB's default |
 | `PIPELINE_DUCKDB_TEMP_DIR`  | _(empty)_    | Where a `duckdb`-source extraction spills past that ceiling; empty = a per-pipeline directory under the system temp dir, wiped on the next run |
 | `PIPELINE_DUCKDB_MAX_TEMP_SIZE` | `4GB`    | Cap on that spill. Empty leaves DuckDB's default |
@@ -150,9 +153,9 @@ here. Every message goes through the same credential scrubber a failed run does.
 Besides ingestion pipelines, the worker runs [dbt](https://www.getdbt.com/) transformations. The control plane provides transformation configs (git repo, ref, schedule); for each due transformation the worker:
 
 1. Shallow-clones the dbt project -- either a connected repo with its own credentials, or the hosted repo from `TRANSFORM_REPO_URL`
-2. Generates `profiles.yml` at run time -- credentials never live in git; data-file access uses credentials vended by the [Lakekeeper](https://lakekeeper.io/) REST catalog
-3. Runs `dbt build` against DuckDB with the Iceberg catalog attached
-4. Reports per-model and per-test results back to the control plane
+2. Prepares the clone (never the repo): merges a `lake` catalog pointing at the box's Lakekeeper into `catalogs.yml` (the repo's other catalogs are kept; its own `lake`, if any, is replaced), sets `flags.use_catalogs_v2` and a project-wide `+catalog_name: lake` when the project doesn't, and puts `on-run-start` hooks ahead of the project's own that apply `DBT_S3_UPLOADER_MAX_FILESIZE` and fail the run if a DuckDB bound did not take
+3. Generates `profiles.yml` (DuckDB bounds + the catalog's OAuth2 client) and runs `dbt deps` if the project declares packages, then `dbt build` — the [dbt-oss](https://github.com/dbt-labs/dbt) 2.x binary, as a subprocess whose environment is an allowlist (no worker credential is reachable from a model's `env_var()`), with telemetry off and the DuckDB driver and extensions baked into the image (nothing is fetched at run time)
+4. Reads the per-node outcome from `target/run_results.json` and reports it
 
 Transformations run on a cron schedule, on manual trigger, or chained after a successful pipeline run.
 
