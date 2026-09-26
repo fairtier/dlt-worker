@@ -140,6 +140,23 @@ DBT_DUCKDB_TEMP_DIR: str = ""
 # disk — disk is the box's other silently-exhausted resource. Empty = leave
 # DuckDB's default (90% of the filesystem).
 DBT_DUCKDB_MAX_TEMP_SIZE: str = "4GB"
+# DuckDB's own thread count for a dbt run, as a SET in the generated
+# profile. Left alone DuckDB takes the host's core count, and every thread
+# holds its own scan and Parquet-writer state (~9-18 MiB each), which on a
+# many-core host is enough to run a 192MB build out of memory on its own.
+# Not the profile's `threads:` key: that is dbt's model concurrency and
+# never reaches DuckDB. Empty = DuckDB's default.
+DBT_DUCKDB_THREADS: str = "2"
+# httpfs sizes its S3 multipart part buffer as this / 10000 parts, and pins
+# one buffer per file being written. DuckDB's default (800GB) makes that
+# 76.5 MiB per Iceberg data file — files that are 8 MiB. 1GB clamps the
+# part to its 5 MiB minimum. Applied with SET GLOBAL from an on-run-start
+# hook (dbt_project.py): a profile SET of an extension setting is
+# session-scoped and dbt discards the connection it ran on. Empty = default.
+DBT_S3_UPLOADER_MAX_FILESIZE: str = "1GB"
+# The `stage_create_tables` option of the lake catalog: a CTAS in place
+# instead of dbt's default empty CREATE followed by INSERT.
+DBT_STAGE_CREATE_TABLES: bool = False
 # The same three bounds for the `duckdb` source type's extraction engine
 # (see duckdb_source.py). Separate knobs from the dbt trio because an
 # extraction is a different workload: it streams batches out and should
@@ -210,6 +227,7 @@ def load() -> None:
     global SOURCE_TEST_POLL_SECONDS, SOURCE_TEST_TIMEOUT_SECONDS
     global SOURCE_TEST_SUBPROCESS
     global DBT_DUCKDB_MEMORY_LIMIT, DBT_DUCKDB_TEMP_DIR, DBT_DUCKDB_MAX_TEMP_SIZE
+    global DBT_DUCKDB_THREADS, DBT_S3_UPLOADER_MAX_FILESIZE, DBT_STAGE_CREATE_TABLES
     global PIPELINE_DUCKDB_MEMORY_LIMIT, PIPELINE_DUCKDB_TEMP_DIR
     global PIPELINE_DUCKDB_MAX_TEMP_SIZE, DUCKDB_EXTENSION_DIR
     global WORKSPACE_DB_URL
@@ -266,6 +284,11 @@ def load() -> None:
     DBT_DUCKDB_MEMORY_LIMIT = os.environ.get("DBT_DUCKDB_MEMORY_LIMIT", "512MB")
     DBT_DUCKDB_TEMP_DIR = os.environ.get("DBT_DUCKDB_TEMP_DIR", "")
     DBT_DUCKDB_MAX_TEMP_SIZE = os.environ.get("DBT_DUCKDB_MAX_TEMP_SIZE", "4GB")
+    DBT_DUCKDB_THREADS = os.environ.get("DBT_DUCKDB_THREADS", "2")
+    DBT_S3_UPLOADER_MAX_FILESIZE = os.environ.get("DBT_S3_UPLOADER_MAX_FILESIZE", "1GB")
+    DBT_STAGE_CREATE_TABLES = os.environ.get(
+        "DBT_STAGE_CREATE_TABLES", "0"
+    ).lower() in ("1", "true", "yes")
     PIPELINE_DUCKDB_MEMORY_LIMIT = os.environ.get(
         "PIPELINE_DUCKDB_MEMORY_LIMIT", "512MB"
     )
