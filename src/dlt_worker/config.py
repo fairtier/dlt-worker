@@ -95,14 +95,6 @@ PIPELINE_SUBPROCESS: bool = True
 # reported. Only enforced in subprocess mode — an in-process run
 # (PIPELINE_SUBPROCESS=0) cannot be safely interrupted. 0 disables.
 PIPELINE_RUN_TIMEOUT_SECONDS: int = 21_600
-# Run each dbt transformation in a short-lived spawned subprocess, for the
-# same reason pipelines are (see run_isolation.py). dbt + DuckDB over a big
-# table retains hundreds of MB the worker never gives back; on 2026-08-10
-# an in-process build over 85M rows left 800 MB resident — under the
-# container limit, so never OOM-killed, and it starved the box until the
-# pod was restarted by hand. 0/false = run in-process (pre-0.7.0
-# behavior). This is the rollback lever.
-TRANSFORMATION_SUBPROCESS: bool = True
 # Wall-clock limit for one dbt transformation run, in seconds. Same purpose
 # as PIPELINE_RUN_TIMEOUT_SECONDS and a separate knob because a dbt build is
 # a different workload: a model that queries a warehouse table has no
@@ -226,7 +218,6 @@ def load() -> None:
     global ICEBERG_CREDENTIAL_REFRESH_SECONDS
     global PIPELINE_SUBPROCESS
     global PIPELINE_RUN_TIMEOUT_SECONDS
-    global TRANSFORMATION_SUBPROCESS
     global TRANSFORMATION_RUN_TIMEOUT_SECONDS
     global SOURCE_TEST_POLL_SECONDS, SOURCE_TEST_TIMEOUT_SECONDS
     global SOURCE_TEST_SUBPROCESS
@@ -271,13 +262,6 @@ def load() -> None:
     SOURCE_TEST_TIMEOUT_SECONDS = _int("SOURCE_TEST_TIMEOUT_SECONDS", 60)
     SOURCE_TEST_SUBPROCESS = os.environ.get(
         "SOURCE_TEST_SUBPROCESS", "1"
-    ).lower() not in (
-        "0",
-        "false",
-        "no",
-    )
-    TRANSFORMATION_SUBPROCESS = os.environ.get(
-        "TRANSFORMATION_SUBPROCESS", "1"
     ).lower() not in (
         "0",
         "false",

@@ -5,6 +5,8 @@ from __future__ import annotations
 import multiprocessing
 import subprocess
 import sys
+import time
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -19,6 +21,7 @@ from dlt_worker.api_client import (
 )
 from dlt_worker.run_isolation import (
     _child_main,
+    _supervise,
     _transformation_child_main,
     run_pipeline_isolated,
     run_transformation_isolated,
@@ -72,6 +75,10 @@ def test_child_main_sends_report_over_pipe(monkeypatch: pytest.MonkeyPatch) -> N
         patch("dlt_worker.run_isolation.config") as mock_config,
         patch("dlt_worker.run_isolation.iceberg_stream") as mock_stream,
         patch("dlt_worker.run_isolation.logging"),
+        # Exercised in-process: the real os.setsid() would make the pytest
+        # process itself a new session leader (and fail outright if a
+        # previous in-process test already made it one).
+        patch("dlt_worker.run_isolation.os.setsid"),
         patch("dlt_worker.pipeline_runner.run_pipeline", return_value=report) as m_run,
     ):
         mock_config.ICEBERG_LOAD_CHUNK_ROWS = 200_000
@@ -110,6 +117,7 @@ class _HungProc:
     sends, ignores nothing — until terminated."""
 
     exitcode = None
+    pid = 424242
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.alive = True
@@ -163,9 +171,12 @@ def test_hung_child_is_killed_at_the_wall_clock_limit(
     )
 
     cfg = _make_config()
-    with patch(
-        "dlt_worker.run_isolation.multiprocessing.get_context",
-        return_value=fake_ctx,
+    with (
+        patch(
+            "dlt_worker.run_isolation.multiprocessing.get_context",
+            return_value=fake_ctx,
+        ),
+        patch("dlt_worker.run_isolation.os.killpg", side_effect=ProcessLookupError),
     ):
         report = run_pipeline_isolated(cfg)
 
@@ -205,20 +216,6 @@ def _transformation_report(cfg: TransformationConfig) -> TransformationRunReport
     )
 
 
-def test_transformation_disabled_runs_in_process(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(config, "TRANSFORMATION_SUBPROCESS", False)
-    cfg = _make_transformation()
-    report = _transformation_report(cfg)
-    with patch(
-        "dlt_worker.transformation_runner.run_transformation", return_value=report
-    ) as m:
-        result = run_transformation_isolated(cfg)
-    m.assert_called_once_with(cfg)
-    assert result is report
-
-
 def test_transformation_child_main_sends_report_over_pipe() -> None:
     """The dbt child re-applies config/telemetry and pipes the report back.
 
@@ -232,6 +229,10 @@ def test_transformation_child_main_sends_report_over_pipe() -> None:
         patch("dlt_worker.run_isolation.config") as mock_config,
         patch("dlt_worker.run_isolation.iceberg_stream") as mock_stream,
         patch("dlt_worker.run_isolation.logging"),
+        # Exercised in-process: the real os.setsid() would make the pytest
+        # process itself a new session leader (and fail outright if a
+        # previous in-process test already made it one).
+        patch("dlt_worker.run_isolation.os.setsid"),
         patch(
             "dlt_worker.transformation_runner.run_transformation", return_value=report
         ) as m_run,
@@ -252,7 +253,6 @@ def test_transformation_child_death_becomes_failed_report(
     env, standing in for an OOM kill) must surface as a failed run — the
     2026-08-10 failure mode, where an in-process build instead left 800 MB
     resident in a worker that kept running."""
-    monkeypatch.setattr(config, "TRANSFORMATION_SUBPROCESS", True)
     monkeypatch.setenv("CUSTOMER_SLUG", "")
 
     cfg = _make_transformation(pending_run_id="run-123")
@@ -270,7 +270,6 @@ def test_hung_transformation_is_killed_at_the_wall_clock_limit(
 ) -> None:
     """A dbt build with no timeout of its own (a model querying the
     warehouse) must not wedge the poll loop forever."""
-    monkeypatch.setattr(config, "TRANSFORMATION_SUBPROCESS", True)
     monkeypatch.setattr(config, "TRANSFORMATION_RUN_TIMEOUT_SECONDS", 1)
 
     real_recv, real_send = multiprocessing.Pipe(duplex=False)
@@ -290,9 +289,12 @@ def test_hung_transformation_is_killed_at_the_wall_clock_limit(
     )
 
     cfg = _make_transformation()
-    with patch(
-        "dlt_worker.run_isolation.multiprocessing.get_context",
-        return_value=fake_ctx,
+    with (
+        patch(
+            "dlt_worker.run_isolation.multiprocessing.get_context",
+            return_value=fake_ctx,
+        ),
+        patch("dlt_worker.run_isolation.os.killpg", side_effect=ProcessLookupError),
     ):
         report = run_transformation_isolated(cfg)
 
@@ -328,3 +330,57 @@ def test_poll_loop_imports_neither_dlt_nor_dbt() -> None:
     assert proc.stdout.strip() == "[]", (
         f"parent imported run engines: {proc.stdout.strip()}"
     )
+
+
+def _grandchild_target(conn: Any, pid_file: str, trace_context: Any) -> None:
+    """A run child that starts a long-lived grandchild (as dbt is) and then
+    hangs without reporting."""
+    from dlt_worker.run_isolation import _child_setup_session
+
+    _child_setup_session()
+    grandchild = subprocess.Popen(["sleep", "300"])
+    Path(pid_file).write_text(str(grandchild.pid))
+    time.sleep(300)
+
+
+def _gone(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split(") ", 1)[1].startswith("Z")
+    # /proc/<pid> can still exist for the open() but the process finishes
+    # exiting before the read(), which surfaces as ESRCH rather than ENOENT
+    # — either one means the process is gone.
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+
+
+def test_deadline_kills_the_runs_grandchildren(tmp_path: Path) -> None:
+    """The dbt binary is a grandchild of the supervisor: killing only the
+    run child would orphan it, still holding its memory."""
+    pid_file = tmp_path / "grandchild.pid"
+
+    def failed(started_at: Any, message: str) -> TransformationRunReport:
+        return TransformationRunReport(
+            transformation_id="t",
+            status="failed",
+            started_at="",
+            completed_at="",
+            error_message=message,
+        )
+
+    report = _supervise(
+        _grandchild_target,
+        str(pid_file),
+        kind="transformation",
+        label="t",
+        timeout=5,
+        failed=failed,
+    )
+
+    assert "wall-clock limit" in report.error_message
+    pid = int(pid_file.read_text())
+    for _ in range(50):
+        if _gone(pid):
+            break
+        time.sleep(0.1)
+    assert _gone(pid), f"grandchild {pid} outlived its run"

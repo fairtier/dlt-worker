@@ -26,23 +26,26 @@ A child that dies without reporting (kernel OOM kill, segfault) becomes a
 and scheduler state survive, and the failure lands in run history with the
 exit code. Previously an OOM during a big load killed the whole worker.
 
-Because only children run dlt and dbt, both imports are deferred to the
-child: importing dlt costs ~115 MB of RSS and dbt another ~60 MB, and the
-poll loop needs neither. A parent that never imports them idles at ~35 MB
-instead of ~190 MB — memory that on a 4 GB box is the difference between
-headroom and none. The cost is that a broken dependency surfaces as a
-failed run rather than at startup.
+Because only children run dlt, its import is deferred to the child:
+importing dlt costs ~115 MB of RSS, and the poll loop needs neither. A
+parent that never imports it idles at ~35 MB instead of ~150 MB — memory
+that on a 4 GB box is the difference between headroom and none. The cost
+is that a broken dependency surfaces as a failed run rather than at
+startup.
 
-``PIPELINE_SUBPROCESS=0`` / ``TRANSFORMATION_SUBPROCESS=0`` restore
-in-process execution (the rollback levers).
+``PIPELINE_SUBPROCESS=0`` restores in-process execution for pipelines (the
+rollback lever). A transformation always runs in a child: dbt is a
+separate binary, so there is no in-process form to fall back to.
 """
 
 from __future__ import annotations
 
 import logging
 import multiprocessing
+import os
 import signal
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -62,8 +65,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _child_setup_session() -> None:
+    """Make this child the leader of its own process group.
+
+    A run child can start processes of its own — dbt is a separate binary —
+    and the parent's deadline must be able to stop all of them at once:
+    with the child's pid as the group id, killpg reaches the whole run.
+    """
+    os.setsid()
+
+
 def _child_setup(trace_context: Mapping[str, str]) -> None:
     """Re-apply the process-wide setup a spawned child starts without."""
+    _child_setup_session()
     config.load()
     # Same re-own-the-root-logger dance as main._configure_logging: importing
     # dlt installs a WARNING-level root handler; force=True takes it back so
@@ -138,6 +152,33 @@ def _source_test_child_main(
         telemetry.flush()
 
 
+def _stop_group(proc: Any) -> None:
+    """SIGTERM the child's process group, SIGKILL it if it lingers.
+
+    Falls back to the child alone if it never became a group leader (the
+    deadline fired before its setsid ran).
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        proc.terminate()
+    proc.join(30)
+    if proc.is_alive():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            proc.kill()
+        proc.join()
+    _reap_group(proc.pid)
+
+
+def _reap_group(pid: int) -> None:
+    """SIGKILL whatever is left of a finished child's process group — a dbt
+    binary whose parent was OOM-killed would otherwise run on unowned."""
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal.SIGKILL)
+
+
 def _supervise[Report: (PipelineRunReport, TransformationRunReport, SourceTestReport)](
     target: Callable[..., None],
     cfg: Any,
@@ -201,17 +242,16 @@ def _supervise[Report: (PipelineRunReport, TransformationRunReport, SourceTestRe
             label,
             timeout,
         )
-        proc.terminate()
-        proc.join(30)
-        if proc.is_alive():
-            proc.kill()
-            proc.join()
+        _stop_group(proc)
         return failed(
             started_at,
             f"{kind} run exceeded the {timeout}s wall-clock limit and was killed",
         )
 
     proc.join()
+    # proc.pid is only None before start(), which already happened above.
+    if proc.pid is not None:
+        _reap_group(proc.pid)
 
     if report is not None:
         return report
@@ -295,15 +335,7 @@ def run_source_test_isolated(test: SourceTest) -> SourceTestReport:
 def run_transformation_isolated(
     cfg: TransformationConfig,
 ) -> TransformationRunReport:
-    """Run one dbt transformation in a short-lived child and return its report.
-
-    Falls back to in-process execution when TRANSFORMATION_SUBPROCESS is
-    disabled.
-    """
-    if not config.TRANSFORMATION_SUBPROCESS:
-        from dlt_worker.transformation_runner import run_transformation
-
-        return run_transformation(cfg)
+    """Run one dbt transformation in a short-lived child and return its report."""
 
     def failed(started_at: datetime, message: str) -> TransformationRunReport:
         return TransformationRunReport(
