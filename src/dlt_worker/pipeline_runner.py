@@ -106,7 +106,10 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
                     table_format="iceberg",
                 )
 
-            rows_loaded = _count_rows(pipeline.last_trace.last_normalize_info)
+            # dlt types last_trace as Optional (dlt 1.31); a completed run()
+            # always leaves one, but a missing trace still just counts zero.
+            trace = pipeline.last_trace
+            rows_loaded = _count_rows(trace.last_normalize_info if trace else None)
 
             logger.info("Pipeline %s completed: %d rows loaded", cfg.name, rows_loaded)
 
