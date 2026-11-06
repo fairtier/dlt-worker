@@ -15,7 +15,11 @@ dependencies = [
     "pyiceberg[pyarrow]>=0.10",
     "requests>=2.32",
     "croniter>=6.0",
-    "duckdb>=1.5.5",
+    # <2 until _stream_batches moves to con.sql(): on 2.0 the cursor's
+    # to_arrow_reader() materialises the whole result before the first batch,
+    # and no test catches it. On 1.5 con.sql() is the one that materialises,
+    # so the code change and this bump must land in the same commit.
+    "duckdb>=1.5.5,<2",
     "pyyaml>=6",
     "pyrage>=1.2",
     "psycopg[binary]>=3.2",

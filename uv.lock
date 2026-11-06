@@ -762,7 +762,7 @@ dev = [
 requires-dist = [
     { name = "croniter", specifier = ">=6.0" },
     { name = "dlt", extras = ["pyiceberg", "filesystem", "s3", "parquet"], specifier = ">=1.5" },
-    { name = "duckdb", specifier = ">=1.5.5" },
+    { name = "duckdb", specifier = ">=1.5.5,<2" },
     { name = "google-auth", specifier = ">=2.35" },
     { name = "opentelemetry-api", specifier = ">=1.30" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.30" },
