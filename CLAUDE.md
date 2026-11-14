@@ -42,7 +42,7 @@ src/dlt_worker/       # Application source
   config.py           # Environment variable configuration
   health.py           # Kubernetes health check server
   telemetry.py        # OpenTelemetry traces + metrics (no-op unless an OTLP endpoint is set)
-  main.py             # Main poll loop with graceful shutdown
+  main.py             # Main poll loop with graceful shutdown; a tick runs pipelines → workflows → transformations (README "Workflows" for the dedupe rules)
   pipeline_files.py   # Files mode: load pipeline definitions from a git checkout
   scheduler_state.py  # Files mode: worker-owned last_run_at (scheduler.json)
   pipeline_runner.py  # dlt pipeline execution (child process only)
