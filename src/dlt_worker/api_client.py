@@ -484,10 +484,39 @@ class APIClient:
             return False
 
 
+# proto3 JSON (Connect's default protojson codec) omits every zero-valued
+# scalar — "" for a string, false for a bool, 0 for a number — and a parser
+# must also accept an explicit null as that zero value. So an absent field IS
+# its zero value: a default of True for an omitted bool turns every false
+# into true. Read scalars through these two helpers, never ``.get(k, True)``.
+
+
+def _str(record: dict[str, Any], key: str) -> str:
+    """A proto3 string field: absent or null is "". Any other non-string
+    raises — the record is malformed, and the caller skips it."""
+    value = record.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise TypeError(f"{key!r} is not a string")
+    return value
+
+
+def _bool(record: dict[str, Any], key: str) -> bool:
+    """A proto3 bool field: absent or null is False (proto3 omits false).
+    Any other non-bool raises, as for ``_str``."""
+    value = record.get(key)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise TypeError(f"{key!r} is not a bool")
+    return value
+
+
 def _parse_source_test(t: dict[str, Any]) -> SourceTest:
     return SourceTest(
         id=t["id"],
-        source_type=t.get("sourceType", ""),
+        source_type=_str(t, "sourceType"),
         source_config=_json_object(t.get("sourceConfig")),
         source_credentials=_json_object(t.get("sourceCredentials")),
     )
@@ -507,7 +536,7 @@ def _json_object(raw: Any) -> dict[str, Any]:
 
 
 def _parse_last_run_at(record: dict[str, Any]) -> datetime | None:
-    last_run_at_str = record.get("lastRunAt", "")
+    last_run_at_str = _str(record, "lastRunAt")
     if not last_run_at_str:
         return None
     return datetime.fromisoformat(last_run_at_str)
@@ -521,31 +550,35 @@ def _parse_trigger_record(p: dict[str, Any]) -> PipelineTrigger:
     rather than rejected: an older control plane must degrade to "triggers
     only", not to "every record is malformed".
     """
-    source_credentials = p.get("sourceCredentials", "{}")
+    source_credentials = _str(p, "sourceCredentials")
     return PipelineTrigger(
         id=p["id"],
         source_credentials=json.loads(source_credentials) if source_credentials else {},
-        trigger_now=p.get("triggerNow", False),
-        pending_run_id=p.get("pendingRunId", ""),
+        trigger_now=_bool(p, "triggerNow"),
+        pending_run_id=_str(p, "pendingRunId"),
         last_run_at=_parse_last_run_at(p),
     )
 
 
 def _parse_transformation_record(t: dict[str, Any]) -> TransformationConfig:
     """Map one API transformation record to a TransformationConfig. Raises on
-    malformed input — the caller skips the record and keeps the rest."""
-    git_credentials = t.get("gitCredentials", "{}")
+    malformed input — the caller skips the record and keeps the rest.
+
+    ``id`` and ``name`` are required: proto3 omits them only when empty, and
+    an empty id or name is a malformed record.
+    """
+    git_credentials = _str(t, "gitCredentials")
     return TransformationConfig(
         id=t["id"],
         name=t["name"],
-        repo_url=t.get("repoUrl", ""),
-        repo_ref=t.get("repoRef") or "main",
+        repo_url=_str(t, "repoUrl"),
+        repo_ref=_str(t, "repoRef") or "main",
         git_credentials=json.loads(git_credentials) if git_credentials else {},
-        schedule=t.get("schedule") or None,
-        trigger_after_pipeline_id=t.get("triggerAfterPipelineId", ""),
-        dbt_selector=t.get("dbtSelector", ""),
-        enabled=t.get("enabled", True),
-        trigger_now=t.get("triggerNow", False),
-        pending_run_id=t.get("pendingRunId", ""),
+        schedule=_str(t, "schedule") or None,
+        trigger_after_pipeline_id=_str(t, "triggerAfterPipelineId"),
+        dbt_selector=_str(t, "dbtSelector"),
+        enabled=_bool(t, "enabled"),
+        trigger_now=_bool(t, "triggerNow"),
+        pending_run_id=_str(t, "pendingRunId"),
         last_run_at=_parse_last_run_at(t),
     )
