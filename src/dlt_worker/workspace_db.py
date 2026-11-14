@@ -22,14 +22,19 @@ off entirely.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, LiteralString
 
 import psycopg
 from opentelemetry.trace import SpanKind
 
 from dlt_worker import config, telemetry
-from dlt_worker.api_client import PipelineRunReport, TransformationRunReport
+from dlt_worker.api_client import (
+    PipelineRunReport,
+    TransformationRunReport,
+    WorkflowRunReport,
+    WorkflowStepRunReport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -306,7 +311,6 @@ class WorkspaceRecorder:
                     count,
                     table,
                 )
-        self._finalize_stale_workflow_runs()
 
     def _workflow_tables_present(self) -> bool:
         """Whether this database has the workflow tables at all.
@@ -314,7 +318,7 @@ class WorkspaceRecorder:
         They exist only where WORKSPACE_DB_URL is the workspace-api's own
         database (and only from its 000006 migration on); a standalone store
         has pipeline_runs/transformation_runs and nothing else. Asking first
-        keeps an hourly sweep from logging a failed UPDATE forever.
+        keeps the startup orphan check from logging a failed SELECT.
         """
         try:
             with psycopg.connect(
@@ -327,62 +331,123 @@ class WorkspaceRecorder:
                 ).fetchone()
         except Exception:
             logger.warning(
-                "Workspace DB: could not check for workflow tables — skipping "
-                "the workflow stale-run sweep",
+                "Workspace DB: could not check for workflow tables — leaving "
+                "orphaned workflow runs to the API's stuck-run sweep",
                 exc_info=True,
             )
             return False
         return bool(row and row[0])
 
-    def _finalize_stale_workflow_runs(self) -> None:
-        """Fail workflow runs a killed worker left ``running``.
+    def orphaned_workflow_runs(self) -> list[WorkflowRunReport]:
+        """Every ``running`` workflow run, as the report that fails it.
 
-        The worker reports workflow runs only to the API (no local-first
-        write), but where this database is the API's own the rows are here,
-        and nothing else would ever finish them. Steps first, keyed on the
-        same predicate, so the run update cannot hide which steps to close:
-        the step that was running fails, the ones that never ran are
-        skipped. Same 2-hour threshold as the other run tables; a sweep only
-        happens between ticks, when this — the only — worker has no
-        workflow in flight.
+        For startup only (``main._finalize_orphaned_workflow_runs`` sends
+        them through ``ReportWorkflowRun``, so the API's failed transition
+        raises the notification, once). Workflow runs are reported to the
+        API only, but where this database is the API's own the rows are
+        here; a worker that has just started has no workflow in flight, and
+        by the invariants of ``finalize_stale_runs`` no other worker does,
+        so every ``running`` row is an orphan — no age margin, which is the
+        point: the run is failed (and its workflow served again) right
+        after the restart, not hours later. The running step fails, steps
+        that never ran are skipped, finished ones are reported as they
+        were. No workflow tables, or no database: none (the API's own
+        stuck-run sweep covers those deployments).
         """
         if not self._workflow_tables_present():
-            return
-        self._execute(
-            """
-            UPDATE workflow_step_runs s
-               SET status = CASE WHEN s.status = 'running'
-                                 THEN 'failed' ELSE 'skipped' END,
-                   completed_at = CASE WHEN s.status = 'running'
-                                       THEN now() ELSE s.completed_at END,
-                   error_message = CASE WHEN s.status = 'running'
-                                        THEN 'worker restarted mid-run'
-                                        ELSE s.error_message END
-              FROM workflow_runs r
-             WHERE s.workflow_run_id = r.id
-               AND s.status IN ('pending', 'running')
-               AND r.status = 'running'
-               AND r.started_at < now() - interval '2 hours'
-            """,
-            (),
-            desc="stale-run sweep (workflow_step_runs)",
-            operation="stale_run_sweep",
-        )
-        count = self._execute(
-            """
-            UPDATE workflow_runs
-               SET status = 'failed',
-                   completed_at = now(),
-                   error_message = 'worker restarted mid-run'
-             WHERE status = 'running'
-               AND started_at < now() - interval '2 hours'
-            """,
-            (),
-            desc="stale-run sweep (workflow_runs)",
-            operation="stale_run_sweep",
-        )
-        if count:
+            return []
+        try:
+            with psycopg.connect(
+                self._dsn, autocommit=True, connect_timeout=_CONNECT_TIMEOUT_SECONDS
+            ) as conn:
+                runs = conn.execute(
+                    """
+                    SELECT id::text, workflow_id::text, trigger, started_at
+                      FROM workflow_runs
+                     WHERE status = 'running'
+                     ORDER BY created_at
+                    """,
+                    (),
+                ).fetchall()
+                if not runs:
+                    return []
+                steps = conn.execute(
+                    """
+                    SELECT workflow_run_id::text, position, kind, ref_id::text,
+                           name, status,
+                           COALESCE(pipeline_run_id::text, ''),
+                           COALESCE(transformation_run_id::text, ''),
+                           started_at, completed_at, error_message
+                      FROM workflow_step_runs
+                     WHERE workflow_run_id = ANY(%s::uuid[])
+                     ORDER BY workflow_run_id, position
+                    """,
+                    ([row[0] for row in runs],),
+                ).fetchall()
+        except Exception:
             logger.warning(
-                "Finalized %d orphaned workflow_runs row(s) from a previous worker",
-                count,
+                "Workspace DB: could not read running workflow runs — leaving "
+                "them to the API's stuck-run sweep",
+                exc_info=True,
             )
+            return []
+        now = datetime.now(UTC)
+        return [
+            _orphan_failure(run, [st for st in steps if st[0] == run[0]], now)
+            for run in runs
+        ]
+
+
+_ORPHANED = "worker restarted mid-run"
+
+
+def _iso(value: datetime | None) -> str:
+    return value.astimezone(UTC).isoformat() if value is not None else ""
+
+
+def _orphan_failure(
+    run: tuple[Any, ...], steps: list[tuple[Any, ...]], now: datetime
+) -> WorkflowRunReport:
+    """The failure report of one orphaned workflow run (rows as selected in
+    ``orphaned_workflow_runs``)."""
+    run_id, workflow_id, trigger, started_at = run
+    step_runs: list[WorkflowStepRunReport] = []
+    interrupted: WorkflowStepRunReport | None = None
+    for _, position, kind, ref_id, name, status, p_run, t_run, s_at, c_at, err in steps:
+        step = WorkflowStepRunReport(
+            position=position,
+            kind=kind,
+            ref_id=ref_id,
+            name=name,
+            status=status,
+            pipeline_run_id=p_run,
+            transformation_run_id=t_run,
+            started_at=_iso(s_at),
+            completed_at=_iso(c_at),
+            error_message=err,
+        )
+        if status == "running":
+            step.status = "failed"
+            step.completed_at = now.isoformat()
+            step.error_message = f"{_ORPHANED} (the worker stopped while this step ran)"
+            interrupted = interrupted or step
+        elif status == "pending":
+            step.status = "skipped"
+        step_runs.append(step)
+    if interrupted is not None:
+        message = (
+            f"step {interrupted.position + 1} ({interrupted.kind} "
+            f"{interrupted.name!r}) failed: {_ORPHANED}"
+        )
+    else:
+        message = f"{_ORPHANED}, between steps"
+    return WorkflowRunReport(
+        run_id=run_id,
+        workflow_id=workflow_id,
+        status="failed",
+        trigger=trigger,
+        started_at=_iso(started_at),
+        completed_at=now.isoformat(),
+        error_message=message,
+        step_runs=step_runs,
+    )

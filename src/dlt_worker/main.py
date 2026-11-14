@@ -272,6 +272,8 @@ def run() -> None:
             "tenant-bound auth"
         )
 
+    _finalize_orphaned_workflow_runs(client)
+
     start_health_server(client, config.HEALTHZ_PORT, config.PIPELINES_DIR)
 
     logger.info(
@@ -922,6 +924,41 @@ def _flush_workflow_reports(client: APIClient) -> None:
             )
         else:
             _unsent_workflow_reports[workflow_id] = (report, attempts)
+
+
+def _finalize_orphaned_workflow_runs(client: APIClient) -> None:
+    """At startup: fail the workflow runs a killed worker left ``running``.
+
+    Through ``ReportWorkflowRun``, not SQL, so the API's transition into
+    ``failed`` raises the one failure notification (and a run the API's own
+    stuck-run sweep already failed is no longer ``running``, so it is not
+    found here: no second notification). A report that does not land waits
+    in ``_unsent_workflow_reports`` like any undelivered final report — the
+    next ticks retry it — and if it never lands, the API's sweep fails the
+    run and notifies. Needs the workspace database to find the runs
+    (``WorkspaceRecorder.orphaned_workflow_runs``); without one, the API's
+    sweep is the only path.
+    """
+    if _recorder is None:
+        return
+    for report in _recorder.orphaned_workflow_runs():
+        result = _send_workflow_report(client, report)
+        if result:
+            logger.warning(
+                "Failed workflow run %s (workflow %s), left running by a "
+                "previous worker",
+                report.run_id,
+                report.workflow_id,
+            )
+        elif result is ReportResult.REJECTED:
+            _report_rejected(report)
+        else:
+            _unsent_workflow_reports.setdefault(report.workflow_id, (report, 1))
+            logger.error(
+                "Could not report orphaned workflow run %s as failed; "
+                "retrying next tick",
+                report.run_id,
+            )
 
 
 def _run_due_workflows(

@@ -942,3 +942,76 @@ class TestWorkflowTimes:
             (self._at(25).isoformat(), self._at(35).isoformat()),
         ]
         assert main._workflow_started_at["w1"] == self._at(20)
+
+
+class TestFinalizeOrphanedWorkflowRuns:
+    """At startup, the workflow runs a killed worker left running are failed
+    through ReportWorkflowRun — the API's failed transition is what raises
+    the notification, once."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self) -> Iterator[None]:
+        main._unsent_workflow_reports.clear()
+        yield
+        main._unsent_workflow_reports.clear()
+        main._recorder = None
+
+    @staticmethod
+    def _orphan(run_id: str = "r1", workflow_id: str = "w1") -> WorkflowRunReport:
+        return WorkflowRunReport(
+            run_id=run_id,
+            workflow_id=workflow_id,
+            status="failed",
+            trigger="schedule",
+            started_at="2026-01-01T00:00:00+00:00",
+            error_message="worker restarted mid-run, between steps",
+        )
+
+    def test_orphans_are_reported_failed(self) -> None:
+        main._recorder = MagicMock()
+        main._recorder.orphaned_workflow_runs.return_value = [
+            self._orphan(),
+            self._orphan("r2", "w2"),
+        ]
+        client = MagicMock()
+        client.report_workflow_run.return_value = ReportResult.DELIVERED
+
+        main._finalize_orphaned_workflow_runs(client)
+
+        sent = [c[0][0] for c in client.report_workflow_run.call_args_list]
+        assert [(r.run_id, r.status) for r in sent] == [
+            ("r1", "failed"),
+            ("r2", "failed"),
+        ]
+        assert main._unsent_workflow_reports == {}
+
+    def test_an_unreachable_api_retries_the_report_next_ticks(self) -> None:
+        """Not a direct SQL write: that would fail the run without the
+        notification. The report waits in the unsent queue (which also holds
+        the workflow back) and, should it never land, the API's own stuck-run
+        sweep fails the run and notifies."""
+        main._recorder = MagicMock()
+        orphan = self._orphan()
+        main._recorder.orphaned_workflow_runs.return_value = [orphan]
+        client = MagicMock()
+        client.report_workflow_run.return_value = ReportResult.TRANSIENT
+
+        main._finalize_orphaned_workflow_runs(client)
+
+        assert main._unsent_workflow_reports == {"w1": (orphan, 1)}
+
+    def test_a_rejected_orphan_is_dropped(self) -> None:
+        main._recorder = MagicMock()
+        main._recorder.orphaned_workflow_runs.return_value = [self._orphan()]
+        client = MagicMock()
+        client.report_workflow_run.return_value = ReportResult.REJECTED
+
+        main._finalize_orphaned_workflow_runs(client)
+
+        assert main._unsent_workflow_reports == {}
+
+    def test_no_recorder_no_orphan_check(self) -> None:
+        main._recorder = None
+        client = MagicMock()
+        main._finalize_orphaned_workflow_runs(client)
+        client.report_workflow_run.assert_not_called()
