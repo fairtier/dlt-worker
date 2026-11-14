@@ -43,6 +43,52 @@ def _count_rows(normalize_info: Any) -> int:
     return rows
 
 
+def _count_resumed_rows(load_info: Any, normalize_info: Any) -> int:
+    """Count rows in loaded packages that this run's normalize step did not see.
+
+    When a previous run died after normalize (an OOM kill, the deadline kill),
+    dlt's ``run()`` loads the pending package and returns without extracting,
+    so the trace has a load step and no normalize metrics for that package.
+    Its rows are counted from the package's completed job files instead.
+    Packages normalized in this run are skipped: ``_count_rows`` has them.
+    """
+    if not load_info:
+        return 0
+    normalized = set(normalize_info.metrics) if normalize_info else set()
+    rows = 0
+    for package in load_info.load_packages:
+        if package.load_id in normalized:
+            continue
+        for job in package.jobs.get("completed_jobs", []):
+            table_name = job.job_file_info.table_name
+            if table_name.startswith("_dlt_"):
+                continue
+            rows += _count_job_file_rows(job.file_path, job.job_file_info.file_format)
+    return rows
+
+
+def _count_job_file_rows(path: str, file_format: str) -> int:
+    """Rows in one normalized job file; 0 (logged) if it cannot be read.
+
+    Iceberg tables are written from parquet; ``reference`` jobs only point at
+    those files and carry no rows of their own. A missing file (dlt's
+    ``delete_completed_jobs``) undercounts rather than failing a loaded run.
+    """
+    try:
+        if file_format == "parquet":
+            import pyarrow.parquet as pq
+
+            return pq.ParquetFile(path).metadata.num_rows
+        if file_format == "jsonl":
+            from dlt.common.storages import FileStorage
+
+            with FileStorage.open_zipsafe_ro(path) as f:
+                return sum(1 for line in f if line.strip())
+    except OSError as exc:
+        logger.warning("Could not count rows in %s: %s", path, exc)
+    return 0
+
+
 def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
     """Build and run a dlt pipeline from the given config. Returns a run report."""
     started_at = datetime.now(UTC)
@@ -109,7 +155,11 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
             # dlt types last_trace as Optional (dlt 1.31); a completed run()
             # always leaves one, but a missing trace still just counts zero.
             trace = pipeline.last_trace
-            rows_loaded = _count_rows(trace.last_normalize_info if trace else None)
+            normalize_info = trace.last_normalize_info if trace else None
+            load_info = trace.last_load_info if trace else None
+            rows_loaded = _count_rows(normalize_info) + _count_resumed_rows(
+                load_info, normalize_info
+            )
 
             logger.info("Pipeline %s completed: %d rows loaded", cfg.name, rows_loaded)
 

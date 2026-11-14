@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
@@ -1224,6 +1225,86 @@ class TestRunPipelineErrorScrubbing:
         assert report.status == "failed"
         assert "hunter22" not in report.error_message
         assert "***" in report.error_message
+
+
+class TestRunPipelineRowsLoaded:
+    """rows_loaded against real dlt, local filesystem destination, Iceberg.
+
+    When a previous run died after normalize, dlt's ``run()`` loads the
+    pending package and RETURNS without extracting — so this run's trace
+    carries a load step and no normalize step, and counting rows from the
+    normalize metrics alone reported 0 for a run that loaded every row of
+    the package.
+    """
+
+    _NAME = "rows-loaded-test"
+
+    @pytest.fixture(autouse=True)
+    def _local_destination(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A test that ran config.load() in-process must not point this one
+        # at a REST catalog or an S3 bucket.
+        for key in list(os.environ):
+            if key.startswith(("DESTINATION__", "ICEBERG_CATALOG__")):
+                monkeypatch.delenv(key)
+        monkeypatch.setenv(
+            "DESTINATION__FILESYSTEM__BUCKET_URL", (tmp_path / "bucket").as_uri()
+        )
+        monkeypatch.setattr(config, "DLT_STATE_DIR", str(tmp_path / "state"))
+
+    def _pipeline(self) -> Any:
+        return dlt.pipeline(
+            pipeline_name=self._NAME,
+            destination="filesystem",
+            dataset_name="raw",
+            pipelines_dir=config.DLT_STATE_DIR,
+        )
+
+    @staticmethod
+    def _rows(n: int, start: int = 0) -> Any:
+        return dlt.resource([{"id": i} for i in range(start, start + n)], name="items")
+
+    def _run(self, source: Any) -> Any:
+        cfg = _make_config(name=self._NAME, source_type="test")
+        with patch("dlt_worker.pipeline_runner._build_source", return_value=source):
+            return run_pipeline(cfg)
+
+    def test_fresh_run_counts_normalized_rows(self) -> None:
+        report = self._run(self._rows(5))
+        assert report.status == "success", report.error_message
+        assert report.rows_loaded == 5
+
+    def test_pending_only_resume_counts_the_pending_package(self) -> None:
+        # An earlier run that loaded fine (so the destination is initialised
+        # and dlt keeps the local state instead of wiping it) ...
+        assert self._run(self._rows(3)).rows_loaded == 3
+        # ... then one that got as far as normalize and died before loading.
+        p = self._pipeline()
+        p.extract(self._rows(7, start=100), table_format="iceberg")
+        p.normalize()
+        assert len(p.list_normalized_load_packages()) == 1
+
+        report = self._run(self._rows(1, start=1000))
+
+        assert report.status == "success", report.error_message
+        assert self._pipeline().list_normalized_load_packages() == []
+        # The pending package's 7 rows — not 0, and not the 1 row the source
+        # offered this time, which dlt does not extract on a resume.
+        assert report.rows_loaded == 7
+
+    def test_extracted_only_resume_is_not_counted_twice(self) -> None:
+        """A package that died before normalize gets normalized by this run,
+        so the normalize metrics already have it."""
+        assert self._run(self._rows(3)).rows_loaded == 3
+        p = self._pipeline()
+        p.extract(self._rows(7, start=100), table_format="iceberg")
+        assert len(p.list_extracted_load_packages()) == 1
+
+        report = self._run(self._rows(1, start=1000))
+
+        assert report.status == "success", report.error_message
+        assert report.rows_loaded == 7
 
 
 class TestPublicHttpFilesystemSource:
