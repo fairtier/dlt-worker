@@ -12,7 +12,7 @@ import signal
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,6 +26,10 @@ from dlt_worker.api_client import (
     PipelineTrigger,
     TransformationConfig,
     TransformationRunReport,
+    WorkflowConfig,
+    WorkflowRunReport,
+    WorkflowStepConfig,
+    WorkflowStepRunReport,
 )
 from dlt_worker.health import start_health_server
 from dlt_worker.pipeline_files import load_pipeline_configs
@@ -78,6 +82,19 @@ _creds_cache: dict[str, dict[str, Any]] = {}
 # at most one immediate re-fire.
 _last_failure_at: dict[str, datetime] = {}
 
+# Workflows: start time of the last run this process began, per workflow id.
+# The server's last_run_at is the real cron baseline (it covers failures and
+# restarts); this only covers the window in which the start report has not
+# landed, so a flapping API cannot make a scheduled workflow fire every tick.
+_workflow_started_at: dict[str, datetime] = {}
+
+# Workflows: final reports the API did not take, per workflow id, with the
+# number of delivery attempts so far. Flushed before every GetWorkflowConfigs
+# — until one lands, the server still shows the run as running (or a manual
+# trigger as pending), so its workflow is held back rather than re-run.
+_unsent_workflow_reports: dict[str, tuple[WorkflowRunReport, int]] = {}
+_WORKFLOW_REPORT_MAX_ATTEMPTS = 10
+
 
 @dataclass
 class _RunOutcome:
@@ -98,7 +115,8 @@ class _RunOutcome:
 class _Tick:
     """State shared by the phases of one poll tick.
 
-    Pipelines run first, then transformations; each phase leaves behind what the later ones need to look targets up and to avoid
+    Pipelines run first, then workflows, then transformations; each phase
+    leaves behind what the later ones need to look targets up and to avoid
     running anything twice in one tick.
     """
 
@@ -337,10 +355,19 @@ def _tick(client: APIClient) -> None:
 
 
 def _poll_and_run(client: APIClient) -> None:
-    """One tick: pipelines, then transformations, sharing one _Tick."""
+    """One tick: pipelines, then workflows, then transformations.
+
+    Workflows sit in the middle on purpose. After pipelines, so a step whose
+    pipeline already ran by its own schedule this tick takes that run's
+    outcome instead of loading the same data twice. Before transformations,
+    so a pipeline a workflow ran still chains its trigger_after_pipeline
+    transformations this tick, and a transformation a workflow already ran is
+    not run again by its own schedule or chain.
+    """
     tick = _Tick()
     _run_due_pipelines(client, tick)
     transformations = _fetch_transformation_configs(client)
+    _run_due_workflows(client, tick, transformations)
     _run_due_transformations(client, tick.succeeded, transformations, tick)
 
 
@@ -765,6 +792,402 @@ def _execute_transformation(
             f"transformation {report.transformation_id} (run_id={report.run_id})",
         )
     return report
+
+
+# --- workflows ---
+#
+# A workflow is a linear list of steps, each an existing pipeline or
+# transformation. The worker does not get a second way to run either: a step
+# goes through _execute_pipeline / _execute_transformation, so isolation,
+# retries, local-first recording and the run's own report are exactly those
+# of a standalone run. The workflow run itself is reported with
+# ReportWorkflowRun — an idempotent upsert carrying every step every time —
+# after each transition.
+
+
+def _workflow_due(wf: WorkflowConfig, now: datetime) -> str | None:
+    """The trigger that makes a workflow due ("manual" / "schedule"), or None.
+
+    A Run-now outranks ``enabled``, as for pipelines: disabling stops the
+    schedule, not a run a person asked for (the server serves a disabled
+    workflow only when it has a pending run). The cron baseline is the
+    server's last_run_at — the start of the last run whatever its outcome,
+    so a failing workflow waits for its next slot like a successful one.
+    """
+    if wf.trigger_now:
+        return "manual"
+    if not wf.enabled or not wf.schedule:
+        return None
+    if not croniter.is_valid(wf.schedule):
+        logger.warning(
+            "Workflow %s has an invalid cron schedule %r — skipping",
+            wf.name,
+            wf.schedule,
+        )
+        return None
+
+    baseline = wf.last_run_at
+    local = _workflow_started_at.get(wf.id)
+    if local is not None and (baseline is None or local > baseline):
+        baseline = local
+    if baseline is None:
+        return "schedule"  # never run before
+    try:
+        next_run = croniter(wf.schedule, baseline).get_next(datetime)
+    except ValueError:
+        logger.warning(
+            "Workflow %s: cron schedule %r failed to evaluate — skipping",
+            wf.name,
+            wf.schedule,
+        )
+        return None
+    return "schedule" if now >= next_run else None
+
+
+def _flush_workflow_reports(client: APIClient) -> None:
+    """Re-send final workflow reports an earlier tick could not deliver.
+
+    Bounded: a report the API keeps refusing (the workflow was deleted, say)
+    is dropped after _WORKFLOW_REPORT_MAX_ATTEMPTS ticks rather than holding
+    its workflow back forever.
+    """
+    for workflow_id, (report, attempts) in list(_unsent_workflow_reports.items()):
+        if client.report_workflow_run(report):
+            del _unsent_workflow_reports[workflow_id]
+            continue
+        attempts += 1
+        if attempts >= _WORKFLOW_REPORT_MAX_ATTEMPTS:
+            del _unsent_workflow_reports[workflow_id]
+            telemetry.add_event(
+                "workflow.report_dropped",
+                {telemetry.ATTR_WORKFLOW_ID: workflow_id},
+            )
+            logger.error(
+                "Giving up on the final report of workflow run %s after %d attempts",
+                report.run_id,
+                attempts,
+            )
+        else:
+            _unsent_workflow_reports[workflow_id] = (report, attempts)
+
+
+def _run_due_workflows(
+    client: APIClient,
+    tick: _Tick,
+    transformations: list[TransformationConfig],
+) -> None:
+    """Run every due workflow, one after the other, each step in order.
+
+    Never raises: a control plane that predates workflows answers "none"
+    (get_workflow_configs), and one broken workflow must not abandon the
+    others or the transformations that follow.
+    """
+    try:
+        _flush_workflow_reports(client)
+        workflows = client.get_workflow_configs()
+    except Exception:
+        logger.warning("Failed to fetch workflow configs", exc_info=True)
+        return
+    if not workflows:
+        return
+
+    transformations_by_id = {t.id: t for t in transformations}
+    for wf in workflows:
+        if _shutdown:
+            break
+        try:
+            if wf.id in _unsent_workflow_reports:
+                # The API has not taken the last run's outcome, so this
+                # config may still show it pending — running now could run
+                # one Run-now twice.
+                logger.warning(
+                    "Workflow %s: last run's final report not delivered yet — "
+                    "holding the workflow back",
+                    wf.name,
+                )
+                continue
+            trigger = _workflow_due(wf, datetime.now(UTC))
+            if trigger is None:
+                continue
+            _execute_workflow(wf, trigger, tick, transformations_by_id, client)
+        except Exception as exc:
+            _tick_error(wf.name, exc)
+            logger.exception(
+                "Workflow %s: tick processing failed — continuing with the rest",
+                wf.name,
+            )
+
+
+def _iso_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _send_workflow_report(client: APIClient, report: WorkflowRunReport) -> bool:
+    """One best-effort attempt. A miss is not retried here: the next
+    transition re-sends the whole run, and the final one falls back to
+    _unsent_workflow_reports."""
+    ok = client.report_workflow_run(report)
+    if not ok:
+        telemetry.add_event(
+            "workflow.report_failed", {telemetry.ATTR_RUN_ID: report.run_id}
+        )
+    return ok
+
+
+def _execute_workflow(
+    wf: WorkflowConfig,
+    trigger: str,
+    tick: _Tick,
+    transformations_by_id: dict[str, TransformationConfig],
+    client: APIClient,
+) -> WorkflowRunReport:
+    """Run one due workflow to its end and report it."""
+    # The pending id is the run the person queued; reporting it as running
+    # is also what clears trigger_now server-side.
+    run_id = wf.pending_run_id or str(uuid.uuid4())
+    started = datetime.now(UTC)
+    started_mono = time.monotonic()
+    _workflow_started_at[wf.id] = started
+    logger.info("Running workflow: %s (%d steps, %s)", wf.name, len(wf.steps), trigger)
+
+    report = WorkflowRunReport(
+        run_id=run_id,
+        workflow_id=wf.id,
+        status="running",
+        trigger=trigger,
+        started_at=started.isoformat(),
+        step_runs=[
+            WorkflowStepRunReport(
+                position=s.position, kind=s.kind, ref_id=s.ref_id, name=s.name
+            )
+            for s in wf.steps
+        ],
+    )
+
+    with telemetry.tracer.start_as_current_span(
+        "dlt_worker.workflow.run",
+        attributes={
+            telemetry.ATTR_WORKFLOW_ID: wf.id,
+            telemetry.ATTR_WORKFLOW_NAME: wf.name,
+            telemetry.ATTR_TRIGGER: trigger,
+            telemetry.ATTR_RUN_ID: run_id,
+        },
+    ) as span:
+        _send_workflow_report(client, report)
+
+        for step, step_run in zip(wf.steps, report.step_runs, strict=True):
+            if _shutdown:
+                report.status = "failed"
+                report.error_message = (
+                    f"worker shut down before step {step.position + 1} "
+                    f"({step.kind} {step.name!r}) ran"
+                )
+                break
+
+            step_run.status = "running"
+            step_run.started_at = _iso_now()
+            _send_workflow_report(client, report)
+
+            with telemetry.tracer.start_as_current_span(
+                "dlt_worker.workflow.step",
+                attributes={
+                    telemetry.ATTR_WORKFLOW_ID: wf.id,
+                    telemetry.ATTR_STEP_POSITION: step.position,
+                    telemetry.ATTR_STEP_KIND: step.kind,
+                },
+            ) as step_span:
+                try:
+                    _run_workflow_step(
+                        step, step_run, tick, transformations_by_id, client
+                    )
+                except Exception as exc:
+                    # Type only, never the message (it can quote anything).
+                    step_run.status = "failed"
+                    step_run.error_message = f"internal error ({type(exc).__name__})"
+                    logger.exception(
+                        "Workflow %s: step %d crashed", wf.name, step.position + 1
+                    )
+                step_span.set_attribute(telemetry.ATTR_STATUS, step_run.status)
+                if step_run.status != "success":
+                    step_span.set_status(telemetry.error_status(step_run.error_message))
+            step_run.completed_at = step_run.completed_at or _iso_now()
+
+            if step_run.status != "success":
+                report.status = "failed"
+                report.error_message = (
+                    f"step {step.position + 1} ({step.kind} {step.name!r}) "
+                    f"failed: {step_run.error_message or 'no error message'}"
+                )
+                break
+            _send_workflow_report(client, report)
+        else:
+            report.status = "success"
+
+        # Whatever did not get to run is skipped — the first failure (or a
+        # shutdown) stops the workflow.
+        for step_run in report.step_runs:
+            if step_run.status == "pending":
+                step_run.status = "skipped"
+        report.completed_at = _iso_now()
+
+        span.set_attribute(telemetry.ATTR_STATUS, report.status)
+        if report.status != "success":
+            span.set_status(telemetry.error_status(report.error_message))
+        attrs = {
+            telemetry.ATTR_WORKFLOW_NAME: wf.name,
+            telemetry.ATTR_STATUS: report.status,
+            telemetry.ATTR_TRIGGER: trigger,
+        }
+        telemetry.workflow_runs.add(1, attrs)
+        telemetry.workflow_run_duration.record(time.monotonic() - started_mono, attrs)
+
+        if not _send_workflow_report(client, report):
+            _unsent_workflow_reports[wf.id] = (report, 1)
+            logger.error(
+                "Failed to report the outcome of workflow run %s; retrying next tick",
+                run_id,
+            )
+
+    logger.info("Workflow %s: %s", wf.name, report.status)
+    return report
+
+
+def _fail_step(step_run: WorkflowStepRunReport, message: str) -> None:
+    step_run.status = "failed"
+    step_run.error_message = message
+
+
+def _reuse_outcome(
+    step: WorkflowStepConfig, step_run: WorkflowStepRunReport, prior: _RunOutcome
+) -> None:
+    """Satisfy a step with a run its target already made this tick.
+
+    The target ran minutes ago by its own schedule, trigger or another
+    workflow; running it again would load (or build) the same thing twice.
+    A failure is taken over too — that run already exhausted its retries.
+    """
+    telemetry.add_event(
+        "workflow.step_reused_run",
+        {
+            telemetry.ATTR_STEP_POSITION: step.position,
+            telemetry.ATTR_STEP_KIND: step.kind,
+            telemetry.ATTR_RUN_ID: prior.run_id,
+        },
+    )
+    logger.info(
+        "Workflow step %d (%s %s) already ran this tick (run %s, %s) — taking that run",
+        step.position + 1,
+        step.kind,
+        step.name,
+        prior.run_id,
+        prior.status,
+    )
+    if step.kind == "pipeline":
+        step_run.pipeline_run_id = prior.run_id
+    else:
+        step_run.transformation_run_id = prior.run_id
+    step_run.status = "success" if prior.status == "success" else "failed"
+    if prior.status != "success":
+        step_run.error_message = (
+            f"its run earlier in this tick failed: {prior.error_message}"
+        )
+    step_run.started_at = prior.started_at or step_run.started_at
+    step_run.completed_at = prior.completed_at
+
+
+def _run_workflow_step(
+    step: WorkflowStepConfig,
+    step_run: WorkflowStepRunReport,
+    tick: _Tick,
+    transformations_by_id: dict[str, TransformationConfig],
+    client: APIClient,
+) -> None:
+    """Run one step and leave its outcome on ``step_run``."""
+    if step.kind == "pipeline":
+        _run_pipeline_step(step, step_run, tick, client)
+    elif step.kind == "transformation":
+        _run_transformation_step(step, step_run, tick, transformations_by_id, client)
+    else:
+        _fail_step(step_run, f"unknown step kind {step.kind!r}")
+
+
+def _run_pipeline_step(
+    step: WorkflowStepConfig,
+    step_run: WorkflowStepRunReport,
+    tick: _Tick,
+    client: APIClient,
+) -> None:
+    if not step.ref_enabled:
+        _fail_step(step_run, "pipeline is disabled")
+        return
+    prior = tick.pipeline_runs.get(step.ref_id)
+    if prior is not None:
+        _reuse_outcome(step, step_run, prior)
+        return
+    found = tick.pipelines.get(step.ref_id)
+    if found is None:
+        _fail_step(
+            step_run,
+            "pipeline not found: no definition in the pipelines checkout "
+            "(not mirrored yet, deleted, or its file does not load)",
+        )
+        return
+    if not found.enabled:
+        _fail_step(step_run, "pipeline is disabled (in its definition file)")
+        return
+    # A copy: this tick's config object carries the pipeline's own trigger
+    # fields, and a step is not the pipeline's Run-now.
+    cfg = replace(found, trigger_now=False, pending_run_id="")
+    reason = _resolve_credentials(cfg, tick.polled)
+    if reason is not None:
+        _fail_step(step_run, f"pipeline cannot run: {_CREDENTIAL_SKIP_REASONS[reason]}")
+        return
+
+    started = datetime.now(UTC)
+    report, run_id = _execute_pipeline(cfg, started, client, trigger="workflow")
+    _record_pipeline_outcome(cfg, report, run_id, started, tick)
+    step_run.pipeline_run_id = run_id
+    if report is not None and report.status == "success":
+        step_run.status = "success"
+    else:
+        _fail_step(step_run, report.error_message if report is not None else "")
+    if report is not None:
+        step_run.completed_at = report.completed_at
+
+
+def _run_transformation_step(
+    step: WorkflowStepConfig,
+    step_run: WorkflowStepRunReport,
+    tick: _Tick,
+    transformations_by_id: dict[str, TransformationConfig],
+    client: APIClient,
+) -> None:
+    if not step.ref_enabled:
+        _fail_step(step_run, "transformation is disabled")
+        return
+    prior = tick.transformation_runs.get(step.ref_id)
+    if prior is not None:
+        _reuse_outcome(step, step_run, prior)
+        return
+    cfg = transformations_by_id.get(step.ref_id)
+    if cfg is None:
+        _fail_step(
+            step_run,
+            "transformation not found in this tick's transformation configs",
+        )
+        return
+
+    # The config as served, pending_run_id included: if the transformation
+    # also has a Run-now queued, this run is that run — one run satisfies
+    # both, and the transformation phase after this one skips it.
+    report = _execute_transformation(cfg, datetime.now(UTC), client, "workflow")
+    tick.transformation_runs[cfg.id] = _transformation_outcome(report)
+    step_run.transformation_run_id = report.run_id
+    if report.status == "success":
+        step_run.status = "success"
+    else:
+        _fail_step(step_run, report.error_message)
+    step_run.completed_at = report.completed_at
 
 
 # Fields a retry's config re-read must NOT take from the checkout: the

@@ -74,7 +74,13 @@ ATTR_WRITE_DISPOSITION = "dlt_worker.pipeline.write_disposition"
 ATTR_TRANSFORMATION_ID = "dlt_worker.transformation.id"
 ATTR_TRANSFORMATION_NAME = "dlt_worker.transformation.name"
 ATTR_RUN_ID = "dlt_worker.run.id"
-ATTR_TRIGGER = "dlt_worker.run.trigger"  # "manual" | "schedule" | "chained"
+ATTR_WORKFLOW_ID = "dlt_worker.workflow.id"
+ATTR_WORKFLOW_NAME = "dlt_worker.workflow.name"
+ATTR_STEP_POSITION = "dlt_worker.workflow.step.position"
+ATTR_STEP_KIND = "dlt_worker.workflow.step.kind"  # "pipeline" | "transformation"
+# "manual" | "schedule" | "chained" | "workflow" (a run made by a workflow step;
+# the workflow run itself carries "manual" | "schedule")
+ATTR_TRIGGER = "dlt_worker.run.trigger"
 ATTR_STATUS = "dlt_worker.run.status"  # "success" | "failed"
 ATTR_ATTEMPT = "dlt_worker.run.attempt"
 ATTR_ROWS = "dlt_worker.run.rows_loaded"
@@ -127,6 +133,16 @@ transformation_nodes = _meter.create_counter(
     "dlt_worker.transformation.nodes",
     unit="{node}",
     description="dbt nodes executed, by kind and outcome",
+)
+workflow_runs = _meter.create_counter(
+    "dlt_worker.workflow.runs",
+    unit="{run}",
+    description="Finished workflow runs by outcome",
+)
+workflow_run_duration = _meter.create_histogram(
+    "dlt_worker.workflow.run.duration",
+    unit="s",
+    description="Wall-clock duration of a workflow run, all steps included",
 )
 api_requests = _meter.create_counter(
     "dlt_worker.api.requests",
