@@ -12,7 +12,7 @@ import signal
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import fields
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,6 +25,7 @@ from dlt_worker.api_client import (
     PipelineRunReport,
     PipelineTrigger,
     TransformationConfig,
+    TransformationRunReport,
 )
 from dlt_worker.health import start_health_server
 from dlt_worker.pipeline_files import load_pipeline_configs
@@ -76,6 +77,39 @@ _creds_cache: dict[str, dict[str, Any]] = {}
 # Cleared on success. In-memory only: a restart forgets failures, costing
 # at most one immediate re-fire.
 _last_failure_at: dict[str, datetime] = {}
+
+
+@dataclass
+class _RunOutcome:
+    """What one pipeline or transformation run in this tick ended as.
+
+    Kept per tick so a workflow step whose target already ran in the same
+    tick takes that run's outcome instead of running it a second time.
+    """
+
+    run_id: str
+    status: str
+    error_message: str = ""
+    started_at: str = ""
+    completed_at: str = ""
+
+
+@dataclass
+class _Tick:
+    """State shared by the phases of one poll tick.
+
+    Pipelines run first, then transformations; each phase leaves behind what the later ones need to look targets up and to avoid
+    running anything twice in one tick.
+    """
+
+    now: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # Files mode definitions of this tick, by pipeline id.
+    pipelines: dict[str, PipelineConfig] = field(default_factory=dict)
+    polled: list[PipelineTrigger] | None = None
+    state: SchedulerState | None = None
+    succeeded: set[str] = field(default_factory=set)
+    pipeline_runs: dict[str, _RunOutcome] = field(default_factory=dict)
+    transformation_runs: dict[str, _RunOutcome] = field(default_factory=dict)
 
 
 def _configure_logging() -> None:
@@ -303,21 +337,27 @@ def _tick(client: APIClient) -> None:
 
 
 def _poll_and_run(client: APIClient) -> None:
-    succeeded_pipelines = _run_due_pipelines(client)
-    _run_due_transformations(client, succeeded_pipelines)
+    """One tick: pipelines, then transformations, sharing one _Tick."""
+    tick = _Tick()
+    _run_due_pipelines(client, tick)
+    transformations = _fetch_transformation_configs(client)
+    _run_due_transformations(client, tick.succeeded, transformations, tick)
 
 
 def _execute_pipeline(
-    cfg: PipelineConfig, now: datetime, client: APIClient
-) -> PipelineRunReport | None:
-    """Run one due pipeline and return its final report."""
+    cfg: PipelineConfig,
+    now: datetime,
+    client: APIClient,
+    trigger: str | None = None,
+) -> tuple[PipelineRunReport | None, str]:
+    """Run one due pipeline; returns its final report and run id."""
     logger.info("Running pipeline: %s (%s)", cfg.name, cfg.source_type)
 
     # Local-first: the run exists in the workspace database before it
     # starts — under the central pending id when there is one (one run,
     # one identity in both stores), else a worker-generated UUID.
     local_run_id = cfg.pending_run_id or str(uuid.uuid4())
-    trigger = telemetry.trigger_kind(cfg)
+    trigger = trigger or telemetry.trigger_kind(cfg)
     started = time.monotonic()
 
     with telemetry.tracer.start_as_current_span(
@@ -373,10 +413,10 @@ def _execute_pipeline(
             telemetry.record_pipeline_run(
                 cfg, report, time.monotonic() - started, trigger
             )
-    return report
+    return report, local_run_id
 
 
-def _run_due_pipelines(client: APIClient) -> set[str]:
+def _run_due_pipelines(client: APIClient, tick: _Tick | None = None) -> set[str]:
     """Run all due pipelines. Returns the ids of pipelines that succeeded.
 
     Definitions and schedules come from the pipelines checkout; the poll is
@@ -389,14 +429,21 @@ def _run_due_pipelines(client: APIClient) -> set[str]:
     which the API served whole definitions and PIPELINES_DIR was optional,
     was retired in the pipelines-as-files Phase 2.5 cleanup along with the
     definition fields it read.
+
+    ``tick`` (optional) receives what the later phases of the same tick need:
+    the definitions, the poll, the scheduler state and every run's outcome.
     """
-    succeeded: set[str] = set()
+    if tick is None:
+        tick = _Tick()
 
     files = load_pipeline_configs(config.PIPELINES_DIR, config.AGE_KEY_FILE)
     file_ids = {c.id for c in files.configs}
     state = SchedulerState.load(config.DLT_STATE_DIR)
 
     polled = client.try_get_pipeline_triggers()
+    tick.pipelines = {c.id: c for c in files.configs}
+    tick.polled = polled
+    tick.state = state
     by_id: dict[str, PipelineTrigger] = {}
     if polled is None:
         telemetry.add_event("central.unreachable")
@@ -429,14 +476,12 @@ def _run_due_pipelines(client: APIClient) -> set[str]:
                 if stale_id not in file_ids and stale_id not in by_id:
                     del _creds_cache[stale_id]
 
-    now = datetime.now(UTC)
-
     for cfg in files.configs:
         if _shutdown:
             break
         # One broken config must not abandon the rest of the tick.
         try:
-            _process_file_pipeline(cfg, by_id, polled, state, now, client, succeeded)
+            _process_file_pipeline(cfg, by_id, tick, client)
         except Exception as exc:
             _tick_error(cfg.name, exc)
             logger.exception(
@@ -444,7 +489,7 @@ def _run_due_pipelines(client: APIClient) -> set[str]:
                 cfg.name,
             )
 
-    return succeeded
+    return tick.succeeded
 
 
 def _tick_error(name: str, exc: Exception) -> None:
@@ -476,16 +521,41 @@ def _skipped(cfg: PipelineConfig, reason: str) -> None:
     )
 
 
+def _resolve_credentials(
+    cfg: PipelineConfig, polled: list[PipelineTrigger] | None
+) -> str | None:
+    """Give ``cfg`` the credentials it runs with; returns why it cannot run,
+    or None when it can.
+
+    Precedence: the checkout's .credentials.age file (git truth, no
+    fallback), then the in-memory poll cache, else nothing.
+    """
+    if cfg.has_file_credentials:
+        # Decrypted from the checkout — git truth wins; no fallback.
+        return None
+    if cfg.id in _creds_cache:
+        # A cached {} is a valid "known credential-less" entry.
+        cfg.source_credentials = _creds_cache[cfg.id]
+        return None
+    if polled is None:
+        return "no_credentials_central_unreachable"
+    # The poll succeeded but this pipeline wasn't in the response (deleted
+    # centrally, or file-mirror lag on delete). Running would produce a
+    # guaranteed failed run with empty credentials. A genuinely
+    # credential-less pipeline is covered above: its poll record caches {}.
+    return "not_in_poll_response"
+
+
 def _process_file_pipeline(
     cfg: PipelineConfig,
     by_id: dict[str, PipelineTrigger],
-    polled: list[PipelineTrigger] | None,
-    state: SchedulerState,
-    now: datetime,
+    tick: _Tick,
     client: APIClient,
-    succeeded: set[str],
 ) -> None:
     """Process one pipeline within a tick (schedule, run, record)."""
+    state = tick.state
+    assert state is not None  # set by _run_due_pipelines before this runs
+    now = tick.now
     api_cfg = by_id.get(cfg.id)
 
     # One-time migration: adopt central's last_run_at so existing
@@ -503,68 +573,101 @@ def _process_file_pipeline(
     if not _should_run(cfg, now):
         return
 
-    if cfg.has_file_credentials:
-        # Decrypted from the checkout — git truth wins; no fallback.
-        pass
-    elif cfg.id in _creds_cache:
-        # A cached {} is a valid "known credential-less" entry.
-        cfg.source_credentials = _creds_cache[cfg.id]
-    elif polled is None:
-        _skipped(cfg, "no_credentials_central_unreachable")
+    reason = _resolve_credentials(cfg, tick.polled)
+    if reason is not None:
+        _skipped(cfg, reason)
         logger.warning(
-            "Skipping pipeline %s: no credential file, no cached "
-            "credentials, and the FairTier API is unreachable — "
-            "retrying next tick",
+            "Skipping pipeline %s: %s — retrying next tick",
             cfg.name,
-        )
-        return
-    else:
-        # The poll succeeded but this pipeline wasn't in the response
-        # (deleted centrally, or file-mirror lag on delete). Running would
-        # produce a guaranteed failed run with empty credentials — skip.
-        # A genuinely credential-less pipeline is covered above: its poll
-        # record caches {}.
-        _skipped(cfg, "not_in_poll_response")
-        logger.warning(
-            "Skipping pipeline %s: no credential file and the poll "
-            "response does not include it — retrying next tick",
-            cfg.name,
+            _CREDENTIAL_SKIP_REASONS[reason],
         )
         return
 
-    report = _execute_pipeline(cfg, now, client)
-    if report is not None and report.status == "success":
-        succeeded.add(cfg.id)
-        # Record the run *start* time, mirroring central semantics
-        # (last_run_at = created_at of the last success). Success-only:
-        # a failing scheduled pipeline keeps re-firing, exactly as in
-        # legacy mode.
-        state.record(cfg.id, now)
-        # Extra best-effort snapshot so scheduler.json lands in the
-        # post-run commit instead of waiting for the autosave window
-        # (a crash in between would re-fire the run once).
-        trigger_snapshot(cfg.name)
+    report, run_id = _execute_pipeline(cfg, now, client)
+    _record_pipeline_outcome(cfg, report, run_id, now, tick)
 
 
-def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -> None:
+_CREDENTIAL_SKIP_REASONS = {
+    "no_credentials_central_unreachable": (
+        "no credential file, no cached credentials, and the FairTier API is unreachable"
+    ),
+    "not_in_poll_response": (
+        "no credential file and the poll response does not include it"
+    ),
+}
+
+
+def _record_pipeline_outcome(
+    cfg: PipelineConfig,
+    report: PipelineRunReport | None,
+    run_id: str,
+    started: datetime,
+    tick: _Tick,
+) -> None:
+    """Book a finished pipeline run into the tick and the scheduler state.
+
+    Shared by a standalone run and a workflow step, so a workflow-run
+    pipeline moves its own cron baseline exactly as a standalone run would.
+    """
+    status = report.status if report is not None else "failed"
+    tick.pipeline_runs[cfg.id] = _RunOutcome(
+        run_id=run_id,
+        status=status,
+        error_message=report.error_message if report is not None else "",
+        started_at=report.started_at if report is not None else "",
+        completed_at=report.completed_at if report is not None else "",
+    )
+    if status != "success":
+        return
+    tick.succeeded.add(cfg.id)
+    # Record the run *start* time, mirroring central semantics
+    # (last_run_at = created_at of the last success). Success-only:
+    # a failing scheduled pipeline keeps re-firing, exactly as in
+    # legacy mode.
+    if tick.state is not None:
+        tick.state.record(cfg.id, started)
+    # Extra best-effort snapshot so scheduler.json lands in the
+    # post-run commit instead of waiting for the autosave window
+    # (a crash in between would re-fire the run once).
+    trigger_snapshot(cfg.name)
+
+
+def _fetch_transformation_configs(client: APIClient) -> list[TransformationConfig]:
+    """This tick's transformation configs; empty on any error.
+
+    Transformation errors must never affect pipeline processing.
+    """
+    try:
+        return client.get_transformation_configs()
+    except Exception:
+        logger.warning("Failed to fetch transformation configs", exc_info=True)
+        return []
+
+
+def _run_due_transformations(
+    client: APIClient,
+    succeeded_pipelines: set[str],
+    configs: list[TransformationConfig] | None = None,
+    tick: _Tick | None = None,
+) -> None:
     """Run all due dbt transformations.
 
     A transformation is due on manual trigger, on its cron schedule, or
     chained after a pipeline that succeeded in this same iteration. Unlike
     pipelines there is no retry: dbt failures are code errors, not
     transient — report immediately.
+
+    ``configs`` are fetched when not given. With a ``tick``, a
+    transformation a workflow step already ran this tick is not run again —
+    by schedule, chain or trigger: the step's run was that run.
     """
-    try:
-        configs = client.get_transformation_configs()
-    except Exception:
-        # Transformation errors must never affect pipeline processing.
-        logger.warning("Failed to fetch transformation configs", exc_info=True)
-        return
+    if configs is None:
+        configs = _fetch_transformation_configs(client)
     if not configs:
         return
 
     now = datetime.now(UTC)
-    ran: set[str] = set()
+    ran: set[str] = set(tick.transformation_runs) if tick is not None else set()
 
     for cfg in configs:
         if _shutdown:
@@ -583,66 +686,85 @@ def _run_due_transformations(client: APIClient, succeeded_pipelines: set[str]) -
             if not (due or chained):
                 continue
             ran.add(cfg.id)
-
-            logger.info("Running transformation: %s", cfg.name)
-
-            # Local-first: same identity rules as pipelines (central pending
-            # id when triggered, else a worker-generated UUID).
-            local_run_id = cfg.pending_run_id or str(uuid.uuid4())
             trigger = "manual" if cfg.trigger_now else "schedule" if due else "chained"
-            started = time.monotonic()
-
-            with telemetry.tracer.start_as_current_span(
-                "dlt_worker.transformation.run",
-                attributes={
-                    telemetry.ATTR_TRANSFORMATION_ID: cfg.id,
-                    telemetry.ATTR_TRANSFORMATION_NAME: cfg.name,
-                    telemetry.ATTR_TRIGGER: trigger,
-                    telemetry.ATTR_RUN_ID: local_run_id,
-                },
-            ) as span:
-                if _recorder:
-                    _recorder.record_transformation_run_start(
-                        local_run_id, cfg.id, datetime.now(UTC)
-                    )
-
-                report = run_transformation_isolated(cfg)
-                # Same single-identity rule as pipelines: the report is an
-                # upsert on the id the run was recorded under, so a scheduled
-                # run cannot end up as two rows.
-                report.run_id = local_run_id
-                if report.status == "success":
-                    _last_failure_at.pop(cfg.id, None)
-                else:
-                    _last_failure_at[cfg.id] = now
-
-                span.set_attribute(telemetry.ATTR_STATUS, report.status)
-                span.set_attribute("dlt_worker.dbt.commit_sha", report.commit_sha)
-                span.set_attribute("dlt_worker.dbt.models_total", report.models_total)
-                span.set_attribute("dlt_worker.dbt.models_failed", report.models_failed)
-                span.set_attribute("dlt_worker.dbt.tests_total", report.tests_total)
-                span.set_attribute("dlt_worker.dbt.tests_failed", report.tests_failed)
-                if report.status != "success":
-                    # Sanitized at the source (transformation_runner) — no
-                    # git token can reach the span.
-                    span.set_status(telemetry.error_status(report.error_message))
-                telemetry.record_transformation_run(
-                    cfg, report, time.monotonic() - started
-                )
-
-                if _recorder:
-                    _recorder.record_transformation_run_end(local_run_id, report)
-                _report_run_central(
-                    lambda report=report: client.report_transformation_run(report),
-                    f"transformation {report.transformation_id} "
-                    f"(run_id={report.run_id})",
-                )
+            report = _execute_transformation(cfg, now, client, trigger)
+            if tick is not None:
+                tick.transformation_runs[cfg.id] = _transformation_outcome(report)
         except Exception as exc:
             _tick_error(cfg.name, exc)
             logger.exception(
                 "Transformation %s: tick processing failed — continuing with the rest",
                 cfg.name,
             )
+
+
+def _transformation_outcome(report: TransformationRunReport) -> _RunOutcome:
+    return _RunOutcome(
+        run_id=report.run_id,
+        status=report.status,
+        error_message=report.error_message,
+        started_at=report.started_at,
+        completed_at=report.completed_at,
+    )
+
+
+def _execute_transformation(
+    cfg: TransformationConfig, now: datetime, client: APIClient, trigger: str
+) -> TransformationRunReport:
+    """Run one transformation, record it locally first, report it centrally.
+
+    The one code path for a standalone run and a workflow step alike.
+    """
+    logger.info("Running transformation: %s", cfg.name)
+
+    # Local-first: same identity rules as pipelines (central pending id
+    # when triggered, else a worker-generated UUID).
+    local_run_id = cfg.pending_run_id or str(uuid.uuid4())
+    started = time.monotonic()
+
+    with telemetry.tracer.start_as_current_span(
+        "dlt_worker.transformation.run",
+        attributes={
+            telemetry.ATTR_TRANSFORMATION_ID: cfg.id,
+            telemetry.ATTR_TRANSFORMATION_NAME: cfg.name,
+            telemetry.ATTR_TRIGGER: trigger,
+            telemetry.ATTR_RUN_ID: local_run_id,
+        },
+    ) as span:
+        if _recorder:
+            _recorder.record_transformation_run_start(
+                local_run_id, cfg.id, datetime.now(UTC)
+            )
+
+        report = run_transformation_isolated(cfg)
+        # Same single-identity rule as pipelines: the report is an
+        # upsert on the id the run was recorded under, so a scheduled
+        # run cannot end up as two rows.
+        report.run_id = local_run_id
+        if report.status == "success":
+            _last_failure_at.pop(cfg.id, None)
+        else:
+            _last_failure_at[cfg.id] = now
+
+        span.set_attribute(telemetry.ATTR_STATUS, report.status)
+        span.set_attribute("dlt_worker.dbt.commit_sha", report.commit_sha)
+        span.set_attribute("dlt_worker.dbt.models_total", report.models_total)
+        span.set_attribute("dlt_worker.dbt.models_failed", report.models_failed)
+        span.set_attribute("dlt_worker.dbt.tests_total", report.tests_total)
+        span.set_attribute("dlt_worker.dbt.tests_failed", report.tests_failed)
+        if report.status != "success":
+            # Sanitized at the source (transformation_runner) — no
+            # git token can reach the span.
+            span.set_status(telemetry.error_status(report.error_message))
+        telemetry.record_transformation_run(cfg, report, time.monotonic() - started)
+
+        if _recorder:
+            _recorder.record_transformation_run_end(local_run_id, report)
+        _report_run_central(
+            lambda report=report: client.report_transformation_run(report),
+            f"transformation {report.transformation_id} (run_id={report.run_id})",
+        )
+    return report
 
 
 # Fields a retry's config re-read must NOT take from the checkout: the
