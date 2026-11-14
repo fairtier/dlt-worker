@@ -42,7 +42,7 @@ src/dlt_worker/       # Application source
   config.py           # Environment variable configuration
   health.py           # Kubernetes health check server
   telemetry.py        # OpenTelemetry traces + metrics (no-op unless an OTLP endpoint is set)
-  main.py             # Main poll loop with graceful shutdown; a tick runs pipelines → workflows → transformations (README "Workflows" for the dedupe rules)
+  main.py             # Main poll loop with graceful shutdown; a tick runs pipelines → workflows → transformations (README "Workflows" for the dedupe rules). Runs stamp their own start via the _utcnow() seam; the schedule baseline is _Tick.now (README "Run start vs. schedule baseline")
   pipeline_files.py   # Files mode: load pipeline definitions from a git checkout
   scheduler_state.py  # Files mode: worker-owned last_run_at (scheduler.json)
   pipeline_runner.py  # dlt pipeline execution (child process only)
@@ -53,7 +53,7 @@ src/dlt_worker/       # Application source
   dbt_results.py      # Reads target/run_results.json into the per-node report
   snapshot.py         # State-snapshot webhook — parent-side, so it can't drag dlt in
   workspace_db.py     # Local-first run recording into the workspace Postgres database
-  api_client.py  # FairTier API HTTP client
+  api_client.py  # FairTier API HTTP client; proto3 JSON omits zero values, so read every scalar through _str/_bool/_int
 tests/                # pytest test suite
 ```
 
