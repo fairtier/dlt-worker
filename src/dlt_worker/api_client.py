@@ -131,6 +131,65 @@ class TransformationRunReport:
 
 
 @dataclass
+class WorkflowStepConfig:
+    """One step of a workflow, as GetWorkflowConfigs serves it.
+
+    Only a reference: the pipeline's or transformation's own definition comes
+    from where a standalone run gets it (the checkout, GetTransformationConfigs)
+    and is looked up by ``ref_id``.
+    """
+
+    position: int
+    kind: str  # "pipeline" or "transformation"
+    ref_id: str
+    name: str = ""
+    ref_enabled: bool = True
+
+
+@dataclass
+class WorkflowConfig:
+    """A linear workflow: ordered steps, one optional cron schedule."""
+
+    id: str
+    name: str
+    schedule: str | None
+    enabled: bool
+    steps: list[WorkflowStepConfig] = field(default_factory=list)
+    trigger_now: bool = False
+    pending_run_id: str = ""
+    # Start of the most recent run that left "pending", whatever its outcome
+    # — server-owned, so unlike a pipeline's it already covers failures.
+    last_run_at: datetime | None = None
+    last_run_status: str = ""
+
+
+@dataclass
+class WorkflowStepRunReport:
+    position: int
+    kind: str
+    ref_id: str
+    name: str
+    status: str = "pending"  # pending | running | success | failed | skipped
+    pipeline_run_id: str = ""
+    transformation_run_id: str = ""
+    started_at: str = ""
+    completed_at: str = ""
+    error_message: str = ""
+
+
+@dataclass
+class WorkflowRunReport:
+    run_id: str
+    workflow_id: str
+    status: str  # running | success | failed
+    trigger: str  # manual | schedule
+    started_at: str
+    completed_at: str = ""
+    error_message: str = ""
+    step_runs: list[WorkflowStepRunReport] = field(default_factory=list)
+
+
+@dataclass
 class SourceTest:
     """One queued "can this thing read my X?" probe, claimed from the API.
 
@@ -167,6 +226,7 @@ class APIClient:
     _last_check_at: str = field(default="", repr=False)
     _token: str = field(default="", repr=False)
     _token_expires_at: float = field(default=0.0, repr=False)
+    _workflows_unsupported_logged: bool = field(default=False, repr=False)
 
     @property
     def auth_enabled(self) -> bool:
@@ -402,6 +462,96 @@ class APIClient:
             )
             return False
 
+    def get_workflow_configs(self) -> list[WorkflowConfig]:
+        """Fetch this customer's workflows (enabled ones, plus disabled ones
+        with a pending manual run).
+
+        Like transformations, deliberately does not touch health status, and
+        never raises: workflows are optional. A workspace-api that predates
+        workflows answers 404 (Connect: unimplemented) — that is "no
+        workflows", logged once rather than every tick.
+        """
+        url = f"{self.base_url}/workflow.v1.WorkflowService/GetWorkflowConfigs"
+        try:
+            resp = self._post(url, {"customerSlug": self.customer_slug})
+            if resp.status_code in (404, 501):
+                if not self._workflows_unsupported_logged:
+                    logger.info(
+                        "FairTier API does not serve workflows (HTTP %d) — "
+                        "running none until it does",
+                        resp.status_code,
+                    )
+                    self._workflows_unsupported_logged = True
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+            workflows = data.get("workflows", [])
+            if not isinstance(workflows, list):
+                raise ValueError("'workflows' is not a list")
+        except (requests.RequestException, ValueError):
+            logger.warning("Failed to fetch workflow configs", exc_info=True)
+            return []
+        self._workflows_unsupported_logged = False
+
+        configs = []
+        for w in workflows:
+            try:
+                configs.append(_parse_workflow_record(w))
+            except Exception:
+                logger.warning(
+                    "Skipping malformed workflow record (id=%s)",
+                    w.get("id", "?") if isinstance(w, dict) else "?",
+                    exc_info=True,
+                )
+        return configs
+
+    def report_workflow_run(self, report: WorkflowRunReport) -> bool:
+        """Report a workflow run's state — every step, every time.
+
+        The API upserts on run_id (steps on run_id + position), so repeating a
+        report is harmless. Returns True on success, False on failure; never
+        raises, and never touches health status.
+        """
+        url = f"{self.base_url}/workflow.v1.WorkflowService/ReportWorkflowRun"
+        try:
+            resp = self._post(
+                url,
+                {
+                    "runId": report.run_id,
+                    "workflowId": report.workflow_id,
+                    "status": report.status,
+                    "trigger": report.trigger,
+                    "startedAt": report.started_at,
+                    "completedAt": report.completed_at,
+                    "errorMessage": report.error_message,
+                    "stepRuns": [
+                        {
+                            "position": s.position,
+                            "kind": s.kind,
+                            "refId": s.ref_id,
+                            "name": s.name,
+                            "status": s.status,
+                            "pipelineRunId": s.pipeline_run_id,
+                            "transformationRunId": s.transformation_run_id,
+                            "startedAt": s.started_at,
+                            "completedAt": s.completed_at,
+                            "errorMessage": s.error_message,
+                        }
+                        for s in report.step_runs
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            return True
+        except requests.RequestException:
+            logger.warning(
+                "Failed to report workflow run %s (workflow %s)",
+                report.run_id,
+                report.workflow_id,
+                exc_info=True,
+            )
+            return False
+
     def get_pending_source_tests(self) -> list[SourceTest]:
         """Claim this customer's queued source tests.
 
@@ -528,6 +678,37 @@ def _parse_trigger_record(p: dict[str, Any]) -> PipelineTrigger:
         trigger_now=p.get("triggerNow", False),
         pending_run_id=p.get("pendingRunId", ""),
         last_run_at=_parse_last_run_at(p),
+    )
+
+
+def _parse_workflow_record(w: dict[str, Any]) -> WorkflowConfig:
+    """Map one API workflow record to a WorkflowConfig. Raises on malformed
+    input — the caller skips the record and keeps the rest.
+
+    proto3 JSON omits zero values: a missing ``position`` is 0 and a missing
+    ``refEnabled`` is false, which is exactly what the server meant.
+    """
+    steps = [
+        WorkflowStepConfig(
+            position=int(s.get("position", 0)),
+            kind=s["kind"],
+            ref_id=s["refId"],
+            name=s.get("name", ""),
+            ref_enabled=bool(s.get("refEnabled", False)),
+        )
+        for s in w.get("steps", [])
+    ]
+    steps.sort(key=lambda s: s.position)
+    return WorkflowConfig(
+        id=w["id"],
+        name=w.get("name", ""),
+        schedule=w.get("schedule") or None,
+        enabled=bool(w.get("enabled", False)),
+        steps=steps,
+        trigger_now=bool(w.get("triggerNow", False)),
+        pending_run_id=w.get("pendingRunId", ""),
+        last_run_at=_parse_last_run_at(w),
+        last_run_status=w.get("lastRunStatus", ""),
     )
 
 

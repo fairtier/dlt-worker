@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from typing import Any
 from unittest.mock import MagicMock
 
 import requests
@@ -475,3 +477,203 @@ class TestMalformedCentralResponses:
         assert client.try_get_pipeline_triggers() is None
         healthy, _ = client.health_status()
         assert healthy is False
+
+
+class TestGetWorkflowConfigs:
+    """get_workflow_configs: the worker-facing view of linear workflows."""
+
+    def test_parses_full_response(self) -> None:
+        from datetime import UTC, datetime
+
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response(
+            {
+                "workflows": [
+                    {
+                        "id": "w1",
+                        "name": "nightly",
+                        "schedule": "0 3 * * *",
+                        "enabled": True,
+                        # Out of order on purpose: the worker sorts by position.
+                        "steps": [
+                            {
+                                "position": 1,
+                                "kind": "transformation",
+                                "refId": "t1",
+                                "name": "marts",
+                                "refEnabled": True,
+                            },
+                            # proto3 JSON omits zero values: position 0 and
+                            # refEnabled false arrive as absent keys.
+                            {"kind": "pipeline", "refId": "p1", "name": "orders"},
+                        ],
+                        "triggerNow": True,
+                        "pendingRunId": "run-1",
+                        "lastRunAt": "2025-06-01T03:00:00Z",
+                        "lastRunStatus": "failed",
+                    }
+                ]
+            }
+        )
+
+        [wf] = client.get_workflow_configs()
+
+        assert client._session.post.call_args.args[0].endswith(
+            "/workflow.v1.WorkflowService/GetWorkflowConfigs"
+        )
+        assert client._session.post.call_args.kwargs["json"] == {"customerSlug": "acme"}
+        assert wf.id == "w1"
+        assert wf.schedule == "0 3 * * *"
+        assert wf.enabled is True
+        assert [(s.position, s.kind, s.ref_id) for s in wf.steps] == [
+            (0, "pipeline", "p1"),
+            (1, "transformation", "t1"),
+        ]
+        assert wf.steps[0].ref_enabled is False
+        assert wf.steps[1].ref_enabled is True
+        assert wf.trigger_now is True
+        assert wf.pending_run_id == "run-1"
+        assert wf.last_run_at == datetime(2025, 6, 1, 3, tzinfo=UTC)
+        assert wf.last_run_status == "failed"
+
+    def test_zero_values_default(self) -> None:
+        """A disabled, manual-only, never-run workflow is mostly absent keys."""
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response(
+            {
+                "workflows": [
+                    {"id": "w1", "steps": [{"kind": "pipeline", "refId": "p1"}]}
+                ]
+            }
+        )
+
+        [wf] = client.get_workflow_configs()
+
+        assert wf.enabled is False
+        assert wf.schedule is None
+        assert wf.trigger_now is False
+        assert wf.pending_run_id == ""
+        assert wf.last_run_at is None
+
+    def test_unimplemented_is_no_workflows_logged_once(self, caplog: Any) -> None:
+        """A workspace-api that predates workflows answers 404 (Connect
+        unimplemented). That is "no workflows", not an error — and it is
+        logged once, not every tick."""
+        client = _make_client()
+        client._session = MagicMock()
+        resp = _api_response({"code": "unimplemented"}, status_code=404)
+        resp.raise_for_status.side_effect = requests.HTTPError("404")
+        client._session.post.return_value = resp
+
+        with caplog.at_level(logging.INFO, logger="dlt_worker.api_client"):
+            assert client.get_workflow_configs() == []
+            assert client.get_workflow_configs() == []
+
+        notes = [r for r in caplog.records if "does not serve workflows" in r.message]
+        assert len(notes) == 1
+        assert notes[0].levelno == logging.INFO
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        # Optional feature: never flips the pod unready.
+        assert client.health_status()[0] is True
+
+    def test_transport_error_returns_empty(self) -> None:
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.side_effect = requests.ConnectionError("refused")
+
+        assert client.get_workflow_configs() == []
+        assert client.health_status()[0] is True
+
+    def test_bad_record_is_skipped_others_survive(self) -> None:
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response(
+            {
+                "workflows": [
+                    {"id": "bad", "steps": [{"kind": "pipeline"}]},  # no refId
+                    {"id": "w2", "steps": [{"kind": "pipeline", "refId": "p1"}]},
+                ]
+            }
+        )
+
+        assert [w.id for w in client.get_workflow_configs()] == ["w2"]
+
+
+class TestReportWorkflowRun:
+    def test_payload_shape(self) -> None:
+        from dlt_worker.api_client import WorkflowRunReport, WorkflowStepRunReport
+
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response({})
+
+        report = WorkflowRunReport(
+            run_id="run-1",
+            workflow_id="w1",
+            status="failed",
+            trigger="manual",
+            started_at="2025-06-01T03:00:00+00:00",
+            completed_at="2025-06-01T03:10:00+00:00",
+            error_message="step 1 failed",
+            step_runs=[
+                WorkflowStepRunReport(
+                    position=0,
+                    kind="pipeline",
+                    ref_id="p1",
+                    name="orders",
+                    status="failed",
+                    pipeline_run_id="prun-1",
+                    error_message="boom",
+                ),
+                WorkflowStepRunReport(
+                    position=1,
+                    kind="transformation",
+                    ref_id="t1",
+                    name="marts",
+                    status="skipped",
+                ),
+            ],
+        )
+        assert client.report_workflow_run(report) is True
+
+        assert client._session.post.call_args.args[0].endswith(
+            "/workflow.v1.WorkflowService/ReportWorkflowRun"
+        )
+        payload = client._session.post.call_args.kwargs["json"]
+        assert payload["runId"] == "run-1"
+        assert payload["workflowId"] == "w1"
+        assert payload["status"] == "failed"
+        assert payload["trigger"] == "manual"
+        assert payload["errorMessage"] == "step 1 failed"
+        assert payload["stepRuns"][0] == {
+            "position": 0,
+            "kind": "pipeline",
+            "refId": "p1",
+            "name": "orders",
+            "status": "failed",
+            "pipelineRunId": "prun-1",
+            "transformationRunId": "",
+            "startedAt": "",
+            "completedAt": "",
+            "errorMessage": "boom",
+        }
+        assert payload["stepRuns"][1]["status"] == "skipped"
+
+    def test_http_error_returns_false(self) -> None:
+        from dlt_worker.api_client import WorkflowRunReport
+
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.side_effect = requests.ConnectionError("refused")
+
+        report = WorkflowRunReport(
+            run_id="run-1",
+            workflow_id="w1",
+            status="running",
+            trigger="schedule",
+            started_at="2025-06-01T03:00:00+00:00",
+        )
+        assert client.report_workflow_run(report) is False
+        assert client.health_status()[0] is True
