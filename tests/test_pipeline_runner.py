@@ -1275,27 +1275,50 @@ class TestRunPipelineRowsLoaded:
         assert report.status == "success", report.error_message
         assert report.rows_loaded == 5
 
-    def test_pending_only_resume_counts_the_pending_package(self) -> None:
+    def _loaded_ids(self) -> list[int]:
+        from dlt.common.libs.pyiceberg import get_iceberg_tables
+
+        table = get_iceberg_tables(self._pipeline(), "items")["items"]
+        return sorted(table.scan().to_arrow().column("id").to_pylist())
+
+    @staticmethod
+    def _incremental_rows(n: int) -> Any:
+        @dlt.resource(name="items", primary_key="id")
+        def items(
+            cursor: Any = dlt.sources.incremental("id"),  # noqa: B008
+        ) -> Any:
+            yield [{"id": i} for i in range(n)]
+
+        return items
+
+    def _die_after_normalize(self, source: Any) -> None:
+        """A run that got as far as normalize and died before loading."""
+        p = self._pipeline()
+        p.extract(source, table_format="iceberg")
+        p.normalize()
+        assert len(p.list_normalized_load_packages()) == 1
+
+    def test_pending_only_resume_also_extracts_the_new_data(self) -> None:
+        """dlt's run() loads the pending package and returns WITHOUT
+        extracting what it was given; the worker runs again, so this run
+        delivers today's data too, not just yesterday's."""
         # An earlier run that loaded fine (so the destination is initialised
         # and dlt keeps the local state instead of wiping it) ...
         assert self._run(self._rows(3)).rows_loaded == 3
-        # ... then one that got as far as normalize and died before loading.
-        p = self._pipeline()
-        p.extract(self._rows(7, start=100), table_format="iceberg")
-        p.normalize()
-        assert len(p.list_normalized_load_packages()) == 1
+        self._die_after_normalize(self._rows(7, start=100))
 
         report = self._run(self._rows(1, start=1000))
 
         assert report.status == "success", report.error_message
         assert self._pipeline().list_normalized_load_packages() == []
-        # The pending package's 7 rows — not 0, and not the 1 row the source
-        # offered this time, which dlt does not extract on a resume.
-        assert report.rows_loaded == 7
+        # The pending package's 7 rows plus the 1 row offered this time.
+        assert report.rows_loaded == 8
+        assert self._loaded_ids() == [0, 1, 2, *range(100, 107), 1000]
 
-    def test_extracted_only_resume_is_not_counted_twice(self) -> None:
-        """A package that died before normalize gets normalized by this run,
-        so the normalize metrics already have it."""
+    def test_extracted_only_resume_also_extracts_the_new_data(self) -> None:
+        """A package that died before normalize: normalized and loaded by
+        the first run() (counted once, from its normalize metrics), then the
+        new data by the second."""
         assert self._run(self._rows(3)).rows_loaded == 3
         p = self._pipeline()
         p.extract(self._rows(7, start=100), table_format="iceberg")
@@ -1304,7 +1327,70 @@ class TestRunPipelineRowsLoaded:
         report = self._run(self._rows(1, start=1000))
 
         assert report.status == "success", report.error_message
+        assert report.rows_loaded == 8
+        assert self._loaded_ids() == [0, 1, 2, *range(100, 107), 1000]
+
+    def test_incremental_resume_extracts_only_what_is_new(self) -> None:
+        """The pending package's extract already moved the cursor in the
+        local state, so the second run picks up after it: nothing is loaded
+        twice and nothing is skipped."""
+        assert self._run(self._incremental_rows(3)).rows_loaded == 3
+        # Died after normalize with ids 3..4 (the cursor dropped 0..2).
+        self._die_after_normalize(self._incremental_rows(5))
+
+        report = self._run(self._incremental_rows(7))
+
+        assert report.status == "success", report.error_message
+        assert report.rows_loaded == 2 + 2
+        assert self._loaded_ids() == list(range(7))
+
+    def test_a_failing_fresh_run_fails_the_run_but_keeps_the_resumed_load(
+        self,
+    ) -> None:
+        assert self._run(self._rows(3)).rows_loaded == 3
+        self._die_after_normalize(self._rows(7, start=100))
+
+        @dlt.resource(name="items")
+        def broken() -> Any:
+            raise RuntimeError("source exploded")
+            yield  # pragma: no cover
+
+        report = self._run(broken)
+
+        assert report.status == "failed"
+        assert "source exploded" in report.error_message
+        assert "pending package" in report.error_message
+        # The resumed package is loaded and counted; it is not pending again.
         assert report.rows_loaded == 7
+        assert self._pipeline().list_normalized_load_packages() == []
+        assert self._loaded_ids() == [0, 1, 2, *range(100, 107)]
+
+    def test_runs_again_at_most_once(self) -> None:
+        """If the second run() also only drained pending packages, the worker
+        does not loop: it stops and fails rather than report a success that
+        delivered no fresh data."""
+        assert self._run(self._rows(3)).rows_loaded == 3
+        self._die_after_normalize(self._rows(7, start=100))
+
+        with patch(
+            "dlt_worker.pipeline_runner._extracted", return_value=False
+        ) as extracted:
+            report = self._run(self._rows(1, start=1000))
+
+        assert extracted.call_count == 2
+        assert report.status == "failed"
+        assert "did not extract" in report.error_message
+        assert report.rows_loaded == 8
+
+    def test_a_normal_run_runs_once(self) -> None:
+        with patch(
+            "dlt_worker.pipeline_runner.dlt.Pipeline.run",
+            autospec=True,
+            side_effect=dlt.Pipeline.run,
+        ) as run:
+            report = self._run(self._rows(5))
+        assert report.status == "success", report.error_message
+        assert run.call_count == 1
 
 
 class TestPublicHttpFilesystemSource:

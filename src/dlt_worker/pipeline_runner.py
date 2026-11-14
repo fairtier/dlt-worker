@@ -89,10 +89,55 @@ def _count_job_file_rows(path: str, file_format: str) -> int:
     return 0
 
 
+def _extracted(pipeline: Any, prior_trace_id: str | None) -> bool:
+    """Whether the ``run()`` that just returned extracted the data it was given.
+
+    dlt 1.31's ``Pipeline.run()`` (dlt/pipeline/pipeline.py, the
+    ``has_pending_data`` branch) normalizes and loads any pending packages
+    left by an earlier run that died, and then RETURNS without extracting —
+    it only logs a warning. Its trace then has no ``extract`` step: steps
+    are ``load, run`` (or ``normalize, load, run``) instead of
+    ``extract, normalize, load, run``.
+
+    A trace that is not this call's (runtime tracing disabled, so
+    ``last_trace`` is a stale one from disk) cannot answer; that is treated
+    as extracted — the pre-fix behaviour — rather than risk a second run.
+    """
+    trace = pipeline.last_trace
+    if trace is None or trace.transaction_id == prior_trace_id:
+        logger.warning(
+            "Pipeline %s: no trace for this run; cannot tell whether dlt "
+            "extracted or only resumed pending packages",
+            pipeline.pipeline_name,
+        )
+        return True
+    return any(step.step == "extract" for step in trace.steps)
+
+
+def _run_once(
+    pipeline: Any, source: Any, write_disp: TWriteDispositionConfig
+) -> tuple[int, bool]:
+    """One dlt ``run()``: returns (rows loaded, whether it extracted)."""
+    prior = pipeline.last_trace
+    prior_trace_id = prior.transaction_id if prior else None
+    pipeline.run(source, write_disposition=write_disp, table_format="iceberg")
+
+    # dlt types last_trace as Optional (dlt 1.31); a completed run()
+    # always leaves one, but a missing trace still just counts zero.
+    trace = pipeline.last_trace
+    normalize_info = trace.last_normalize_info if trace else None
+    load_info = trace.last_load_info if trace else None
+    rows = _count_rows(normalize_info) + _count_resumed_rows(load_info, normalize_info)
+    return rows, _extracted(pipeline, prior_trace_id)
+
+
 def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
     """Build and run a dlt pipeline from the given config. Returns a run report."""
     started_at = datetime.now(UTC)
     rows_loaded = 0
+    # Rows of an earlier run's pending packages that this run's first dlt
+    # run() loaded; None when it extracted normally (see _extracted).
+    resumed_rows: int | None = None
 
     # The inner spans below are created with exception recording OFF on
     # purpose: a dlt source exception quotes config freely (SQLAlchemy puts
@@ -146,22 +191,60 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
                 record_exception=False,
                 set_status_on_exception=False,
             ):
-                pipeline.run(
-                    source,
-                    write_disposition=write_disp,
-                    table_format="iceberg",
+                rows_loaded, extracted = _run_once(pipeline, source, write_disp)
+
+            if not extracted:
+                # The run() above only finished an earlier run's pending
+                # packages. Run once more so this run delivers its own data
+                # — otherwise a daily pipeline that failed yesterday would
+                # load yesterday's data today and report success. The
+                # source was never iterated, so it is reused as is; any
+                # incremental cursor was already advanced locally by the
+                # earlier extract, so nothing is extracted twice.
+                resumed_rows = rows_loaded
+                logger.warning(
+                    "Pipeline %s: resumed %d rows of pending package(s) from an "
+                    "earlier run; dlt did not extract this run's data — "
+                    "running again to extract it",
+                    cfg.name,
+                    resumed_rows,
                 )
+                telemetry.add_event(
+                    "pipeline.resumed_pending",
+                    {telemetry.ATTR_ROWS: resumed_rows},
+                )
+                with telemetry.tracer.start_as_current_span(
+                    "dlt_worker.dlt.run",
+                    attributes={
+                        telemetry.ATTR_PIPELINE_NAME: cfg.name,
+                        "dlt_worker.run.after_resume": True,
+                    },
+                    record_exception=False,
+                    set_status_on_exception=False,
+                ):
+                    fresh_rows, extracted = _run_once(pipeline, source, write_disp)
+                rows_loaded += fresh_rows
+                if not extracted:
+                    # At most one extra run: dlt still found pending work,
+                    # so something keeps leaving packages behind.
+                    raise RuntimeError(
+                        "dlt only loaded pending packages again and did not "
+                        "extract this run's data; not retrying further"
+                    )
 
-            # dlt types last_trace as Optional (dlt 1.31); a completed run()
-            # always leaves one, but a missing trace still just counts zero.
-            trace = pipeline.last_trace
-            normalize_info = trace.last_normalize_info if trace else None
-            load_info = trace.last_load_info if trace else None
-            rows_loaded = _count_rows(normalize_info) + _count_resumed_rows(
-                load_info, normalize_info
-            )
-
-            logger.info("Pipeline %s completed: %d rows loaded", cfg.name, rows_loaded)
+            if resumed_rows is None:
+                logger.info(
+                    "Pipeline %s completed: %d rows loaded", cfg.name, rows_loaded
+                )
+            else:
+                logger.info(
+                    "Pipeline %s completed: %d rows loaded (%d resumed from "
+                    "pending packages + %d extracted by this run)",
+                    cfg.name,
+                    rows_loaded,
+                    resumed_rows,
+                    rows_loaded - resumed_rows,
+                )
 
             span.set_attribute(telemetry.ATTR_ROWS, rows_loaded)
             span.set_attribute(telemetry.ATTR_STATUS, "success")
@@ -190,7 +273,18 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
                 _scrub_credentials(traceback.format_exc(), cfg.source_credentials),
             )
             error_message = _scrub_credentials(str(exc), cfg.source_credentials)
+            if resumed_rows is not None:
+                # The resumed packages ARE loaded (dlt marked them so); only
+                # this run's own data failed. Say so, count what landed, and
+                # snapshot the dlt state that now records them as loaded.
+                error_message = (
+                    f"the pending package(s) of an earlier run were loaded "
+                    f"({resumed_rows} rows; they stay loaded), but extracting "
+                    f"this run's data failed: {error_message}"
+                )
+                trigger_snapshot(cfg.name)
             span.set_attribute(telemetry.ATTR_STATUS, "failed")
+            span.set_attribute(telemetry.ATTR_ROWS, rows_loaded)
             span.set_attribute("exception.type", type(exc).__name__)
             span.set_status(telemetry.error_status(error_message))
             return PipelineRunReport(
@@ -198,6 +292,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
                 status="failed",
                 started_at=started_at.isoformat(),
                 completed_at=datetime.now(UTC).isoformat(),
+                rows_loaded=rows_loaded,
                 error_message=error_message,
             )
 
