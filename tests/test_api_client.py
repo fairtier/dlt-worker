@@ -683,7 +683,11 @@ class TestGetWorkflowConfigs:
 
 class TestReportWorkflowRun:
     def test_payload_shape(self) -> None:
-        from dlt_worker.api_client import WorkflowRunReport, WorkflowStepRunReport
+        from dlt_worker.api_client import (
+            ReportResult,
+            WorkflowRunReport,
+            WorkflowStepRunReport,
+        )
 
         client = _make_client()
         client._session = MagicMock()
@@ -716,7 +720,7 @@ class TestReportWorkflowRun:
                 ),
             ],
         )
-        assert client.report_workflow_run(report) is True
+        assert client.report_workflow_run(report) is ReportResult.DELIVERED
 
         assert client._session.post.call_args.args[0].endswith(
             "/workflow.v1.WorkflowService/ReportWorkflowRun"
@@ -741,8 +745,8 @@ class TestReportWorkflowRun:
         }
         assert payload["stepRuns"][1]["status"] == "skipped"
 
-    def test_http_error_returns_false(self) -> None:
-        from dlt_worker.api_client import WorkflowRunReport
+    def test_http_error_is_transient(self) -> None:
+        from dlt_worker.api_client import ReportResult, WorkflowRunReport
 
         client = _make_client()
         client._session = MagicMock()
@@ -755,7 +759,7 @@ class TestReportWorkflowRun:
             trigger="schedule",
             started_at="2025-06-01T03:00:00+00:00",
         )
-        assert client.report_workflow_run(report) is False
+        assert client.report_workflow_run(report) is ReportResult.TRANSIENT
         assert client.health_status()[0] is True
 
     def test_wrongly_typed_scalar_is_malformed(self) -> None:
@@ -763,3 +767,207 @@ class TestReportWorkflowRun:
         not silently read as true or false."""
         with pytest.raises(TypeError):
             _parse_transformation_record({"id": "t1", "name": "n", "enabled": "false"})
+
+
+class TestWorkflowZeroValues:
+    """The Go server encodes with protojson, which omits every zero value —
+    and a proto3 JSON parser must also take an explicit null as that zero
+    value. A workflow record must read the same either way."""
+
+    def _parse(self, record: dict[str, Any]) -> Any:
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response({"workflows": [record]})
+        return client.get_workflow_configs()
+
+    def test_omitted_zero_values(self) -> None:
+        """What the server really sends for a disabled, manual-only, never-run
+        workflow whose first step's target is disabled: no position, no
+        refEnabled, no enabled, no triggerNow, no schedule."""
+        [wf] = self._parse(
+            {
+                "id": "w1",
+                "name": "nightly",
+                "steps": [
+                    {"kind": "pipeline", "refId": "p1", "name": "orders"},
+                    {
+                        "position": 1,
+                        "kind": "transformation",
+                        "refId": "t1",
+                        "refEnabled": True,
+                    },
+                ],
+            }
+        )
+        assert (wf.enabled, wf.trigger_now, wf.schedule) == (False, False, None)
+        assert (wf.pending_run_id, wf.last_run_at, wf.last_run_status) == ("", None, "")
+        assert [(s.position, s.ref_enabled, s.name) for s in wf.steps] == [
+            (0, False, "orders"),
+            (1, True, ""),
+        ]
+
+    def test_explicit_nulls_are_zero_values(self) -> None:
+        [wf] = self._parse(
+            {
+                "id": "w1",
+                "name": None,
+                "schedule": None,
+                "enabled": None,
+                "triggerNow": None,
+                "pendingRunId": None,
+                "lastRunAt": None,
+                "lastRunStatus": None,
+                "steps": [
+                    {
+                        "position": None,
+                        "kind": "pipeline",
+                        "refId": "p1",
+                        "name": None,
+                        "refEnabled": None,
+                    }
+                ],
+            }
+        )
+        assert (wf.name, wf.schedule, wf.enabled, wf.trigger_now) == (
+            "",
+            None,
+            False,
+            False,
+        )
+        assert (wf.pending_run_id, wf.last_run_status) == ("", "")
+        [step] = wf.steps
+        assert (step.position, step.name, step.ref_enabled) == (0, "", False)
+
+    def test_null_steps_is_no_steps(self) -> None:
+        [wf] = self._parse({"id": "w1", "steps": None})
+        assert wf.steps == []
+
+    def test_int32_as_string_is_accepted(self) -> None:
+        """protojson parsers accept an int32 as a JSON string too."""
+        [wf] = self._parse(
+            {"id": "w1", "steps": [{"position": "2", "kind": "pipeline", "refId": "p"}]}
+        )
+        assert wf.steps[0].position == 2
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            {"id": "w1", "enabled": "false", "steps": []},
+            {"id": "w1", "triggerNow": 1, "steps": []},
+            {"id": "w1", "pendingRunId": 7, "steps": []},
+            {
+                "id": "w1",
+                "steps": [{"kind": "pipeline", "refId": "p", "refEnabled": "true"}],
+            },
+            {
+                "id": "w1",
+                "steps": [{"kind": "pipeline", "refId": "p", "position": 1.5}],
+            },
+            {
+                "id": "w1",
+                "steps": [{"kind": "pipeline", "refId": "p", "position": True}],
+            },
+            {"id": "w1", "steps": [{"kind": "pipeline", "refId": ""}]},
+            {"id": "", "steps": []},
+        ],
+    )
+    def test_wrong_types_make_the_record_malformed(
+        self, record: dict[str, Any]
+    ) -> None:
+        """Never read "false" as true: a wrongly typed scalar skips the
+        record, as for every other record type."""
+        assert self._parse(record) == []
+
+
+def _connect_error(status_code: int, body: Any) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status_code
+    if isinstance(body, Exception):
+        resp.json.side_effect = body
+    else:
+        resp.json.return_value = body
+    resp.raise_for_status.side_effect = requests.HTTPError(
+        f"{status_code}", response=resp
+    )
+    return resp
+
+
+class TestReportWorkflowRunErrors:
+    """ReportWorkflowRun documents which errors are permanent (the same
+    report fails the same way: InvalidArgument, NotFound) and which are
+    worth retrying. The client tells them apart for the caller."""
+
+    def _report(self, resp: MagicMock) -> Any:
+        from dlt_worker.api_client import WorkflowRunReport
+
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = resp
+        return client.report_workflow_run(
+            WorkflowRunReport(
+                run_id="run-1",
+                workflow_id="w1",
+                status="success",
+                trigger="schedule",
+                started_at="2025-06-01T03:00:00+00:00",
+            )
+        )
+
+    def test_delivered_is_truthy(self) -> None:
+        from dlt_worker.api_client import ReportResult
+
+        result = self._report(_api_response({}))
+        assert result is ReportResult.DELIVERED
+        assert result
+
+    @pytest.mark.parametrize(
+        ("status_code", "code"),
+        [(400, "invalid_argument"), (404, "not_found")],
+    )
+    def test_permanent_codes_are_rejected(self, status_code: int, code: str) -> None:
+        from dlt_worker.api_client import ReportResult
+
+        result = self._report(
+            _connect_error(status_code, {"code": code, "message": "workflow gone"})
+        )
+        assert result is ReportResult.REJECTED
+        assert not result
+
+    @pytest.mark.parametrize(
+        ("status_code", "body"),
+        [
+            (503, {"code": "unavailable", "message": "down"}),
+            (504, {"code": "deadline_exceeded"}),
+            (500, {"code": "internal"}),
+            (500, {"code": "unknown"}),
+            # Operator problems: not fixed by this report, but by a fix that
+            # may land any minute — bounded retries, not an immediate drop.
+            (401, {"code": "unauthenticated"}),
+            (403, {"code": "permission_denied"}),
+            # No Connect error body (a proxy's page): Connect's HTTP mapping
+            # makes 400 "internal" and 404 "unimplemented" — neither is the
+            # server saying "this report is wrong".
+            (400, ValueError("not json")),
+            (404, {"error": "no route"}),
+            (502, ValueError("not json")),
+        ],
+    )
+    def test_everything_else_is_transient(self, status_code: int, body: Any) -> None:
+        from dlt_worker.api_client import ReportResult
+
+        result = self._report(_connect_error(status_code, body))
+        assert result is ReportResult.TRANSIENT
+        assert not result
+
+    def test_transport_error_is_transient(self) -> None:
+        from dlt_worker.api_client import ReportResult, WorkflowRunReport
+
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.side_effect = requests.ConnectionError("refused")
+        result = client.report_workflow_run(
+            WorkflowRunReport(
+                run_id="r", workflow_id="w", status="running", trigger="", started_at=""
+            )
+        )
+        assert result is ReportResult.TRANSIENT

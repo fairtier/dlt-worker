@@ -15,6 +15,7 @@ configs. The same OIDC app is used for the Lakekeeper catalog.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import time
@@ -187,6 +188,49 @@ class WorkflowRunReport:
     completed_at: str = ""
     error_message: str = ""
     step_runs: list[WorkflowStepRunReport] = field(default_factory=list)
+
+
+class ReportResult(enum.Enum):
+    """How one ReportWorkflowRun call ended — the caller's retry decision.
+
+    Truthy only when delivered, so ``if client.report_workflow_run(r):``
+    still reads as "it landed".
+    """
+
+    DELIVERED = "delivered"
+    # Worth sending the same report again: the server was unreachable or
+    # failed (Unavailable, DeadlineExceeded, Internal, Unknown, transport),
+    # or the worker's token is wrong (Unauthenticated, PermissionDenied —
+    # an operator fix can land any minute).
+    TRANSIENT = "transient"
+    # The server refused this report for good (InvalidArgument: malformed;
+    # NotFound: the workflow is gone or the run id is another workflow's).
+    # The same report fails the same way every time.
+    REJECTED = "rejected"
+
+    def __bool__(self) -> bool:
+        return self is ReportResult.DELIVERED
+
+
+# Connect codes ReportWorkflowRun documents as "do not retry".
+_PERMANENT_REPORT_CODES = frozenset({"invalid_argument", "not_found"})
+
+
+def _connect_error(resp: requests.Response) -> tuple[str, str]:
+    """(code, message) of a Connect error response.
+
+    Only the JSON body's ``code`` says what the server meant; without one
+    (a proxy's error page) Connect maps the HTTP status, and that mapping
+    never yields a permanent code (400 is "internal", 404 "unimplemented").
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and isinstance(body.get("code"), str):
+        message = body.get("message")
+        return body["code"], message if isinstance(message, str) else ""
+    return f"http_{resp.status_code}", ""
 
 
 @dataclass
@@ -505,12 +549,14 @@ class APIClient:
                 )
         return configs
 
-    def report_workflow_run(self, report: WorkflowRunReport) -> bool:
+    def report_workflow_run(self, report: WorkflowRunReport) -> ReportResult:
         """Report a workflow run's state — every step, every time.
 
         The API upserts on run_id (steps on run_id + position), so repeating a
-        report is harmless. Returns True on success, False on failure; never
-        raises, and never touches health status.
+        report is harmless. Returns DELIVERED, TRANSIENT (worth repeating) or
+        REJECTED (the server refused this report for good — see
+        ReportResult); only DELIVERED is truthy. Never raises, and never
+        touches health status.
         """
         url = f"{self.base_url}/workflow.v1.WorkflowService/ReportWorkflowRun"
         try:
@@ -541,8 +587,6 @@ class APIClient:
                     ],
                 },
             )
-            resp.raise_for_status()
-            return True
         except requests.RequestException:
             logger.warning(
                 "Failed to report workflow run %s (workflow %s)",
@@ -550,7 +594,28 @@ class APIClient:
                 report.workflow_id,
                 exc_info=True,
             )
-            return False
+            return ReportResult.TRANSIENT
+        if resp.status_code < 400:
+            return ReportResult.DELIVERED
+        code, message = _connect_error(resp)
+        if code in _PERMANENT_REPORT_CODES:
+            logger.error(
+                "FairTier API rejected the report of workflow run %s "
+                "(workflow %s) as %s: %s — not retrying it",
+                report.run_id,
+                report.workflow_id,
+                code,
+                message or "no message",
+            )
+            return ReportResult.REJECTED
+        logger.warning(
+            "Failed to report workflow run %s (workflow %s): %s %s",
+            report.run_id,
+            report.workflow_id,
+            code,
+            message,
+        )
+        return ReportResult.TRANSIENT
 
     def get_pending_source_tests(self) -> list[SourceTest]:
         """Claim this customer's queued source tests.
@@ -663,6 +728,33 @@ def _bool(record: dict[str, Any], key: str) -> bool:
     return value
 
 
+def _int(record: dict[str, Any], key: str) -> int:
+    """A proto3 int32 field: absent or null is 0. protojson writes int32 as a
+    JSON number but parsers also accept a decimal string, so both are read;
+    anything else (a bool, a fraction) raises, as for ``_str``."""
+    value = record.get(key)
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise TypeError(f"{key!r} is not an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        return int(value)  # ValueError on garbage — malformed, skipped
+    raise TypeError(f"{key!r} is not an integer")
+
+
+def _required_str(record: dict[str, Any], key: str) -> str:
+    """A string field that identifies something: proto3 omits it only when
+    it is empty, and empty is a malformed record."""
+    value = _str(record, key)
+    if not value:
+        raise ValueError(f"{key!r} is missing or empty")
+    return value
+
+
 def _parse_source_test(t: dict[str, Any]) -> SourceTest:
     return SourceTest(
         id=t["id"],
@@ -714,30 +806,37 @@ def _parse_workflow_record(w: dict[str, Any]) -> WorkflowConfig:
     """Map one API workflow record to a WorkflowConfig. Raises on malformed
     input — the caller skips the record and keeps the rest.
 
-    proto3 JSON omits zero values: a missing ``position`` is 0 and a missing
-    ``refEnabled`` is false, which is exactly what the server meant.
+    Every scalar goes through the proto3 helpers: the server omits zero
+    values (position 0, refEnabled/enabled/triggerNow false, empty strings),
+    and an explicit null means the same. ``id``, a step's ``kind`` and
+    ``refId`` are required — empty, they identify nothing.
     """
+    raw_steps = w.get("steps")
+    if raw_steps is None:
+        raw_steps = []
+    if not isinstance(raw_steps, list):
+        raise TypeError("'steps' is not a list")
     steps = [
         WorkflowStepConfig(
-            position=int(s.get("position", 0)),
-            kind=s["kind"],
-            ref_id=s["refId"],
-            name=s.get("name", ""),
-            ref_enabled=bool(s.get("refEnabled", False)),
+            position=_int(s, "position"),
+            kind=_required_str(s, "kind"),
+            ref_id=_required_str(s, "refId"),
+            name=_str(s, "name"),
+            ref_enabled=_bool(s, "refEnabled"),
         )
-        for s in w.get("steps", [])
+        for s in raw_steps
     ]
     steps.sort(key=lambda s: s.position)
     return WorkflowConfig(
-        id=w["id"],
-        name=w.get("name", ""),
-        schedule=w.get("schedule") or None,
-        enabled=bool(w.get("enabled", False)),
+        id=_required_str(w, "id"),
+        name=_str(w, "name"),
+        schedule=_str(w, "schedule") or None,
+        enabled=_bool(w, "enabled"),
         steps=steps,
-        trigger_now=bool(w.get("triggerNow", False)),
-        pending_run_id=w.get("pendingRunId", ""),
+        trigger_now=_bool(w, "triggerNow"),
+        pending_run_id=_str(w, "pendingRunId"),
         last_run_at=_parse_last_run_at(w),
-        last_run_status=w.get("lastRunStatus", ""),
+        last_run_status=_str(w, "lastRunStatus"),
     )
 
 
