@@ -272,7 +272,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
                 cfg.name,
                 _scrub_credentials(traceback.format_exc(), cfg.source_credentials),
             )
-            error_message = _scrub_credentials(str(exc), cfg.source_credentials)
+            error_message = _scrub_credentials(_error_text(exc), cfg.source_credentials)
             if resumed_rows is not None:
                 # The resumed packages ARE loaded (dlt marked them so); only
                 # this run's own data failed. Say so, count what landed, and
@@ -295,6 +295,47 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
                 rows_loaded=rows_loaded,
                 error_message=error_message,
             )
+
+
+def _error_text(exc: BaseException) -> str:
+    """A failed run's error message: its root cause first, then exc's text.
+
+    dlt wraps whatever a source or destination raised (PipelineStepFailed
+    around ResourceExtractionError around the real error), and its text
+    opens with a preamble that names no cause ("Pipeline execution failed
+    at `step=extract` ... with exception:"). Every one-line view of a run's
+    error reads the first line, so "<Type>: <message>" of the cause goes
+    first; dlt's full text follows unchanged, for the Console's error view
+    and the assistant's Explain. An exception dlt did not wrap is its own
+    text.
+    """
+    text = str(exc)
+    root = _root_cause(exc)
+    if root is exc:
+        return text
+    message = str(root)
+    cause = f"{type(root).__name__}: {message}" if message else type(root).__name__
+    return f"{cause}\n\n{text}"
+
+
+def _root_cause(exc: BaseException) -> BaseException:
+    """The first exception in exc's chain that dlt did not raise — the
+    source's, the driver's, the HTTP client's — or the innermost dlt one.
+
+    Stopping at the first foreign exception keeps what the source chose to
+    say: a source that wraps a KeyError in its own error means its own.
+    """
+    seen: set[int] = set()
+    current = exc
+    while type(current).__module__.split(".", 1)[0] == "dlt":
+        seen.add(id(current))
+        nxt = current.__cause__
+        if nxt is None and not current.__suppress_context__:
+            nxt = current.__context__
+        if nxt is None or id(nxt) in seen:
+            break
+        current = nxt
+    return current
 
 
 def _build_source(cfg: PipelineConfig) -> Any:

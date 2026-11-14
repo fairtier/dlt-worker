@@ -1227,6 +1227,24 @@ class TestRunPipelineErrorScrubbing:
         assert "***" in report.error_message
 
 
+class TestRunPipelineErrorRootCause:
+    """An exception dlt did not wrap is reported as it is."""
+
+    @patch("dlt_worker.pipeline_runner._build_source")
+    @patch("dlt_worker.pipeline_runner.dlt.pipeline")
+    def test_a_plain_exception_is_not_prefixed(
+        self, mock_pipeline: MagicMock, mock_build_source: MagicMock
+    ) -> None:
+        try:
+            raise KeyError("x")
+        except KeyError as inner:
+            mock_build_source.side_effect = ValueError("bad source config")
+            mock_build_source.side_effect.__cause__ = inner
+        report = run_pipeline(_make_config())
+        assert report.status == "failed"
+        assert report.error_message == "bad source config"
+
+
 class TestRunPipelineRowsLoaded:
     """rows_loaded against real dlt, local filesystem destination, Iceberg.
 
@@ -1364,6 +1382,30 @@ class TestRunPipelineRowsLoaded:
         assert report.rows_loaded == 7
         assert self._pipeline().list_normalized_load_packages() == []
         assert self._loaded_ids() == [0, 1, 2, *range(100, 107)]
+
+    def test_a_failure_leads_with_its_root_cause(self) -> None:
+        """dlt's own text opens with a preamble ("Pipeline execution failed
+        at `step=extract` ... with exception:") that names no cause; every
+        one-line view of the error reads the first line, so the cause goes
+        first and dlt's full text follows it unchanged."""
+
+        @dlt.resource(name="items")
+        def broken() -> Any:
+            try:
+                raise KeyError("an implementation detail")
+            except KeyError as exc:
+                raise RuntimeError("source exploded") from exc
+            yield  # pragma: no cover
+
+        report = self._run(broken)
+
+        assert report.status == "failed"
+        first, _, rest = report.error_message.partition("\n")
+        # The first exception dlt did not raise: the source's own, not the
+        # KeyError it chose to wrap.
+        assert first == "RuntimeError: source exploded"
+        assert "Pipeline execution failed at `step=extract`" in rest
+        assert "source exploded" in rest
 
     def test_runs_again_at_most_once(self) -> None:
         """If the second run() also only drained pending packages, the worker
