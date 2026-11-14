@@ -246,10 +246,29 @@ class WorkspaceRecorder:
 
         The central stuck-run sweep cannot see this database, so the worker
         finalizes its own orphans on startup and periodically.
+
+        The 2-hour age is NOT a bound on how long a run may take: a pipeline
+        run row stays ``running`` across all its attempts, each up to
+        ``PIPELINE_RUN_TIMEOUT_SECONDS`` (6 h by default), so a live row can
+        be far older. What keeps the sweep off live runs is that no live run
+        can exist when it fires:
+
+        * this worker runs everything synchronously inside a poll tick, and
+          the sweep runs only at startup and between ticks (``main.run``);
+        * there is one worker process per workspace database — the chart is
+          a single-replica StatefulSet, so a new pod starts only after the
+          old one is gone, and a run's subprocess (its own session, but the
+          same container PID namespace, with the worker as PID 1) dies with
+          the container that started it.
+
+        So every ``running`` row the sweep sees is an orphan, and the age is
+        only a margin against those invariants being broken (a second
+        worker pointed at the same database, a force-deleted pod). If they
+        are, a live row older than 2 hours reads ``failed`` until its run's
+        end write — an upsert of the real status — overwrites it.
         """
         # Two literal statements (not an f-string over the table name) so
-        # the SQL stays statically checkable. A `running` row older than
-        # 2 hours is an orphan — no run is allowed to take that long.
+        # the SQL stays statically checkable.
         sweeps: tuple[tuple[str, LiteralString], ...] = (
             (
                 "pipeline_runs",
