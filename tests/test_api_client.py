@@ -6,9 +6,16 @@ import logging
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 import requests
 
-from dlt_worker.api_client import APIClient, PipelineRunReport
+from dlt_worker.api_client import (
+    APIClient,
+    PipelineRunReport,
+    _parse_source_test,
+    _parse_transformation_record,
+    _parse_trigger_record,
+)
 
 
 def _make_client() -> APIClient:
@@ -358,6 +365,79 @@ class TestGetTransformationConfigs:
 
         assert client.get_transformation_configs() == []
 
+    def test_omitted_enabled_is_false(self) -> None:
+        """proto3 JSON omits a false bool, so an absent `enabled` IS false:
+        a disabled transformation must not parse as enabled."""
+        client = _make_client()
+        client._session = MagicMock()
+        client._session.post.return_value = _api_response(
+            {"transformations": [{"id": "t1", "name": "n"}]}
+        )
+
+        (cfg,) = client.get_transformation_configs()
+        assert cfg.enabled is False
+
+
+class TestProto3JsonDefaults:
+    """proto3 JSON: a zero value may be omitted OR sent as null, and both
+    mean the field's zero value ("" / false), never a type-confused None."""
+
+    def test_transformation_nulls_are_zero_values(self) -> None:
+        cfg = _parse_transformation_record(
+            {
+                "id": "t1",
+                "name": "n",
+                "repoUrl": None,
+                "repoRef": None,
+                "gitCredentials": None,
+                "schedule": None,
+                "triggerAfterPipelineId": None,
+                "dbtSelector": None,
+                "enabled": None,
+                "triggerNow": None,
+                "pendingRunId": None,
+                "lastRunAt": None,
+            }
+        )
+        assert cfg.repo_url == ""
+        assert cfg.repo_ref == "main"
+        assert cfg.git_credentials == {}
+        assert cfg.schedule is None
+        assert cfg.trigger_after_pipeline_id == ""
+        assert cfg.dbt_selector == ""
+        assert cfg.enabled is False
+        assert cfg.trigger_now is False
+        assert cfg.pending_run_id == ""
+        assert cfg.last_run_at is None
+
+    def test_trigger_nulls_are_zero_values(self) -> None:
+        trig = _parse_trigger_record(
+            {
+                "id": "p1",
+                "sourceCredentials": None,
+                "triggerNow": None,
+                "pendingRunId": None,
+                "lastRunAt": None,
+            }
+        )
+        assert trig.source_credentials == {}
+        assert trig.trigger_now is False
+        assert trig.pending_run_id == ""
+        assert trig.last_run_at is None
+
+    def test_source_test_nulls_are_zero_values(self) -> None:
+        t = _parse_source_test(
+            {
+                "id": "s1",
+                "sourceType": None,
+                "sourceConfig": None,
+                "sourceCredentials": None,
+            }
+        )
+        assert t.source_type == ""
+        assert t.source_config == {}
+        assert t.source_credentials == {}
+
 
 class TestReportTransformationRun:
     """Tests for APIClient.report_transformation_run."""
@@ -677,3 +757,9 @@ class TestReportWorkflowRun:
         )
         assert client.report_workflow_run(report) is False
         assert client.health_status()[0] is True
+
+    def test_wrongly_typed_scalar_is_malformed(self) -> None:
+        """Not a proto3 bool: the record is malformed (the caller skips it),
+        not silently read as true or false."""
+        with pytest.raises(TypeError):
+            _parse_transformation_record({"id": "t1", "name": "n", "enabled": "false"})

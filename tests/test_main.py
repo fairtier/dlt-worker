@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1521,3 +1522,48 @@ class TestConfigureLogging:
             assert logging.getLogger("dlt_worker.main").isEnabledFor(logging.INFO)
         finally:
             self._restore_root(saved)
+
+
+class TestStaleSweepNeverOverlapsARun:
+    """workspace_db.finalize_stale_runs fails every `running` row older than
+    2 hours, while a run may legitimately take 6 h per attempt. That is safe
+    only because the sweep never runs while this worker has a run in flight:
+    it runs on the poll-loop thread, at startup and between ticks — never
+    from another thread, never inside a tick. Pin that."""
+
+    def test_sweep_only_between_ticks_on_the_loop_thread(self) -> None:
+        loop_thread = threading.get_ident()
+        events: list[str] = []
+        recorder = MagicMock()
+
+        def sweep() -> None:
+            assert threading.get_ident() == loop_thread
+            events.append("sweep")
+
+        recorder.finalize_stale_runs.side_effect = sweep
+
+        def tick(_client: Any) -> None:
+            events.append("tick")
+            if events.count("tick") == 3:
+                main._shutdown = True
+
+        main._shutdown = False
+        with (
+            patch.object(main.config, "load"),
+            patch.object(main.config, "POLL_INTERVAL_SECONDS", 0),
+            patch.object(main, "_configure_logging"),
+            patch.object(main.telemetry, "setup"),
+            patch.object(main.workspace_db, "from_env", return_value=recorder),
+            patch.object(main.signal, "signal"),
+            patch.object(main, "start_health_server"),
+            # Due on every iteration: the most a sweep can ever fire.
+            patch.object(main, "_STALE_SWEEP_INTERVAL", 0),
+            patch.object(main, "_tick", side_effect=tick),
+        ):
+            try:
+                main.run()
+            finally:
+                main._shutdown = False
+                main._recorder = None
+
+        assert events == ["sweep", "tick", "sweep", "tick", "sweep", "tick", "sweep"]
