@@ -24,6 +24,7 @@ from dlt_worker.api_client import (
     PipelineConfig,
     PipelineRunReport,
     PipelineTrigger,
+    ReportResult,
     TransformationConfig,
     TransformationRunReport,
     WorkflowConfig,
@@ -90,8 +91,10 @@ _workflow_started_at: dict[str, datetime] = {}
 
 # Workflows: final reports the API did not take, per workflow id, with the
 # number of delivery attempts so far. Flushed before every GetWorkflowConfigs
-# — until one lands, the server still shows the run as running (or a manual
-# trigger as pending), so its workflow is held back rather than re-run.
+# — until one lands, the server still shows the run as running (and withholds
+# the workflow from GetWorkflowConfigs), so it is held back here as well.
+# Only transient failures are kept: a report the API rejected for good
+# (InvalidArgument, NotFound) fails the same way every time and is dropped.
 _unsent_workflow_reports: dict[str, tuple[WorkflowRunReport, int]] = {}
 _WORKFLOW_REPORT_MAX_ATTEMPTS = 10
 
@@ -120,6 +123,8 @@ class _Tick:
     running anything twice in one tick.
     """
 
+    # The tick's time — the schedule baseline of every pipeline run this tick,
+    # standalone or as a workflow step. A lambda so tests can move _utcnow.
     now: datetime = field(default_factory=lambda: _utcnow())
     # Files mode definitions of this tick, by pipeline id.
     pipelines: dict[str, PipelineConfig] = field(default_factory=dict)
@@ -629,7 +634,7 @@ def _process_file_pipeline(
         return
 
     report, run_id = _execute_pipeline(cfg, now, client)
-    _record_pipeline_outcome(cfg, report, run_id, now, tick)
+    _record_pipeline_outcome(cfg, report, run_id, tick)
 
 
 _CREDENTIAL_SKIP_REASONS = {
@@ -646,13 +651,15 @@ def _record_pipeline_outcome(
     cfg: PipelineConfig,
     report: PipelineRunReport | None,
     run_id: str,
-    started: datetime,
     tick: _Tick,
 ) -> None:
     """Book a finished pipeline run into the tick and the scheduler state.
 
-    Shared by a standalone run and a workflow step, so a workflow-run
-    pipeline moves its own cron baseline exactly as a standalone run would.
+    Shared by a standalone run and a workflow step. Either way the cron
+    baseline recorded is the tick's time (``tick.now``), never the moment
+    the run got its turn: a step runs after every due pipeline of the tick,
+    and recording its start would push the pipeline's next slot later each
+    time it runs in a workflow.
     """
     status = report.status if report is not None else "failed"
     tick.pipeline_runs[cfg.id] = _RunOutcome(
@@ -665,12 +672,11 @@ def _record_pipeline_outcome(
     if status != "success":
         return
     tick.succeeded.add(cfg.id)
-    # Record the run *start* time, mirroring central semantics
-    # (last_run_at = created_at of the last success). Success-only:
-    # a failing scheduled pipeline keeps re-firing, exactly as in
-    # legacy mode.
+    # Record the tick that admitted the run (see the docstring), mirroring
+    # central semantics (last_run_at = created_at of the last success).
+    # Success-only: a failure backs off through _last_failure_at instead.
     if tick.state is not None:
-        tick.state.record(cfg.id, started)
+        tick.state.record(cfg.id, tick.now)
     # Extra best-effort snapshot so scheduler.json lands in the
     # post-run commit instead of waiting for the autosave window
     # (a crash in between would re-fire the run once).
@@ -873,13 +879,20 @@ def _workflow_due(wf: WorkflowConfig, now: datetime) -> str | None:
 def _flush_workflow_reports(client: APIClient) -> None:
     """Re-send final workflow reports an earlier tick could not deliver.
 
-    Bounded: a report the API keeps refusing (the workflow was deleted, say)
-    is dropped after _WORKFLOW_REPORT_MAX_ATTEMPTS ticks rather than holding
-    its workflow back forever.
+    A report the API rejects for good (InvalidArgument, NotFound — the
+    workflow was deleted, say) is dropped at once. Transient failures are
+    retried, bounded: after _WORKFLOW_REPORT_MAX_ATTEMPTS ticks the report is
+    dropped rather than holding its workflow back forever (the server's
+    stuck-run sweep then fails the run).
     """
     for workflow_id, (report, attempts) in list(_unsent_workflow_reports.items()):
-        if client.report_workflow_run(report):
+        result = client.report_workflow_run(report)
+        if result:
             del _unsent_workflow_reports[workflow_id]
+            continue
+        if result is ReportResult.REJECTED:
+            del _unsent_workflow_reports[workflow_id]
+            _report_rejected(report)
             continue
         attempts += 1
         if attempts >= _WORKFLOW_REPORT_MAX_ATTEMPTS:
@@ -932,7 +945,7 @@ def _run_due_workflows(
                     wf.name,
                 )
                 continue
-            trigger = _workflow_due(wf, datetime.now(UTC))
+            trigger = _workflow_due(wf, _utcnow())
             if trigger is None:
                 continue
             _execute_workflow(wf, trigger, tick, transformations_by_id, client)
@@ -945,19 +958,36 @@ def _run_due_workflows(
 
 
 def _iso_now() -> str:
-    return datetime.now(UTC).isoformat()
+    return _utcnow().isoformat()
 
 
-def _send_workflow_report(client: APIClient, report: WorkflowRunReport) -> bool:
+def _send_workflow_report(client: APIClient, report: WorkflowRunReport) -> ReportResult:
     """One best-effort attempt. A miss is not retried here: the next
-    transition re-sends the whole run, and the final one falls back to
-    _unsent_workflow_reports."""
-    ok = client.report_workflow_run(report)
-    if not ok:
+    transition re-sends the whole run, and a transiently failed final one
+    falls back to _unsent_workflow_reports."""
+    result = client.report_workflow_run(report)
+    if not result:
         telemetry.add_event(
             "workflow.report_failed", {telemetry.ATTR_RUN_ID: report.run_id}
         )
-    return ok
+    return result
+
+
+def _report_rejected(report: WorkflowRunReport) -> None:
+    """A final report the API refused for good: log it, count it, move on."""
+    telemetry.add_event(
+        "workflow.report_dropped",
+        {
+            telemetry.ATTR_WORKFLOW_ID: report.workflow_id,
+            "dlt_worker.reason": "rejected",
+        },
+    )
+    logger.error(
+        "Dropping the final report of workflow run %s (%s): the API rejected it "
+        "as invalid or the workflow is gone — not retrying",
+        report.run_id,
+        report.status,
+    )
 
 
 def _execute_workflow(
@@ -971,7 +1001,7 @@ def _execute_workflow(
     # The pending id is the run the person queued; reporting it as running
     # is also what clears trigger_now server-side.
     run_id = wf.pending_run_id or str(uuid.uuid4())
-    started = datetime.now(UTC)
+    started = _utcnow()
     started_mono = time.monotonic()
     _workflow_started_at[wf.id] = started
     logger.info("Running workflow: %s (%d steps, %s)", wf.name, len(wf.steps), trigger)
@@ -1067,7 +1097,10 @@ def _execute_workflow(
         telemetry.workflow_runs.add(1, attrs)
         telemetry.workflow_run_duration.record(time.monotonic() - started_mono, attrs)
 
-        if not _send_workflow_report(client, report):
+        result = _send_workflow_report(client, report)
+        if result is ReportResult.REJECTED:
+            _report_rejected(report)
+        elif not result:
             _unsent_workflow_reports[wf.id] = (report, 1)
             logger.error(
                 "Failed to report the outcome of workflow run %s; retrying next tick",
@@ -1143,23 +1176,25 @@ def _run_pipeline_step(
     tick: _Tick,
     client: APIClient,
 ) -> None:
-    if not step.ref_enabled:
-        _fail_step(step_run, "pipeline is disabled")
+    # Not step.ref_enabled: for a pipeline the definition file's `enabled`
+    # wins, as for every other pipeline field in files mode — the
+    # database-derived ref_enabled can lag the checkout (worker contract).
+    # Checked before reuse, so a disabled pipeline that ran this tick on its
+    # own Run-now still fails the step, as a disabled target must.
+    found = tick.pipelines.get(step.ref_id)
+    if found is not None and not found.enabled:
+        _fail_step(step_run, "pipeline is disabled (in its definition file)")
         return
     prior = tick.pipeline_runs.get(step.ref_id)
     if prior is not None:
         _reuse_outcome(step, step_run, prior)
         return
-    found = tick.pipelines.get(step.ref_id)
     if found is None:
         _fail_step(
             step_run,
             "pipeline not found: no definition in the pipelines checkout "
             "(not mirrored yet, deleted, or its file does not load)",
         )
-        return
-    if not found.enabled:
-        _fail_step(step_run, "pipeline is disabled (in its definition file)")
         return
     # A copy: this tick's config object carries the pipeline's own trigger
     # fields, and a step is not the pipeline's Run-now.
@@ -1169,9 +1204,10 @@ def _run_pipeline_step(
         _fail_step(step_run, f"pipeline cannot run: {_CREDENTIAL_SKIP_REASONS[reason]}")
         return
 
-    started = datetime.now(UTC)
-    report, run_id = _execute_pipeline(cfg, started, client, trigger="workflow")
-    _record_pipeline_outcome(cfg, report, run_id, started, tick)
+    # tick.now, not the step's start: it is the pipeline's schedule
+    # baseline (see _record_pipeline_outcome). The run stamps its own start.
+    report, run_id = _execute_pipeline(cfg, tick.now, client, trigger="workflow")
+    _record_pipeline_outcome(cfg, report, run_id, tick)
     step_run.pipeline_run_id = run_id
     if report is not None and report.status == "success":
         step_run.status = "success"
@@ -1206,7 +1242,9 @@ def _run_transformation_step(
     # The config as served, pending_run_id included: if the transformation
     # also has a Run-now queued, this run is that run — one run satisfies
     # both, and the transformation phase after this one skips it.
-    report = _execute_transformation(cfg, datetime.now(UTC), client, "workflow")
+    # tick.now is only the failure-backoff baseline; the run stamps its own
+    # start (_execute_transformation).
+    report = _execute_transformation(cfg, tick.now, client, "workflow")
     tick.transformation_runs[cfg.id] = _transformation_outcome(report)
     step_run.transformation_run_id = report.run_id
     if report.status == "success":

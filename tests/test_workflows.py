@@ -23,6 +23,7 @@ from dlt_worker.api_client import (
     PipelineConfig,
     PipelineRunReport,
     PipelineTrigger,
+    ReportResult,
     TransformationConfig,
     TransformationRunReport,
     WorkflowConfig,
@@ -30,7 +31,7 @@ from dlt_worker.api_client import (
     WorkflowStepConfig,
 )
 from dlt_worker.scheduler_state import SchedulerState
-from tests.test_main import _make_tconfig, _write_pipeline_yaml
+from tests.test_main import _Clock, _make_tconfig, _write_pipeline_yaml
 
 
 def _wf(**overrides: Any) -> WorkflowConfig:
@@ -148,9 +149,9 @@ class _Recorder:
         self.client.report_pipeline_run.return_value = True
         self.client.report_transformation_run.return_value = True
         self.sent: list[WorkflowRunReport] = []
-        self.accept = True
+        self.accept: bool | ReportResult = True
 
-        def report(r: WorkflowRunReport) -> bool:
+        def report(r: WorkflowRunReport) -> bool | ReportResult:
             self.sent.append(copy.deepcopy(r))
             return self.accept
 
@@ -307,7 +308,44 @@ class TestRunWorkflows:
         assert final.step_runs[0].pipeline_run_id
         rec.client.report_pipeline_run.assert_called_once()
 
-    def test_disabled_target_fails_without_running(self) -> None:
+    def test_disabled_pipeline_file_fails_without_running(self) -> None:
+        _write_pipeline_yaml(
+            self.checkout, "orders.yaml", "p1", schedule=None, enabled=False
+        )
+        rec = _Recorder([_wf(trigger_now=True)])  # ref_enabled True
+
+        self._tick(rec)
+
+        self.p_run.assert_not_called()
+        self.t_run.assert_not_called()
+        final = rec.sent[-1]
+        assert [s.status for s in final.step_runs] == ["failed", "skipped"]
+        assert final.step_runs[0].error_message == (
+            "pipeline is disabled (in its definition file)"
+        )
+        assert final.step_runs[0].pipeline_run_id == ""
+
+    def test_disabled_pipeline_run_by_its_run_now_still_fails_the_step(
+        self,
+    ) -> None:
+        """A Run-now runs a disabled pipeline standalone; a workflow step
+        must not take that run as its own — a disabled target fails."""
+        _write_pipeline_yaml(
+            self.checkout, "orders.yaml", "p1", schedule=None, enabled=False
+        )
+        rec = _Recorder([_wf(trigger_now=True)])
+
+        self._tick(rec, triggers=[PipelineTrigger(id="p1", trigger_now=True)])
+
+        self.p_run.assert_called_once()  # the Run-now, not the step
+        step = rec.sent[-1].step_runs[0]
+        assert step.status == "failed"
+        assert step.error_message == "pipeline is disabled (in its definition file)"
+
+    def test_pipeline_file_enabled_wins_over_ref_enabled(self) -> None:
+        """Worker contract: for a pipeline the definition file's `enabled`
+        wins over the database-derived ref_enabled, as for every other
+        pipeline field in files mode (the database may lag the checkout)."""
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
         wf = _wf(
             trigger_now=True,
@@ -320,12 +358,8 @@ class TestRunWorkflows:
 
         self._tick(rec)
 
-        self.p_run.assert_not_called()
-        self.t_run.assert_not_called()
-        final = rec.sent[-1]
-        assert [s.status for s in final.step_runs] == ["failed", "skipped"]
-        assert final.step_runs[0].error_message == "pipeline is disabled"
-        assert final.step_runs[0].pipeline_run_id == ""
+        self.p_run.assert_called_once()
+        assert [s.status for s in rec.sent[-1].step_runs] == ["success", "success"]
 
     def test_disabled_transformation_fails_without_running(self) -> None:
         wf = _wf(
@@ -498,6 +532,65 @@ class TestRunWorkflows:
 
         assert main._unsent_workflow_reports == {}
 
+    def test_rejected_final_report_is_not_retained(self, caplog: Any) -> None:
+        """InvalidArgument / NotFound: the same report fails the same way, so
+        it is dropped at once — not retried for ten ticks while holding its
+        workflow back."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
+        rec = _Recorder([_wf(trigger_now=True, pending_run_id="pend-1")])
+        rec.accept = ReportResult.REJECTED
+
+        with caplog.at_level("ERROR", logger="dlt_worker.main"):
+            self._tick(rec)
+
+        assert rec.sent[-1].status == "success"
+        assert main._unsent_workflow_reports == {}
+        assert any(
+            "pend-1" in r.getMessage() and "not retrying" in r.getMessage()
+            for r in caplog.records
+        )
+
+        # Next tick: nothing to flush, and the workflow is not held back.
+        rec.accept = True
+        rec.sent.clear()
+        rec.client.get_workflow_configs.return_value = [_wf(trigger_now=True)]
+        self._tick(rec)
+        assert [r.status for r in rec.sent][-1] == "success"
+        assert self.p_run.call_count == 2
+
+    def test_rejected_flush_is_dropped_on_first_refusal(self) -> None:
+        report = WorkflowRunReport(
+            run_id="r",
+            workflow_id="w1",
+            status="success",
+            trigger="schedule",
+            started_at="2026-01-01T00:00:00+00:00",
+        )
+        main._unsent_workflow_reports["w1"] = (report, 1)
+        client = MagicMock()
+        client.report_workflow_run.return_value = ReportResult.REJECTED
+
+        main._flush_workflow_reports(client)
+
+        assert main._unsent_workflow_reports == {}
+        client.report_workflow_run.assert_called_once()
+
+    def test_transient_flush_failure_is_kept(self) -> None:
+        report = WorkflowRunReport(
+            run_id="r",
+            workflow_id="w1",
+            status="success",
+            trigger="schedule",
+            started_at="2026-01-01T00:00:00+00:00",
+        )
+        main._unsent_workflow_reports["w1"] = (report, 1)
+        client = MagicMock()
+        client.report_workflow_run.return_value = ReportResult.TRANSIENT
+
+        main._flush_workflow_reports(client)
+
+        assert main._unsent_workflow_reports == {"w1": (report, 2)}
+
     # --- dedupe with standalone runs ---
 
     def test_pipeline_that_ran_by_its_own_cron_is_not_run_again(self) -> None:
@@ -633,3 +726,162 @@ def _load(pipeline_id: str) -> PipelineConfig:
     cfg = main._reload_definition(pipeline_id)
     assert cfg is not None
     return cfg
+
+
+# --- time: run starts vs. the tick's schedule baseline ---
+
+
+class TestWorkflowTimes:
+    """A workflow runs after every due pipeline of the tick, so its steps
+    start long after the tick did. Each run records when it actually began
+    (durations, the stuck-run sweep), while a pipeline's own cron baseline
+    stays the tick time whichever way it was run — a standalone run and a
+    workflow step move it alike, so the schedule does not drift."""
+
+    TICK = datetime(2026, 1, 1, 10, 0, 5, tzinfo=UTC)
+
+    @pytest.fixture(autouse=True)
+    def _files_mode(self, tmp_path: Path) -> Iterator[None]:
+        self.checkout = tmp_path / "checkout"
+        (self.checkout / "pipelines").mkdir(parents=True)
+        self.state_dir = tmp_path / "state"
+        self.state_dir.mkdir()
+        config.PIPELINES_DIR = str(self.checkout)
+        config.DLT_STATE_DIR = str(self.state_dir)
+        config.AGE_KEY_FILE = ""
+        config.PIPELINE_MAX_RETRIES = 0
+        main._shutdown = False
+        main._creds_cache.clear()
+        main._last_failure_at.clear()
+        main._workflow_started_at.clear()
+        main._unsent_workflow_reports.clear()
+        self.recorder = MagicMock()
+        main._recorder = self.recorder
+        self.clock = _Clock(self.TICK)
+
+        # p0: hourly, due this tick, takes 20 minutes. p1: every 15 minutes,
+        # last run a moment before the tick, so only the workflow runs it.
+        _write_pipeline_yaml(self.checkout, "a_long.yaml", "p0", schedule="0 * * * *")
+        _write_pipeline_yaml(
+            self.checkout, "b_step.yaml", "p1", schedule="*/15 * * * *"
+        )
+        state = SchedulerState.load(str(self.state_dir))
+        state.record("p0", datetime(2026, 1, 1, 9, 0, 5, tzinfo=UTC))
+        state.record("p1", datetime(2026, 1, 1, 10, 0, 1, tzinfo=UTC))
+
+        durations = {"p0": 20, "p1": 5}
+        self.p_status = "success"
+
+        def run_pipeline(cfg: PipelineConfig) -> PipelineRunReport:
+            report = self.clock.run_for(cfg, durations[cfg.id])
+            if cfg.id == "p1":
+                report.status = self.p_status
+            return report
+
+        def run_transformation(cfg: TransformationConfig) -> TransformationRunReport:
+            # The child's own clock, deliberately unlike the run's start.
+            report = TransformationRunReport(
+                transformation_id=cfg.id,
+                status="success",
+                started_at="2020-01-01T00:00:00+00:00",
+                completed_at="",
+            )
+            self.clock.at += timedelta(minutes=10)
+            report.completed_at = self.clock.at.isoformat()
+            return report
+
+        patch("dlt_worker.main._utcnow", self.clock).start()
+        patch("dlt_worker.main.run_pipeline_isolated", side_effect=run_pipeline).start()
+        patch(
+            "dlt_worker.main.run_transformation_isolated",
+            side_effect=run_transformation,
+        ).start()
+        patch("dlt_worker.main.trigger_snapshot").start()
+        patch("dlt_worker.main.time.sleep").start()
+        yield
+        patch.stopall()
+        main._recorder = None
+        config.PIPELINES_DIR = ""
+        main._creds_cache.clear()
+        main._last_failure_at.clear()
+        main._workflow_started_at.clear()
+        main._unsent_workflow_reports.clear()
+
+    def _tick(self, rec: _Recorder) -> None:
+        rec.client.try_get_pipeline_triggers.return_value = [
+            PipelineTrigger(id="p0"),
+            PipelineTrigger(id="p1"),
+        ]
+        rec.client.get_transformation_configs.return_value = [_make_tconfig()]
+        main._poll_and_run(rec.client)
+
+    def _workflow(self) -> WorkflowConfig:
+        return _wf(
+            trigger_now=True,
+            steps=[
+                WorkflowStepConfig(0, "pipeline", "p1", "b_step", True),
+                WorkflowStepConfig(1, "transformation", "t1", "nightly", True),
+            ],
+        )
+
+    def _at(self, minutes: int) -> datetime:
+        return self.TICK + timedelta(minutes=minutes)
+
+    def test_step_keeps_the_pipelines_cron_baseline_on_the_tick(self) -> None:
+        rec = _Recorder([self._workflow()])
+
+        self._tick(rec)
+
+        state = SchedulerState.load(str(self.state_dir))
+        assert state.get("p0") == self.TICK
+        # Not 10:20:05, when the step got its turn: that would move a
+        # */15 schedule's next slot from 10:15 to 10:30.
+        assert state.get("p1") == self.TICK
+
+    def test_failed_step_backs_off_from_the_tick(self) -> None:
+        self.p_status = "failed"
+        rec = _Recorder([self._workflow()])
+
+        self._tick(rec)
+
+        assert rec.sent[-1].status == "failed"
+        assert main._last_failure_at["p1"] == self.TICK
+
+    def test_step_runs_record_their_own_start(self) -> None:
+        rec = _Recorder([self._workflow()])
+
+        self._tick(rec)
+
+        # Pipeline step: local start row, and the run's own report.
+        starts = {
+            c[0][1]: c[0][2]
+            for c in self.recorder.record_pipeline_run_start.call_args_list
+        }
+        assert starts == {"p0": self.TICK, "p1": self._at(20)}
+        p1_report = next(
+            c[0][0]
+            for c in rec.client.report_pipeline_run.call_args_list
+            if c[0][0].pipeline_id == "p1"
+        )
+        assert p1_report.started_at == self._at(20).isoformat()
+
+        # Transformation step: the run's start, not the child's clock.
+        [t_start] = self.recorder.record_transformation_run_start.call_args_list
+        assert t_start[0][2] == self._at(25)
+        t_report = rec.client.report_transformation_run.call_args[0][0]
+        assert t_report.started_at == self._at(25).isoformat()
+
+    def test_workflow_and_step_timestamps_follow_the_clock(self) -> None:
+        rec = _Recorder([self._workflow()])
+
+        self._tick(rec)
+
+        final = rec.sent[-1]
+        assert final.status == "success"
+        assert final.started_at == self._at(20).isoformat()
+        assert final.completed_at == self._at(35).isoformat()
+        assert [(s.started_at, s.completed_at) for s in final.step_runs] == [
+            (self._at(20).isoformat(), self._at(25).isoformat()),
+            (self._at(25).isoformat(), self._at(35).isoformat()),
+        ]
+        assert main._workflow_started_at["w1"] == self._at(20)
