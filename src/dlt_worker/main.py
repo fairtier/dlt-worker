@@ -120,7 +120,7 @@ class _Tick:
     running anything twice in one tick.
     """
 
-    now: datetime = field(default_factory=lambda: datetime.now(UTC))
+    now: datetime = field(default_factory=lambda: _utcnow())
     # Files mode definitions of this tick, by pipeline id.
     pipelines: dict[str, PipelineConfig] = field(default_factory=dict)
     polled: list[PipelineTrigger] | None = None
@@ -152,6 +152,11 @@ def _handle_signal(signum: int, _frame: object) -> None:
     global _shutdown
     logger.info("Received signal %d, shutting down gracefully...", signum)
     _shutdown = True
+
+
+def _utcnow() -> datetime:
+    """The wall clock — one seam, so tests can move time."""
+    return datetime.now(UTC)
 
 
 def _should_run(cfg: PipelineConfig | TransformationConfig, now: datetime) -> bool:
@@ -377,8 +382,21 @@ def _execute_pipeline(
     client: APIClient,
     trigger: str | None = None,
 ) -> tuple[PipelineRunReport | None, str]:
-    """Run one due pipeline; returns its final report and run id."""
+    """Run one due pipeline; returns its final report and run id.
+
+    ``now`` is the tick's time — for a workflow step too, not the step's
+    start: the schedule baseline (it backs
+    ``_last_failure_at`` here and ``last_run_at`` in the caller), which must
+    not move with queueing or the schedule drifts later every run. It is
+    NOT this run's start — pipelines in one tick run one after another, so
+    a run queued behind a long one starts long after the tick did. The run
+    stamps its own start, and every record of it (local start row, central
+    "running" mark, final report) carries that one value: durations stay
+    honest, and the stuck-run sweep, which ages rows from started_at,
+    cannot fail a short run for the time it spent waiting its turn.
+    """
     logger.info("Running pipeline: %s (%s)", cfg.name, cfg.source_type)
+    run_started_at = _utcnow()
 
     # Local-first: the run exists in the workspace database before it
     # starts — under the central pending id when there is one (one run,
@@ -400,7 +418,7 @@ def _execute_pipeline(
         },
     ) as span:
         if _recorder:
-            _recorder.record_pipeline_run_start(local_run_id, cfg.id, now)
+            _recorder.record_pipeline_run_start(local_run_id, cfg.id, run_started_at)
 
         # Mark a triggered run as "running" before execution, so the Console
         # stops showing it as queued. Only triggered runs: a scheduled run has
@@ -412,7 +430,7 @@ def _execute_pipeline(
                 PipelineRunReport(
                     pipeline_id=cfg.id,
                     status="running",
-                    started_at=now.isoformat(),
+                    started_at=run_started_at.isoformat(),
                     completed_at="",
                     run_id=cfg.pending_run_id,
                 )
@@ -425,7 +443,7 @@ def _execute_pipeline(
                     cfg.pending_run_id,
                 )
 
-        report = _run_with_retry(cfg, local_run_id, client)
+        report = _run_with_retry(cfg, local_run_id, client, run_started_at)
         if report is not None:
             if report.status == "success":
                 _last_failure_at.pop(cfg.id, None)
@@ -693,7 +711,7 @@ def _run_due_transformations(
     if not configs:
         return
 
-    now = datetime.now(UTC)
+    now = _utcnow()
     ran: set[str] = set(tick.transformation_runs) if tick is not None else set()
 
     for cfg in configs:
@@ -741,8 +759,15 @@ def _execute_transformation(
     """Run one transformation, record it locally first, report it centrally.
 
     The one code path for a standalone run and a workflow step alike.
+
+    ``now`` is the schedule baseline (it backs ``_last_failure_at``), as for
+    ``_execute_pipeline``; the run stamps its own start, because
+    transformations run after every pipeline and workflow of the tick and one
+    after another. The local start row and the central report carry that one
+    value — the child's own clock would otherwise disagree with the local row.
     """
     logger.info("Running transformation: %s", cfg.name)
+    run_started_at = _utcnow()
 
     # Local-first: same identity rules as pipelines (central pending id
     # when triggered, else a worker-generated UUID).
@@ -760,7 +785,7 @@ def _execute_transformation(
     ) as span:
         if _recorder:
             _recorder.record_transformation_run_start(
-                local_run_id, cfg.id, datetime.now(UTC)
+                local_run_id, cfg.id, run_started_at
             )
 
         report = run_transformation_isolated(cfg)
@@ -768,6 +793,7 @@ def _execute_transformation(
         # upsert on the id the run was recorded under, so a scheduled
         # run cannot end up as two rows.
         report.run_id = local_run_id
+        report.started_at = run_started_at.isoformat()
         if report.status == "success":
             _last_failure_at.pop(cfg.id, None)
         else:
@@ -1297,13 +1323,21 @@ def _refresh_config(cfg: PipelineConfig, client: APIClient) -> bool:
 
 
 def _run_with_retry(
-    cfg: PipelineConfig, local_run_id: str, client: APIClient
+    cfg: PipelineConfig,
+    local_run_id: str,
+    client: APIClient,
+    run_started_at: datetime | None = None,
 ) -> PipelineRunReport | None:
     """Run a pipeline with exponential-backoff retries on failure.
 
     Every retry re-reads the definition and credentials first
     (``_refresh_config``), so a fix that lands mid-run is picked up rather
     than slept through.
+
+    ``run_started_at``, when given, replaces each attempt's own start on the
+    report: the run row is one identity across attempts, and the local end
+    write never touches started_at, so the central report has to carry the
+    run's start too for the two stores to agree.
 
     Returns the final run report."""
     max_attempts = config.PIPELINE_MAX_RETRIES + 1
@@ -1336,6 +1370,8 @@ def _run_with_retry(
         # rows for one run wherever the two stores are the same database
         # (a box serving its own workspace plane).
         report.run_id = local_run_id
+        if run_started_at is not None:
+            report.started_at = run_started_at.isoformat()
 
         if report.status == "success" or attempt == max_attempts - 1:
             # Success, or final attempt — record and return.
