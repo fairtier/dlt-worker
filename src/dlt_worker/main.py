@@ -242,7 +242,6 @@ def run() -> None:
     _recorder = workspace_db.from_env()
     if _recorder:
         logger.info("Local-first run recording enabled (workspace database)")
-        _recorder.finalize_stale_runs()
 
     # Only the process that actually runs dlt needs the patch, and with
     # subprocess isolation that is the child — run_isolation applies it
@@ -272,6 +271,10 @@ def run() -> None:
             "tenant-bound auth"
         )
 
+    # Runs first, workflow runs second: an interrupted step's own run then
+    # already reads failed when the workflow run's final report (naming that
+    # run, failed) goes out and raises the workflow notification.
+    _finalize_orphaned_runs(client)
     _finalize_orphaned_workflow_runs(client)
 
     start_health_server(client, config.HEALTHZ_PORT, config.PIPELINES_DIR)
@@ -924,6 +927,45 @@ def _flush_workflow_reports(client: APIClient) -> None:
             )
         else:
             _unsent_workflow_reports[workflow_id] = (report, attempts)
+
+
+def _finalize_orphaned_runs(client: APIClient) -> None:
+    """At startup: fail the pipeline/transformation runs a killed worker left
+    ``running``, and report each failure through the normal report path.
+
+    A freshly started worker has no run in flight (see
+    ``WorkspaceRecorder.claim_orphaned_runs`` for the invariants), so every
+    ``running`` row is dead — and a dead ``running`` pipeline row is what
+    ``TriggerPipeline`` answers Run now with, so it must not wait for the
+    2 h stale sweep. The local SQL claim is the record (where this database
+    is the API's own, it IS the API's row); the report is what a run failing
+    any other way sends, so the API's ``notifyRun`` raises the usual
+    "pipeline/transformation failed" notification once, and a standalone
+    store's central row is finalized too. An interrupted workflow step thus
+    yields exactly what a step failing for any other reason does: its run's
+    notification plus the one workflow notification
+    (``_finalize_orphaned_workflow_runs``, which runs after this).
+
+    One attempt per report, no retry sleeps: startup must not stall on an
+    unreachable API, and a miss costs only that notification (or, with a
+    standalone store, the central row's freshness — the API's stuck
+    pipeline-run sweep still covers pipelines there).
+    """
+    if _recorder is None:
+        return
+    pipelines, transformations = _recorder.claim_orphaned_runs()
+    for report in pipelines:
+        if not client.report_pipeline_run(report):
+            logger.error(
+                "Could not report orphaned pipeline run %s as failed",
+                report.run_id,
+            )
+    for t_report in transformations:
+        if not client.report_transformation_run(t_report):
+            logger.error(
+                "Could not report orphaned transformation run %s as failed",
+                t_report.run_id,
+            )
 
 
 def _finalize_orphaned_workflow_runs(client: APIClient) -> None:

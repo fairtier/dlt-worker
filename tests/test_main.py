@@ -1542,6 +1542,13 @@ class TestStaleSweepNeverOverlapsARun:
 
         recorder.finalize_stale_runs.side_effect = sweep
 
+        def claim() -> tuple[list[Any], list[Any]]:
+            assert threading.get_ident() == loop_thread
+            events.append("claim")
+            return [], []
+
+        recorder.claim_orphaned_runs.side_effect = claim
+
         def tick(_client: Any) -> None:
             events.append("tick")
             if events.count("tick") == 3:
@@ -1566,4 +1573,123 @@ class TestStaleSweepNeverOverlapsARun:
                 main._shutdown = False
                 main._recorder = None
 
-        assert events == ["sweep", "tick", "sweep", "tick", "sweep", "tick", "sweep"]
+        # Startup fails every running row (claim, no age margin); between
+        # ticks only the 2 h sweep runs.
+        assert events == ["claim", "tick", "sweep", "tick", "sweep", "tick", "sweep"]
+
+
+class TestFinalizeOrphanedRunsAtStartup:
+    """A restarted worker has nothing in flight, so every `running` pipeline
+    and transformation row is a dead run: failed at once (not after the 2 h
+    margin — a dead `running` row swallows every Run now meanwhile), then
+    reported through the normal report path so the central row and the
+    API's usual failure notification follow."""
+
+    @staticmethod
+    def _claimed() -> tuple[list[PipelineRunReport], list[TransformationRunReport]]:
+        return (
+            [
+                PipelineRunReport(
+                    pipeline_id="p1",
+                    status="failed",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    completed_at="2026-01-01T00:10:00+00:00",
+                    error_message="worker restarted mid-run",
+                    run_id="pr-1",
+                )
+            ],
+            [
+                TransformationRunReport(
+                    transformation_id="t1",
+                    status="failed",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    completed_at="2026-01-01T00:10:00+00:00",
+                    error_message="worker restarted mid-run",
+                    run_id="tr-1",
+                )
+            ],
+        )
+
+    def test_claimed_runs_are_reported_once_each(self) -> None:
+        main._recorder = MagicMock()
+        pipelines, transformations = self._claimed()
+        main._recorder.claim_orphaned_runs.return_value = (pipelines, transformations)
+        client = MagicMock()
+        client.report_pipeline_run.return_value = True
+        client.report_transformation_run.return_value = True
+        try:
+            main._finalize_orphaned_runs(client)
+        finally:
+            main._recorder = None
+
+        client.report_pipeline_run.assert_called_once_with(pipelines[0])
+        client.report_transformation_run.assert_called_once_with(transformations[0])
+
+    def test_an_unreachable_api_does_not_hold_startup(self) -> None:
+        """One attempt each: the local row is already failed (where this is
+        the API's database, that IS the API's row) — a miss costs the
+        notification, or, with a standalone store, the central row's
+        freshness. Retrying with sleeps would delay the first tick."""
+        main._recorder = MagicMock()
+        main._recorder.claim_orphaned_runs.return_value = self._claimed()
+        client = MagicMock()
+        client.report_pipeline_run.return_value = False
+        client.report_transformation_run.return_value = False
+        with patch.object(main.time, "sleep") as sleep:
+            try:
+                main._finalize_orphaned_runs(client)
+            finally:
+                main._recorder = None
+
+        assert client.report_pipeline_run.call_count == 1
+        assert client.report_transformation_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_no_recorder_nothing_to_claim(self) -> None:
+        main._recorder = None
+        client = MagicMock()
+        main._finalize_orphaned_runs(client)
+        client.report_pipeline_run.assert_not_called()
+        client.report_transformation_run.assert_not_called()
+
+    def test_runs_are_failed_before_the_workflow_runs(self) -> None:
+        """A workflow step's run is failed (and reported) before the workflow
+        run's final report goes out, so when the workflow-failed
+        notification lands the step's linked run already reads `failed`
+        — never a failed step pointing at a run still `running`."""
+        events: list[str] = []
+        recorder = MagicMock()
+        recorder.claim_orphaned_runs.side_effect = lambda: (
+            events.append("claim") or self._claimed()
+        )
+
+        def report(_r: Any) -> bool:
+            events.append("report run")
+            return True
+
+        main._shutdown = True  # stop before the first tick
+        with (
+            patch.object(main.config, "load"),
+            patch.object(main, "_configure_logging"),
+            patch.object(main.telemetry, "setup"),
+            patch.object(main.workspace_db, "from_env", return_value=recorder),
+            patch.object(main.signal, "signal"),
+            patch.object(main, "start_health_server"),
+            patch.object(main.APIClient, "report_pipeline_run", side_effect=report),
+            patch.object(
+                main.APIClient, "report_transformation_run", side_effect=report
+            ),
+            patch.object(
+                main,
+                "_finalize_orphaned_workflow_runs",
+                side_effect=lambda _c: events.append("workflow orphans"),
+            ),
+        ):
+            try:
+                main.run()
+            finally:
+                main._shutdown = False
+                main._recorder = None
+
+        assert events == ["claim", "report run", "report run", "workflow orphans"]
+        recorder.finalize_stale_runs.assert_not_called()

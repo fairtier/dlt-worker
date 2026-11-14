@@ -177,6 +177,65 @@ class TestWrites:
         assert len(queries) == 2
         assert not any("workflow" in q for q in queries)
 
+    def test_claim_orphaned_runs_fails_every_running_row(self) -> None:
+        """At startup every `running` row is an orphan, whatever its age:
+        one atomic UPDATE ... RETURNING per table, no interval, and each
+        claimed row comes back as the failure report that carries its own
+        columns (the API's update overwrites them)."""
+        started = datetime(2026, 1, 1, 3, 0, tzinfo=UTC)
+        done = datetime(2026, 1, 1, 3, 5, tzinfo=UTC)
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        p_cur, t_cur = MagicMock(), MagicMock()
+        p_cur.fetchall.return_value = [("pr-1", "p1", started, done, 7)]
+        t_cur.fetchall.return_value = [
+            ("tr-1", "t1", started, done, "abc", 3, 0, 2, 0, "[]")
+        ]
+        conn.execute.side_effect = [p_cur, t_cur]
+        with patch("dlt_worker.workspace_db.psycopg.connect", return_value=conn):
+            pipelines, transformations = self.recorder.claim_orphaned_runs()
+
+        queries = [c[0][0] for c in conn.execute.call_args_list]
+        assert "UPDATE pipeline_runs" in queries[0]
+        assert "UPDATE transformation_runs" in queries[1]
+        for query in queries:
+            assert "WHERE status = 'running'" in query
+            assert "interval" not in query
+            assert "RETURNING" in query
+            assert "worker restarted mid-run" in query
+        assert pipelines == [
+            PipelineRunReport(
+                pipeline_id="p1",
+                status="failed",
+                started_at=started.isoformat(),
+                completed_at=done.isoformat(),
+                rows_loaded=7,
+                error_message="worker restarted mid-run",
+                run_id="pr-1",
+            )
+        ]
+        assert transformations == [
+            TransformationRunReport(
+                transformation_id="t1",
+                status="failed",
+                started_at=started.isoformat(),
+                completed_at=done.isoformat(),
+                commit_sha="abc",
+                models_total=3,
+                tests_total=2,
+                model_results="[]",
+                error_message="worker restarted mid-run",
+                run_id="tr-1",
+            )
+        ]
+
+    def test_claim_orphaned_runs_swallows_db_errors(self) -> None:
+        with patch(
+            "dlt_worker.workspace_db.psycopg.connect",
+            side_effect=RuntimeError("connection refused"),
+        ):
+            assert self.recorder.claim_orphaned_runs() == ([], [])
+
     def test_orphaned_workflow_runs_become_failure_reports(self) -> None:
         """Every running workflow run, whatever its age, comes back as the
         report that fails it: the running step failed (its run id kept),
