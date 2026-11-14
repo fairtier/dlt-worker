@@ -386,8 +386,13 @@ def _execute_pipeline(
     now: datetime,
     client: APIClient,
     trigger: str | None = None,
+    on_start: Callable[[str], None] | None = None,
 ) -> tuple[PipelineRunReport | None, str]:
     """Run one due pipeline; returns its final report and run id.
+
+    ``on_start`` is called with the run id once the run is recorded (the
+    local row, when local-first) and before it executes — a workflow step
+    reports its link to the run there, so a crash mid-run keeps it.
 
     ``now`` is the tick's time — for a workflow step too, not the step's
     start: the schedule baseline (it backs
@@ -424,6 +429,8 @@ def _execute_pipeline(
     ) as span:
         if _recorder:
             _recorder.record_pipeline_run_start(local_run_id, cfg.id, run_started_at)
+        if on_start is not None:
+            on_start(local_run_id)
 
         # Mark a triggered run as "running" before execution, so the Console
         # stops showing it as queued. Only triggered runs: a scheduled run has
@@ -760,11 +767,16 @@ def _transformation_outcome(report: TransformationRunReport) -> _RunOutcome:
 
 
 def _execute_transformation(
-    cfg: TransformationConfig, now: datetime, client: APIClient, trigger: str
+    cfg: TransformationConfig,
+    now: datetime,
+    client: APIClient,
+    trigger: str,
+    on_start: Callable[[str], None] | None = None,
 ) -> TransformationRunReport:
     """Run one transformation, record it locally first, report it centrally.
 
     The one code path for a standalone run and a workflow step alike.
+    ``on_start`` as for ``_execute_pipeline``.
 
     ``now`` is the schedule baseline (it backs ``_last_failure_at``), as for
     ``_execute_pipeline``; the run stamps its own start, because
@@ -793,6 +805,8 @@ def _execute_transformation(
             _recorder.record_transformation_run_start(
                 local_run_id, cfg.id, run_started_at
             )
+        if on_start is not None:
+            on_start(local_run_id)
 
         report = run_transformation_isolated(cfg)
         # Same single-identity rule as pipelines: the report is an
@@ -1031,6 +1045,9 @@ def _execute_workflow(
     ) as span:
         _send_workflow_report(client, report)
 
+        def announce() -> None:
+            _send_workflow_report(client, report)
+
         for step, step_run in zip(wf.steps, report.step_runs, strict=True):
             if _shutdown:
                 report.status = "failed"
@@ -1040,9 +1057,12 @@ def _execute_workflow(
                 )
                 break
 
+            # The "running" report goes out from the step, once it knows
+            # the run it is about to make (announce): it then names that
+            # run, and a step that fails or reuses a run without running
+            # anything goes straight to its outcome.
             step_run.status = "running"
             step_run.started_at = _iso_now()
-            _send_workflow_report(client, report)
 
             with telemetry.tracer.start_as_current_span(
                 "dlt_worker.workflow.step",
@@ -1054,7 +1074,7 @@ def _execute_workflow(
             ) as step_span:
                 try:
                     _run_workflow_step(
-                        step, step_run, tick, transformations_by_id, client
+                        step, step_run, tick, transformations_by_id, client, announce
                     )
                 except Exception as exc:
                     # Type only, never the message (it can quote anything).
@@ -1160,12 +1180,20 @@ def _run_workflow_step(
     tick: _Tick,
     transformations_by_id: dict[str, TransformationConfig],
     client: APIClient,
+    announce: Callable[[], None],
 ) -> None:
-    """Run one step and leave its outcome on ``step_run``."""
+    """Run one step and leave its outcome on ``step_run``.
+
+    ``announce`` reports the workflow run with this step ``running``; a
+    step that executes a run calls it once that run has its id (and its
+    local row), after setting the id on ``step_run``.
+    """
     if step.kind == "pipeline":
-        _run_pipeline_step(step, step_run, tick, client)
+        _run_pipeline_step(step, step_run, tick, client, announce)
     elif step.kind == "transformation":
-        _run_transformation_step(step, step_run, tick, transformations_by_id, client)
+        _run_transformation_step(
+            step, step_run, tick, transformations_by_id, client, announce
+        )
     else:
         _fail_step(step_run, f"unknown step kind {step.kind!r}")
 
@@ -1175,6 +1203,7 @@ def _run_pipeline_step(
     step_run: WorkflowStepRunReport,
     tick: _Tick,
     client: APIClient,
+    announce: Callable[[], None],
 ) -> None:
     # Not step.ref_enabled: for a pipeline the definition file's `enabled`
     # wins, as for every other pipeline field in files mode — the
@@ -1206,7 +1235,13 @@ def _run_pipeline_step(
 
     # tick.now, not the step's start: it is the pipeline's schedule
     # baseline (see _record_pipeline_outcome). The run stamps its own start.
-    report, run_id = _execute_pipeline(cfg, tick.now, client, trigger="workflow")
+    def started(run_id: str) -> None:
+        step_run.pipeline_run_id = run_id
+        announce()
+
+    report, run_id = _execute_pipeline(
+        cfg, tick.now, client, trigger="workflow", on_start=started
+    )
     _record_pipeline_outcome(cfg, report, run_id, tick)
     step_run.pipeline_run_id = run_id
     if report is not None and report.status == "success":
@@ -1223,6 +1258,7 @@ def _run_transformation_step(
     tick: _Tick,
     transformations_by_id: dict[str, TransformationConfig],
     client: APIClient,
+    announce: Callable[[], None],
 ) -> None:
     if not step.ref_enabled:
         _fail_step(step_run, "transformation is disabled")
@@ -1244,7 +1280,13 @@ def _run_transformation_step(
     # both, and the transformation phase after this one skips it.
     # tick.now is only the failure-backoff baseline; the run stamps its own
     # start (_execute_transformation).
-    report = _execute_transformation(cfg, tick.now, client, "workflow")
+    def started(run_id: str) -> None:
+        step_run.transformation_run_id = run_id
+        announce()
+
+    report = _execute_transformation(
+        cfg, tick.now, client, "workflow", on_start=started
+    )
     tick.transformation_runs[cfg.id] = _transformation_outcome(report)
     step_run.transformation_run_id = report.run_id
     if report.status == "success":

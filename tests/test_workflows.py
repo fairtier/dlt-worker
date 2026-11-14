@@ -258,6 +258,63 @@ class TestRunWorkflows:
         assert final.step_runs[1].pipeline_run_id == p_report.run_id
         assert final.step_runs[0].name == "marts"
 
+    def test_running_step_report_names_its_run(self) -> None:
+        """A step's "running" report already carries the id of the run it
+        is about to make, so a worker killed mid-step leaves the step linked
+        to its pipeline/transformation run (the server keeps a stored id
+        when a later report leaves it empty)."""
+        _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
+        order: list[str] = []
+        recorder = MagicMock()
+        recorder.record_pipeline_run_start.side_effect = lambda run_id, *_: (
+            order.append(f"local {run_id}")
+        )
+        recorder.record_transformation_run_start.side_effect = lambda run_id, *_: (
+            order.append(f"local {run_id}")
+        )
+        main._recorder = recorder
+        rec = _Recorder([_wf(trigger_now=True)])  # p1 then t1
+        sent = rec.client.report_workflow_run.side_effect
+
+        def report(r: WorkflowRunReport) -> Any:
+            for s in r.step_runs:
+                if s.status == "running":
+                    order.append(
+                        f"running {s.pipeline_run_id or s.transformation_run_id}"
+                    )
+            return sent(r)
+
+        rec.client.report_workflow_run.side_effect = report
+        try:
+            self._tick(rec)
+        finally:
+            main._recorder = None
+
+        final = rec.sent[-1]
+        assert final.status == "success"
+        running = [
+            r.step_runs[i]
+            for r in rec.sent
+            for i in range(2)
+            if r.step_runs[i].status == "running"
+        ]
+        assert [s.pipeline_run_id for s in running[:1]] == [
+            final.step_runs[0].pipeline_run_id
+        ]
+        assert [s.transformation_run_id for s in running[1:]] == [
+            final.step_runs[1].transformation_run_id
+        ]
+        p_id = final.step_runs[0].pipeline_run_id
+        t_id = final.step_runs[1].transformation_run_id
+        assert p_id and t_id
+        # Local-first: the run's own row exists before a step points at it.
+        assert order == [
+            f"local {p_id}",
+            f"running {p_id}",
+            f"local {t_id}",
+            f"running {t_id}",
+        ]
+
     def test_scheduled_run_gets_one_generated_uuid(self) -> None:
         _write_pipeline_yaml(self.checkout, "orders.yaml", "p1", schedule=None)
         rec = _Recorder([_wf(schedule="0 3 * * *")])  # never run → due
