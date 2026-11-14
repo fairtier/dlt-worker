@@ -287,3 +287,83 @@ class WorkspaceRecorder:
                     count,
                     table,
                 )
+        self._finalize_stale_workflow_runs()
+
+    def _workflow_tables_present(self) -> bool:
+        """Whether this database has the workflow tables at all.
+
+        They exist only where WORKSPACE_DB_URL is the workspace-api's own
+        database (and only from its 000006 migration on); a standalone store
+        has pipeline_runs/transformation_runs and nothing else. Asking first
+        keeps an hourly sweep from logging a failed UPDATE forever.
+        """
+        try:
+            with psycopg.connect(
+                self._dsn, autocommit=True, connect_timeout=_CONNECT_TIMEOUT_SECONDS
+            ) as conn:
+                row = conn.execute(
+                    "SELECT to_regclass('workflow_runs') IS NOT NULL"
+                    " AND to_regclass('workflow_step_runs') IS NOT NULL",
+                    (),
+                ).fetchone()
+        except Exception:
+            logger.warning(
+                "Workspace DB: could not check for workflow tables — skipping "
+                "the workflow stale-run sweep",
+                exc_info=True,
+            )
+            return False
+        return bool(row and row[0])
+
+    def _finalize_stale_workflow_runs(self) -> None:
+        """Fail workflow runs a killed worker left ``running``.
+
+        The worker reports workflow runs only to the API (no local-first
+        write), but where this database is the API's own the rows are here,
+        and nothing else would ever finish them. Steps first, keyed on the
+        same predicate, so the run update cannot hide which steps to close:
+        the step that was running fails, the ones that never ran are
+        skipped. Same 2-hour threshold as the other run tables; a sweep only
+        happens between ticks, when this — the only — worker has no
+        workflow in flight.
+        """
+        if not self._workflow_tables_present():
+            return
+        self._execute(
+            """
+            UPDATE workflow_step_runs s
+               SET status = CASE WHEN s.status = 'running'
+                                 THEN 'failed' ELSE 'skipped' END,
+                   completed_at = CASE WHEN s.status = 'running'
+                                       THEN now() ELSE s.completed_at END,
+                   error_message = CASE WHEN s.status = 'running'
+                                        THEN 'worker restarted mid-run'
+                                        ELSE s.error_message END
+              FROM workflow_runs r
+             WHERE s.workflow_run_id = r.id
+               AND s.status IN ('pending', 'running')
+               AND r.status = 'running'
+               AND r.started_at < now() - interval '2 hours'
+            """,
+            (),
+            desc="stale-run sweep (workflow_step_runs)",
+            operation="stale_run_sweep",
+        )
+        count = self._execute(
+            """
+            UPDATE workflow_runs
+               SET status = 'failed',
+                   completed_at = now(),
+                   error_message = 'worker restarted mid-run'
+             WHERE status = 'running'
+               AND started_at < now() - interval '2 hours'
+            """,
+            (),
+            desc="stale-run sweep (workflow_runs)",
+            operation="stale_run_sweep",
+        )
+        if count:
+            logger.warning(
+                "Finalized %d orphaned workflow_runs row(s) from a previous worker",
+                count,
+            )

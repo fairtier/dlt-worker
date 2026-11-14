@@ -147,7 +147,10 @@ class TestWrites:
             self.recorder.finalize_stale_runs()
 
     def test_finalize_stale_runs_sweeps_both_tables(self) -> None:
-        with patch("dlt_worker.workspace_db.psycopg.connect", return_value=self.conn):
+        with (
+            patch("dlt_worker.workspace_db.psycopg.connect", return_value=self.conn),
+            patch.object(self.recorder, "_workflow_tables_present", return_value=False),
+        ):
             self.recorder.finalize_stale_runs()
 
         assert len(self.conn.executed) == 2
@@ -158,3 +161,44 @@ class TestWrites:
             assert "status = 'failed'" in query
             assert "worker restarted mid-run" in query
             assert "interval '2 hours'" in query
+
+    def test_finalize_stale_runs_sweeps_workflow_tables_when_present(self) -> None:
+        """Where the workspace DB is the API's own, a workflow run a killed
+        worker left running is failed, its running step failed and its
+        pending steps skipped — steps first, keyed on the run's predicate."""
+        with (
+            patch("dlt_worker.workspace_db.psycopg.connect", return_value=self.conn),
+            patch.object(self.recorder, "_workflow_tables_present", return_value=True),
+        ):
+            self.recorder.finalize_stale_runs()
+
+        queries = [q for q, _ in self.conn.executed]
+        assert len(queries) == 4
+        steps, runs = queries[2], queries[3]
+        assert "UPDATE workflow_step_runs" in steps
+        assert "'skipped'" in steps
+        assert "r.status = 'running'" in steps
+        assert "interval '2 hours'" in steps
+        assert "UPDATE workflow_runs" in runs
+        assert "status = 'failed'" in runs
+        assert "interval '2 hours'" in runs
+
+    def test_workflow_tables_probe(self) -> None:
+        """The probe answers from to_regclass and a broken connection
+        means "absent" — never an exception into the sweep."""
+        cur = MagicMock()
+        cur.fetchone.return_value = (False,)
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.execute.return_value = cur
+        with patch("dlt_worker.workspace_db.psycopg.connect", return_value=conn):
+            assert self.recorder._workflow_tables_present() is False
+            cur.fetchone.return_value = (True,)
+            assert self.recorder._workflow_tables_present() is True
+        assert "to_regclass('workflow_runs')" in conn.execute.call_args[0][0]
+
+        with patch(
+            "dlt_worker.workspace_db.psycopg.connect",
+            side_effect=RuntimeError("connection refused"),
+        ):
+            assert self.recorder._workflow_tables_present() is False
