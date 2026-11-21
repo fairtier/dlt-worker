@@ -22,14 +22,19 @@ off entirely.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, LiteralString
 
 import psycopg
 from opentelemetry.trace import SpanKind
 
 from dlt_worker import config, telemetry
-from dlt_worker.api_client import PipelineRunReport, TransformationRunReport
+from dlt_worker.api_client import (
+    PipelineRunReport,
+    TransformationRunReport,
+    WorkflowRunReport,
+    WorkflowStepRunReport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -242,14 +247,36 @@ class WorkspaceRecorder:
         )
 
     def finalize_stale_runs(self) -> None:
-        """Fail orphaned ``running`` rows left behind by a crash/restart.
+        """Fail orphaned ``running`` rows older than 2 hours (periodic).
 
         The central stuck-run sweep cannot see this database, so the worker
-        finalizes its own orphans on startup and periodically.
+        finalizes its own orphans: all of them at startup
+        (``claim_orphaned_runs``, no age margin — nothing can be in flight
+        then), and these, older than 2 hours, between ticks — a backstop for
+        a startup claim that could not reach the database.
+
+        The 2-hour age is NOT a bound on how long a run may take: a pipeline
+        run row stays ``running`` across all its attempts, each up to
+        ``PIPELINE_RUN_TIMEOUT_SECONDS`` (6 h by default), so a live row can
+        be far older. What keeps the sweep off live runs is that no live run
+        can exist when it fires:
+
+        * this worker runs everything synchronously inside a poll tick, and
+          the sweep runs only between ticks (``main.run``);
+        * there is one worker process per workspace database — the chart is
+          a single-replica StatefulSet, so a new pod starts only after the
+          old one is gone, and a run's subprocess (its own session, but the
+          same container PID namespace, with the worker as PID 1) dies with
+          the container that started it.
+
+        So every ``running`` row the sweep sees is an orphan, and the age is
+        only a margin against those invariants being broken (a second
+        worker pointed at the same database, a force-deleted pod). If they
+        are, a live row older than 2 hours reads ``failed`` until its run's
+        end write — an upsert of the real status — overwrites it.
         """
         # Two literal statements (not an f-string over the table name) so
-        # the SQL stays statically checkable. A `running` row older than
-        # 2 hours is an orphan — no run is allowed to take that long.
+        # the SQL stays statically checkable.
         sweeps: tuple[tuple[str, LiteralString], ...] = (
             (
                 "pipeline_runs",
@@ -287,3 +314,258 @@ class WorkspaceRecorder:
                     count,
                     table,
                 )
+
+    def claim_orphaned_runs(
+        self,
+    ) -> tuple[list[PipelineRunReport], list[TransformationRunReport]]:
+        """At startup: fail EVERY ``running`` pipeline/transformation row,
+        and return each as the final report that says so.
+
+        Startup only (``main._finalize_orphaned_runs``). No age margin, unlike
+        ``finalize_stale_runs``: a worker that has just started has nothing
+        in flight, and by the invariants spelled out there (one worker per
+        database, runs execute synchronously inside a tick, a run's
+        subprocess dies with the container) neither has anyone else, so
+        every ``running`` row is an orphan of the previous worker. Leaving
+        it ``running`` for the 2 h margin is not harmless: the API's
+        ``TriggerPipeline`` answers Run now with the oldest pending-or-
+        running run, so a dead row swallows every Run now until it is
+        failed, and the Console shows the dead run as running.
+
+        One ``UPDATE ... RETURNING`` per table, so the claim is atomic: a
+        row the API's stuck-run sweep failed first is no longer ``running``
+        and is not returned (no second report, so no second notification),
+        and the API's sweep cannot fail a row claimed here. The SQL is the
+        record; the returned reports exist so the caller sends them through
+        ``ReportPipelineRun``/``ReportTransformationRun`` — for the central
+        row (where this database is a standalone store) and the API's usual
+        failure notification. They carry the row's own columns back,
+        because the API's update overwrites them.
+
+        A run subprocess that survived its worker is impossible on a box
+        (it dies with the container), so it is not coded around. Were the
+        invariants broken anyway, the live run's end write — an upsert of
+        the real status — overwrites ``failed``, as with the periodic sweep.
+
+        A database error is logged and swallowed: ``([], [])``, and the
+        periodic sweep fails the rows once they are 2 hours old.
+        """
+        try:
+            with psycopg.connect(
+                self._dsn, autocommit=True, connect_timeout=_CONNECT_TIMEOUT_SECONDS
+            ) as conn:
+                pipeline_rows = conn.execute(
+                    """
+                    UPDATE pipeline_runs
+                       SET status = 'failed',
+                           completed_at = now(),
+                           error_message = 'worker restarted mid-run'
+                     WHERE status = 'running'
+                    RETURNING id::text, pipeline_id::text, started_at,
+                              completed_at, rows_loaded
+                    """,
+                    (),
+                ).fetchall()
+                transformation_rows = conn.execute(
+                    """
+                    UPDATE transformation_runs
+                       SET status = 'failed',
+                           completed_at = now(),
+                           error_message = 'worker restarted mid-run'
+                     WHERE status = 'running'
+                    RETURNING id::text, transformation_id::text, started_at,
+                              completed_at, commit_sha, models_total,
+                              models_failed, tests_total, tests_failed,
+                              model_results::text
+                    """,
+                    (),
+                ).fetchall()
+        except Exception:
+            logger.warning(
+                "Workspace DB: could not fail the runs a previous worker left "
+                "running — the periodic stale-run sweep will, after 2 hours",
+                exc_info=True,
+            )
+            return [], []
+        pipelines = [
+            PipelineRunReport(
+                pipeline_id=pipeline_id,
+                status="failed",
+                started_at=_iso(started_at),
+                completed_at=_iso(completed_at),
+                rows_loaded=rows_loaded,
+                error_message=_ORPHANED,
+                run_id=run_id,
+            )
+            for run_id, pipeline_id, started_at, completed_at, rows_loaded in (
+                pipeline_rows
+            )
+        ]
+        transformations = [
+            TransformationRunReport(
+                transformation_id=row[1],
+                status="failed",
+                started_at=_iso(row[2]),
+                completed_at=_iso(row[3]),
+                commit_sha=row[4],
+                models_total=row[5],
+                models_failed=row[6],
+                tests_total=row[7],
+                tests_failed=row[8],
+                model_results=row[9],
+                error_message=_ORPHANED,
+                run_id=row[0],
+            )
+            for row in transformation_rows
+        ]
+        for table, count in (
+            ("pipeline_runs", len(pipelines)),
+            ("transformation_runs", len(transformations)),
+        ):
+            if count:
+                logger.warning(
+                    "Failed %d %s row(s) a previous worker left running",
+                    count,
+                    table,
+                )
+        return pipelines, transformations
+
+    def _workflow_tables_present(self) -> bool:
+        """Whether this database has the workflow tables at all.
+
+        They exist only where WORKSPACE_DB_URL is the workspace-api's own
+        database (and only from its 000006 migration on); a standalone store
+        has pipeline_runs/transformation_runs and nothing else. Asking first
+        keeps the startup orphan check from logging a failed SELECT.
+        """
+        try:
+            with psycopg.connect(
+                self._dsn, autocommit=True, connect_timeout=_CONNECT_TIMEOUT_SECONDS
+            ) as conn:
+                row = conn.execute(
+                    "SELECT to_regclass('workflow_runs') IS NOT NULL"
+                    " AND to_regclass('workflow_step_runs') IS NOT NULL",
+                    (),
+                ).fetchone()
+        except Exception:
+            logger.warning(
+                "Workspace DB: could not check for workflow tables — leaving "
+                "orphaned workflow runs to the API's stuck-run sweep",
+                exc_info=True,
+            )
+            return False
+        return bool(row and row[0])
+
+    def orphaned_workflow_runs(self) -> list[WorkflowRunReport]:
+        """Every ``running`` workflow run, as the report that fails it.
+
+        For startup only (``main._finalize_orphaned_workflow_runs`` sends
+        them through ``ReportWorkflowRun``, so the API's failed transition
+        raises the notification, once). Workflow runs are reported to the
+        API only, but where this database is the API's own the rows are
+        here; a worker that has just started has no workflow in flight, and
+        by the invariants of ``finalize_stale_runs`` no other worker does,
+        so every ``running`` row is an orphan — no age margin, which is the
+        point: the run is failed (and its workflow served again) right
+        after the restart, not hours later. The running step fails, steps
+        that never ran are skipped, finished ones are reported as they
+        were. No workflow tables, or no database: none (the API's own
+        stuck-run sweep covers those deployments).
+        """
+        if not self._workflow_tables_present():
+            return []
+        try:
+            with psycopg.connect(
+                self._dsn, autocommit=True, connect_timeout=_CONNECT_TIMEOUT_SECONDS
+            ) as conn:
+                runs = conn.execute(
+                    """
+                    SELECT id::text, workflow_id::text, trigger, started_at
+                      FROM workflow_runs
+                     WHERE status = 'running'
+                     ORDER BY created_at
+                    """,
+                    (),
+                ).fetchall()
+                if not runs:
+                    return []
+                steps = conn.execute(
+                    """
+                    SELECT workflow_run_id::text, position, kind, ref_id::text,
+                           name, status,
+                           COALESCE(pipeline_run_id::text, ''),
+                           COALESCE(transformation_run_id::text, ''),
+                           started_at, completed_at, error_message
+                      FROM workflow_step_runs
+                     WHERE workflow_run_id = ANY(%s::uuid[])
+                     ORDER BY workflow_run_id, position
+                    """,
+                    ([row[0] for row in runs],),
+                ).fetchall()
+        except Exception:
+            logger.warning(
+                "Workspace DB: could not read running workflow runs — leaving "
+                "them to the API's stuck-run sweep",
+                exc_info=True,
+            )
+            return []
+        now = datetime.now(UTC)
+        return [
+            _orphan_failure(run, [st for st in steps if st[0] == run[0]], now)
+            for run in runs
+        ]
+
+
+_ORPHANED = "worker restarted mid-run"
+
+
+def _iso(value: datetime | None) -> str:
+    return value.astimezone(UTC).isoformat() if value is not None else ""
+
+
+def _orphan_failure(
+    run: tuple[Any, ...], steps: list[tuple[Any, ...]], now: datetime
+) -> WorkflowRunReport:
+    """The failure report of one orphaned workflow run (rows as selected in
+    ``orphaned_workflow_runs``)."""
+    run_id, workflow_id, trigger, started_at = run
+    step_runs: list[WorkflowStepRunReport] = []
+    interrupted: WorkflowStepRunReport | None = None
+    for _, position, kind, ref_id, name, status, p_run, t_run, s_at, c_at, err in steps:
+        step = WorkflowStepRunReport(
+            position=position,
+            kind=kind,
+            ref_id=ref_id,
+            name=name,
+            status=status,
+            pipeline_run_id=p_run,
+            transformation_run_id=t_run,
+            started_at=_iso(s_at),
+            completed_at=_iso(c_at),
+            error_message=err,
+        )
+        if status == "running":
+            step.status = "failed"
+            step.completed_at = now.isoformat()
+            step.error_message = f"{_ORPHANED} (the worker stopped while this step ran)"
+            interrupted = interrupted or step
+        elif status == "pending":
+            step.status = "skipped"
+        step_runs.append(step)
+    if interrupted is not None:
+        message = (
+            f"step {interrupted.position + 1} ({interrupted.kind} "
+            f"{interrupted.name!r}) failed: {_ORPHANED}"
+        )
+    else:
+        message = f"{_ORPHANED}, between steps"
+    return WorkflowRunReport(
+        run_id=run_id,
+        workflow_id=workflow_id,
+        status="failed",
+        trigger=trigger,
+        started_at=_iso(started_at),
+        completed_at=now.isoformat(),
+        error_message=message,
+        step_runs=step_runs,
+    )

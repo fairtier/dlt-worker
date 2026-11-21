@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1182,14 +1183,17 @@ class TestLocalFirstRecording:
         client = MagicMock()
         client.report_pipeline_run.return_value = True
 
-        now = datetime.now(UTC)
-        main._execute_pipeline(cfg, now, client)
+        tick = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+        begun = tick + timedelta(minutes=3)
+        with patch("dlt_worker.main._utcnow", return_value=begun):
+            main._execute_pipeline(cfg, tick, client)
 
         rec = self.recorder
         rec.record_pipeline_run_start.assert_called_once()
         run_id, pipeline_id, started_at = rec.record_pipeline_run_start.call_args[0]
         assert pipeline_id == cfg.id
-        assert started_at == now
+        # When the run began, not when the tick that admitted it did.
+        assert started_at == begun
         rec.record_pipeline_run_end.assert_called_once()
         end_run_id, end_report = rec.record_pipeline_run_end.call_args[0]
         assert end_run_id == run_id  # one identity from start to end
@@ -1273,6 +1277,211 @@ class TestLocalFirstRecording:
         assert report.status == "success"
 
 
+class _Clock:
+    """A wall clock the test advances: stands in for main._utcnow, and a
+    pipeline "run" moves it forward by its duration."""
+
+    def __init__(self, at: datetime) -> None:
+        self.at = at
+
+    def __call__(self) -> datetime:
+        return self.at
+
+    def run_for(self, cfg: PipelineConfig, minutes: int) -> PipelineRunReport:
+        report = PipelineRunReport(
+            pipeline_id=cfg.id,
+            status="success",
+            started_at=self.at.isoformat(),
+            completed_at="",
+        )
+        self.at += timedelta(minutes=minutes)
+        report.completed_at = self.at.isoformat()
+        return report
+
+
+class TestRunStartedAt:
+    """Pipelines in one tick run one after another, so the tick's start
+    time is NOT a run's start time. A run queued behind a long one must
+    record when it actually began — otherwise its duration is inflated and
+    the stuck-run sweep (which ages rows from started_at) can fail a short,
+    healthy run. The schedule baseline, on the other hand, stays the tick
+    time, or a schedule drifts later every run."""
+
+    @pytest.fixture(autouse=True)
+    def _files_mode(self, tmp_path: Path) -> Any:
+        self.checkout = tmp_path / "checkout"
+        (self.checkout / "pipelines").mkdir(parents=True)
+        self.state_dir = tmp_path / "state"
+        self.state_dir.mkdir()
+        config.PIPELINES_DIR = str(self.checkout)
+        config.DLT_STATE_DIR = str(self.state_dir)
+        config.AGE_KEY_FILE = ""
+        config.PIPELINE_MAX_RETRIES = 0
+        main._shutdown = False
+        main._creds_cache.clear()
+        main._last_failure_at.clear()
+        self.recorder = MagicMock()
+        main._recorder = self.recorder
+        self.clock = _Clock(datetime(2026, 1, 1, 10, 0, 5, tzinfo=UTC))
+        with patch("dlt_worker.main._utcnow", self.clock):
+            yield
+        main._recorder = None
+        config.PIPELINES_DIR = ""
+        config.AGE_KEY_FILE = ""
+        main._creds_cache.clear()
+        main._last_failure_at.clear()
+
+    def _client(self, polled: list[PipelineTrigger]) -> MagicMock:
+        client = MagicMock()
+        client.try_get_pipeline_triggers.return_value = polled
+        client.report_pipeline_run.return_value = True
+        return client
+
+    def _starts(self, client: MagicMock) -> dict[str, dict[str, str]]:
+        """started_at per pipeline, as each of the three writes saw it."""
+        out: dict[str, dict[str, str]] = {}
+        for call in self.recorder.record_pipeline_run_start.call_args_list:
+            _, pid, at = call[0]
+            out.setdefault(pid, {})["local"] = at.isoformat()
+        for call in client.report_pipeline_run.call_args_list:
+            r = call[0][0]
+            out.setdefault(r.pipeline_id, {})[r.status] = r.started_at
+        return out
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_queued_run_stamps_its_own_start(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        _write_pipeline_yaml(self.checkout, "a_long.yaml", "p1", schedule=None)
+        _write_pipeline_yaml(self.checkout, "b_short.yaml", "p2", schedule=None)
+        durations = {"p1": 20, "p2": 1}
+        mock_run.side_effect = lambda cfg: self.clock.run_for(cfg, durations[cfg.id])
+        client = self._client(
+            [
+                _make_trigger(id="p1", trigger_now=True, pending_run_id="r1"),
+                _make_trigger(id="p2", trigger_now=True, pending_run_id="r2"),
+            ]
+        )
+
+        main._run_due_pipelines(client)
+
+        tick = "2026-01-01T10:00:05+00:00"
+        after_long = "2026-01-01T10:20:05+00:00"
+        starts = self._starts(client)
+        # Local start row, central "running" mark and central final report
+        # all carry the same, real start time.
+        assert starts["p1"] == {"local": tick, "running": tick, "success": tick}
+        assert starts["p2"] == {
+            "local": after_long,
+            "running": after_long,
+            "success": after_long,
+        }
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_final_report_carries_run_start_across_retries(
+        self,
+        mock_run: MagicMock,
+        mock_snapshot: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The central final report is an upsert on the run's one identity;
+        the local end write never touches started_at. So the final report
+        must carry the run's start too, not its last attempt's — or the two
+        stores disagree about the same run."""
+        config.PIPELINE_MAX_RETRIES = 1
+        monkeypatch.setattr(config, "PIPELINE_RETRY_BASE_DELAY", 0)
+        _write_pipeline_yaml(self.checkout, "a.yaml", "p1", schedule=None)
+        attempts = iter(["failed", "success"])
+
+        def attempt(cfg: PipelineConfig) -> PipelineRunReport:
+            report = self.clock.run_for(cfg, 5)
+            report.status = next(attempts)
+            return report
+
+        mock_run.side_effect = attempt
+        client = self._client([_make_trigger(id="p1", trigger_now=True)])
+
+        with patch("dlt_worker.main._refresh_config", return_value=True):
+            main._run_due_pipelines(client)
+
+        final = client.report_pipeline_run.call_args_list[-1][0][0]
+        assert final.status == "success"
+        assert final.started_at == "2026-01-01T10:00:05+00:00"
+        assert final.completed_at == "2026-01-01T10:10:05+00:00"
+
+    @patch("dlt_worker.main.trigger_snapshot")
+    @patch("dlt_worker.main.run_pipeline_isolated")
+    def test_schedule_baseline_stays_the_tick_time(
+        self, mock_run: MagicMock, mock_snapshot: MagicMock
+    ) -> None:
+        """An hourly pipeline queued behind a 20-minute one keeps firing on
+        the hour: its last_run_at is the tick that admitted it, not the
+        moment it got its turn."""
+        _write_pipeline_yaml(self.checkout, "a_long.yaml", "p1", schedule="0 * * * *")
+        _write_pipeline_yaml(self.checkout, "b_hourly.yaml", "p2", schedule="0 * * * *")
+        state = SchedulerState.load(str(self.state_dir))
+        state.record("p1", datetime(2026, 1, 1, 9, 0, 5, tzinfo=UTC))
+        state.record("p2", datetime(2026, 1, 1, 9, 0, 5, tzinfo=UTC))
+        durations = {"p1": 20, "p2": 1}
+        mock_run.side_effect = lambda cfg: self.clock.run_for(cfg, durations[cfg.id])
+        client = self._client([_make_trigger(id="p1"), _make_trigger(id="p2")])
+
+        main._run_due_pipelines(client)  # 10:00:05 tick: both fire
+
+        tick = datetime(2026, 1, 1, 10, 0, 5, tzinfo=UTC)
+        state = SchedulerState.load(str(self.state_dir))
+        assert state.get("p2") == tick
+        # ...while the run itself records its real start.
+        assert self.recorder.record_pipeline_run_start.call_args_list[1][0][
+            2
+        ] == tick + timedelta(minutes=20)
+
+        # 10:59:30 — not due yet; 11:00:10 — due again, on the hour.
+        mock_run.reset_mock()
+        self.clock.at = datetime(2026, 1, 1, 10, 59, 30, tzinfo=UTC)
+        assert main._run_due_pipelines(client) == set()
+        mock_run.assert_not_called()
+
+        self.clock.at = datetime(2026, 1, 1, 11, 0, 10, tzinfo=UTC)
+        assert main._run_due_pipelines(client) == {"p1", "p2"}
+
+    @patch("dlt_worker.main.run_transformation_isolated")
+    def test_transformation_stamps_its_own_start(self, mock_run: MagicMock) -> None:
+        """Transformations run after every pipeline of the tick and one
+        after another as well — same rule, and the final report agrees
+        with the local row."""
+        t1 = _make_tconfig(id="t1", trigger_now=True)
+        t2 = _make_tconfig(id="t2", trigger_now=True)
+        client = MagicMock()
+        client.get_transformation_configs.return_value = [t1, t2]
+        client.report_transformation_run.return_value = True
+
+        def run(cfg: TransformationConfig) -> TransformationRunReport:
+            report = _transformation_report()
+            report.transformation_id = cfg.id
+            self.clock.at += timedelta(minutes=30)
+            return report
+
+        mock_run.side_effect = run
+
+        main._run_due_transformations(client, succeeded_pipelines=set())
+
+        rec = self.recorder.record_transformation_run_start.call_args_list
+        assert [c[0][2] for c in rec] == [
+            datetime(2026, 1, 1, 10, 0, 5, tzinfo=UTC),
+            datetime(2026, 1, 1, 10, 30, 5, tzinfo=UTC),
+        ]
+        reported = [
+            c[0][0].started_at for c in client.report_transformation_run.call_args_list
+        ]
+        assert reported == [
+            "2026-01-01T10:00:05+00:00",
+            "2026-01-01T10:30:05+00:00",
+        ]
+
+
 class TestConfigureLogging:
     """_configure_logging must win over dlt's root-logger setup.
 
@@ -1313,3 +1522,174 @@ class TestConfigureLogging:
             assert logging.getLogger("dlt_worker.main").isEnabledFor(logging.INFO)
         finally:
             self._restore_root(saved)
+
+
+class TestStaleSweepNeverOverlapsARun:
+    """workspace_db.finalize_stale_runs fails every `running` row older than
+    2 hours, while a run may legitimately take 6 h per attempt. That is safe
+    only because the sweep never runs while this worker has a run in flight:
+    it runs on the poll-loop thread, at startup and between ticks — never
+    from another thread, never inside a tick. Pin that."""
+
+    def test_sweep_only_between_ticks_on_the_loop_thread(self) -> None:
+        loop_thread = threading.get_ident()
+        events: list[str] = []
+        recorder = MagicMock()
+
+        def sweep() -> None:
+            assert threading.get_ident() == loop_thread
+            events.append("sweep")
+
+        recorder.finalize_stale_runs.side_effect = sweep
+
+        def claim() -> tuple[list[Any], list[Any]]:
+            assert threading.get_ident() == loop_thread
+            events.append("claim")
+            return [], []
+
+        recorder.claim_orphaned_runs.side_effect = claim
+
+        def tick(_client: Any) -> None:
+            events.append("tick")
+            if events.count("tick") == 3:
+                main._shutdown = True
+
+        main._shutdown = False
+        with (
+            patch.object(main.config, "load"),
+            patch.object(main.config, "POLL_INTERVAL_SECONDS", 0),
+            patch.object(main, "_configure_logging"),
+            patch.object(main.telemetry, "setup"),
+            patch.object(main.workspace_db, "from_env", return_value=recorder),
+            patch.object(main.signal, "signal"),
+            patch.object(main, "start_health_server"),
+            # Due on every iteration: the most a sweep can ever fire.
+            patch.object(main, "_STALE_SWEEP_INTERVAL", 0),
+            patch.object(main, "_tick", side_effect=tick),
+        ):
+            try:
+                main.run()
+            finally:
+                main._shutdown = False
+                main._recorder = None
+
+        # Startup fails every running row (claim, no age margin); between
+        # ticks only the 2 h sweep runs.
+        assert events == ["claim", "tick", "sweep", "tick", "sweep", "tick", "sweep"]
+
+
+class TestFinalizeOrphanedRunsAtStartup:
+    """A restarted worker has nothing in flight, so every `running` pipeline
+    and transformation row is a dead run: failed at once (not after the 2 h
+    margin — a dead `running` row swallows every Run now meanwhile), then
+    reported through the normal report path so the central row and the
+    API's usual failure notification follow."""
+
+    @staticmethod
+    def _claimed() -> tuple[list[PipelineRunReport], list[TransformationRunReport]]:
+        return (
+            [
+                PipelineRunReport(
+                    pipeline_id="p1",
+                    status="failed",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    completed_at="2026-01-01T00:10:00+00:00",
+                    error_message="worker restarted mid-run",
+                    run_id="pr-1",
+                )
+            ],
+            [
+                TransformationRunReport(
+                    transformation_id="t1",
+                    status="failed",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    completed_at="2026-01-01T00:10:00+00:00",
+                    error_message="worker restarted mid-run",
+                    run_id="tr-1",
+                )
+            ],
+        )
+
+    def test_claimed_runs_are_reported_once_each(self) -> None:
+        main._recorder = MagicMock()
+        pipelines, transformations = self._claimed()
+        main._recorder.claim_orphaned_runs.return_value = (pipelines, transformations)
+        client = MagicMock()
+        client.report_pipeline_run.return_value = True
+        client.report_transformation_run.return_value = True
+        try:
+            main._finalize_orphaned_runs(client)
+        finally:
+            main._recorder = None
+
+        client.report_pipeline_run.assert_called_once_with(pipelines[0])
+        client.report_transformation_run.assert_called_once_with(transformations[0])
+
+    def test_an_unreachable_api_does_not_hold_startup(self) -> None:
+        """One attempt each: the local row is already failed (where this is
+        the API's database, that IS the API's row) — a miss costs the
+        notification, or, with a standalone store, the central row's
+        freshness. Retrying with sleeps would delay the first tick."""
+        main._recorder = MagicMock()
+        main._recorder.claim_orphaned_runs.return_value = self._claimed()
+        client = MagicMock()
+        client.report_pipeline_run.return_value = False
+        client.report_transformation_run.return_value = False
+        with patch.object(main.time, "sleep") as sleep:
+            try:
+                main._finalize_orphaned_runs(client)
+            finally:
+                main._recorder = None
+
+        assert client.report_pipeline_run.call_count == 1
+        assert client.report_transformation_run.call_count == 1
+        sleep.assert_not_called()
+
+    def test_no_recorder_nothing_to_claim(self) -> None:
+        main._recorder = None
+        client = MagicMock()
+        main._finalize_orphaned_runs(client)
+        client.report_pipeline_run.assert_not_called()
+        client.report_transformation_run.assert_not_called()
+
+    def test_runs_are_failed_before_the_workflow_runs(self) -> None:
+        """A workflow step's run is failed (and reported) before the workflow
+        run's final report goes out, so when the workflow-failed
+        notification lands the step's linked run already reads `failed`
+        — never a failed step pointing at a run still `running`."""
+        events: list[str] = []
+        recorder = MagicMock()
+        recorder.claim_orphaned_runs.side_effect = lambda: (
+            events.append("claim") or self._claimed()
+        )
+
+        def report(_r: Any) -> bool:
+            events.append("report run")
+            return True
+
+        main._shutdown = True  # stop before the first tick
+        with (
+            patch.object(main.config, "load"),
+            patch.object(main, "_configure_logging"),
+            patch.object(main.telemetry, "setup"),
+            patch.object(main.workspace_db, "from_env", return_value=recorder),
+            patch.object(main.signal, "signal"),
+            patch.object(main, "start_health_server"),
+            patch.object(main.APIClient, "report_pipeline_run", side_effect=report),
+            patch.object(
+                main.APIClient, "report_transformation_run", side_effect=report
+            ),
+            patch.object(
+                main,
+                "_finalize_orphaned_workflow_runs",
+                side_effect=lambda _c: events.append("workflow orphans"),
+            ),
+        ):
+            try:
+                main.run()
+            finally:
+                main._shutdown = False
+                main._recorder = None
+
+        assert events == ["claim", "report run", "report run", "workflow orphans"]
+        recorder.finalize_stale_runs.assert_not_called()

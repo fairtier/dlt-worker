@@ -17,8 +17,9 @@ def test_record_and_load_roundtrip(tmp_path: Path) -> None:
     state.record("p1", _T1)
 
     reloaded = SchedulerState.load(str(tmp_path))
-    assert reloaded.get("p1") == _T1
-    assert reloaded.get("p1").tzinfo is not None  # ty: ignore[unresolved-attribute]
+    got = reloaded.get("p1")
+    assert got == _T1
+    assert got is not None and got.tzinfo is not None
 
 
 def test_missing_file_starts_empty(tmp_path: Path) -> None:

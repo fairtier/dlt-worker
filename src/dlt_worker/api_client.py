@@ -15,6 +15,7 @@ configs. The same OIDC app is used for the Lakekeeper catalog.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import time
@@ -131,6 +132,108 @@ class TransformationRunReport:
 
 
 @dataclass
+class WorkflowStepConfig:
+    """One step of a workflow, as GetWorkflowConfigs serves it.
+
+    Only a reference: the pipeline's or transformation's own definition comes
+    from where a standalone run gets it (the checkout, GetTransformationConfigs)
+    and is looked up by ``ref_id``.
+    """
+
+    position: int
+    kind: str  # "pipeline" or "transformation"
+    ref_id: str
+    name: str = ""
+    ref_enabled: bool = True
+
+
+@dataclass
+class WorkflowConfig:
+    """A linear workflow: ordered steps, one optional cron schedule."""
+
+    id: str
+    name: str
+    schedule: str | None
+    enabled: bool
+    steps: list[WorkflowStepConfig] = field(default_factory=list)
+    trigger_now: bool = False
+    pending_run_id: str = ""
+    # Start of the most recent run that left "pending", whatever its outcome
+    # — server-owned, so unlike a pipeline's it already covers failures.
+    last_run_at: datetime | None = None
+    last_run_status: str = ""
+
+
+@dataclass
+class WorkflowStepRunReport:
+    position: int
+    kind: str
+    ref_id: str
+    name: str
+    status: str = "pending"  # pending | running | success | failed | skipped
+    pipeline_run_id: str = ""
+    transformation_run_id: str = ""
+    started_at: str = ""
+    completed_at: str = ""
+    error_message: str = ""
+
+
+@dataclass
+class WorkflowRunReport:
+    run_id: str
+    workflow_id: str
+    status: str  # running | success | failed
+    trigger: str  # manual | schedule
+    started_at: str
+    completed_at: str = ""
+    error_message: str = ""
+    step_runs: list[WorkflowStepRunReport] = field(default_factory=list)
+
+
+class ReportResult(enum.Enum):
+    """How one ReportWorkflowRun call ended — the caller's retry decision.
+
+    Truthy only when delivered, so ``if client.report_workflow_run(r):``
+    still reads as "it landed".
+    """
+
+    DELIVERED = "delivered"
+    # Worth sending the same report again: the server was unreachable or
+    # failed (Unavailable, DeadlineExceeded, Internal, Unknown, transport),
+    # or the worker's token is wrong (Unauthenticated, PermissionDenied —
+    # an operator fix can land any minute).
+    TRANSIENT = "transient"
+    # The server refused this report for good (InvalidArgument: malformed;
+    # NotFound: the workflow is gone or the run id is another workflow's).
+    # The same report fails the same way every time.
+    REJECTED = "rejected"
+
+    def __bool__(self) -> bool:
+        return self is ReportResult.DELIVERED
+
+
+# Connect codes ReportWorkflowRun documents as "do not retry".
+_PERMANENT_REPORT_CODES = frozenset({"invalid_argument", "not_found"})
+
+
+def _connect_error(resp: requests.Response) -> tuple[str, str]:
+    """(code, message) of a Connect error response.
+
+    Only the JSON body's ``code`` says what the server meant; without one
+    (a proxy's error page) Connect maps the HTTP status, and that mapping
+    never yields a permanent code (400 is "internal", 404 "unimplemented").
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and isinstance(body.get("code"), str):
+        message = body.get("message")
+        return body["code"], message if isinstance(message, str) else ""
+    return f"http_{resp.status_code}", ""
+
+
+@dataclass
 class SourceTest:
     """One queued "can this thing read my X?" probe, claimed from the API.
 
@@ -167,6 +270,7 @@ class APIClient:
     _last_check_at: str = field(default="", repr=False)
     _token: str = field(default="", repr=False)
     _token_expires_at: float = field(default=0.0, repr=False)
+    _workflows_unsupported_logged: bool = field(default=False, repr=False)
 
     @property
     def auth_enabled(self) -> bool:
@@ -402,6 +506,117 @@ class APIClient:
             )
             return False
 
+    def get_workflow_configs(self) -> list[WorkflowConfig]:
+        """Fetch this customer's workflows (enabled ones, plus disabled ones
+        with a pending manual run).
+
+        Like transformations, deliberately does not touch health status, and
+        never raises: workflows are optional. A workspace-api that predates
+        workflows answers 404 (Connect: unimplemented) — that is "no
+        workflows", logged once rather than every tick.
+        """
+        url = f"{self.base_url}/workflow.v1.WorkflowService/GetWorkflowConfigs"
+        try:
+            resp = self._post(url, {"customerSlug": self.customer_slug})
+            if resp.status_code in (404, 501):
+                if not self._workflows_unsupported_logged:
+                    logger.info(
+                        "FairTier API does not serve workflows (HTTP %d) — "
+                        "running none until it does",
+                        resp.status_code,
+                    )
+                    self._workflows_unsupported_logged = True
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+            workflows = data.get("workflows", [])
+            if not isinstance(workflows, list):
+                raise ValueError("'workflows' is not a list")
+        except (requests.RequestException, ValueError):
+            logger.warning("Failed to fetch workflow configs", exc_info=True)
+            return []
+        self._workflows_unsupported_logged = False
+
+        configs = []
+        for w in workflows:
+            try:
+                configs.append(_parse_workflow_record(w))
+            except Exception:
+                logger.warning(
+                    "Skipping malformed workflow record (id=%s)",
+                    w.get("id", "?") if isinstance(w, dict) else "?",
+                    exc_info=True,
+                )
+        return configs
+
+    def report_workflow_run(self, report: WorkflowRunReport) -> ReportResult:
+        """Report a workflow run's state — every step, every time.
+
+        The API upserts on run_id (steps on run_id + position), so repeating a
+        report is harmless. Returns DELIVERED, TRANSIENT (worth repeating) or
+        REJECTED (the server refused this report for good — see
+        ReportResult); only DELIVERED is truthy. Never raises, and never
+        touches health status.
+        """
+        url = f"{self.base_url}/workflow.v1.WorkflowService/ReportWorkflowRun"
+        try:
+            resp = self._post(
+                url,
+                {
+                    "runId": report.run_id,
+                    "workflowId": report.workflow_id,
+                    "status": report.status,
+                    "trigger": report.trigger,
+                    "startedAt": report.started_at,
+                    "completedAt": report.completed_at,
+                    "errorMessage": report.error_message,
+                    "stepRuns": [
+                        {
+                            "position": s.position,
+                            "kind": s.kind,
+                            "refId": s.ref_id,
+                            "name": s.name,
+                            "status": s.status,
+                            "pipelineRunId": s.pipeline_run_id,
+                            "transformationRunId": s.transformation_run_id,
+                            "startedAt": s.started_at,
+                            "completedAt": s.completed_at,
+                            "errorMessage": s.error_message,
+                        }
+                        for s in report.step_runs
+                    ],
+                },
+            )
+        except requests.RequestException:
+            logger.warning(
+                "Failed to report workflow run %s (workflow %s)",
+                report.run_id,
+                report.workflow_id,
+                exc_info=True,
+            )
+            return ReportResult.TRANSIENT
+        if resp.status_code < 400:
+            return ReportResult.DELIVERED
+        code, message = _connect_error(resp)
+        if code in _PERMANENT_REPORT_CODES:
+            logger.error(
+                "FairTier API rejected the report of workflow run %s "
+                "(workflow %s) as %s: %s — not retrying it",
+                report.run_id,
+                report.workflow_id,
+                code,
+                message or "no message",
+            )
+            return ReportResult.REJECTED
+        logger.warning(
+            "Failed to report workflow run %s (workflow %s): %s %s",
+            report.run_id,
+            report.workflow_id,
+            code,
+            message,
+        )
+        return ReportResult.TRANSIENT
+
     def get_pending_source_tests(self) -> list[SourceTest]:
         """Claim this customer's queued source tests.
 
@@ -484,10 +699,66 @@ class APIClient:
             return False
 
 
+# proto3 JSON (Connect's default protojson codec) omits every zero-valued
+# scalar — "" for a string, false for a bool, 0 for a number — and a parser
+# must also accept an explicit null as that zero value. So an absent field IS
+# its zero value: a default of True for an omitted bool turns every false
+# into true. Read scalars through these two helpers, never ``.get(k, True)``.
+
+
+def _str(record: dict[str, Any], key: str) -> str:
+    """A proto3 string field: absent or null is "". Any other non-string
+    raises — the record is malformed, and the caller skips it."""
+    value = record.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise TypeError(f"{key!r} is not a string")
+    return value
+
+
+def _bool(record: dict[str, Any], key: str) -> bool:
+    """A proto3 bool field: absent or null is False (proto3 omits false).
+    Any other non-bool raises, as for ``_str``."""
+    value = record.get(key)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise TypeError(f"{key!r} is not a bool")
+    return value
+
+
+def _int(record: dict[str, Any], key: str) -> int:
+    """A proto3 int32 field: absent or null is 0. protojson writes int32 as a
+    JSON number but parsers also accept a decimal string, so both are read;
+    anything else (a bool, a fraction) raises, as for ``_str``."""
+    value = record.get(key)
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise TypeError(f"{key!r} is not an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        return int(value)  # ValueError on garbage — malformed, skipped
+    raise TypeError(f"{key!r} is not an integer")
+
+
+def _required_str(record: dict[str, Any], key: str) -> str:
+    """A string field that identifies something: proto3 omits it only when
+    it is empty, and empty is a malformed record."""
+    value = _str(record, key)
+    if not value:
+        raise ValueError(f"{key!r} is missing or empty")
+    return value
+
+
 def _parse_source_test(t: dict[str, Any]) -> SourceTest:
     return SourceTest(
         id=t["id"],
-        source_type=t.get("sourceType", ""),
+        source_type=_str(t, "sourceType"),
         source_config=_json_object(t.get("sourceConfig")),
         source_credentials=_json_object(t.get("sourceCredentials")),
     )
@@ -507,7 +778,7 @@ def _json_object(raw: Any) -> dict[str, Any]:
 
 
 def _parse_last_run_at(record: dict[str, Any]) -> datetime | None:
-    last_run_at_str = record.get("lastRunAt", "")
+    last_run_at_str = _str(record, "lastRunAt")
     if not last_run_at_str:
         return None
     return datetime.fromisoformat(last_run_at_str)
@@ -521,31 +792,73 @@ def _parse_trigger_record(p: dict[str, Any]) -> PipelineTrigger:
     rather than rejected: an older control plane must degrade to "triggers
     only", not to "every record is malformed".
     """
-    source_credentials = p.get("sourceCredentials", "{}")
+    source_credentials = _str(p, "sourceCredentials")
     return PipelineTrigger(
         id=p["id"],
         source_credentials=json.loads(source_credentials) if source_credentials else {},
-        trigger_now=p.get("triggerNow", False),
-        pending_run_id=p.get("pendingRunId", ""),
+        trigger_now=_bool(p, "triggerNow"),
+        pending_run_id=_str(p, "pendingRunId"),
         last_run_at=_parse_last_run_at(p),
+    )
+
+
+def _parse_workflow_record(w: dict[str, Any]) -> WorkflowConfig:
+    """Map one API workflow record to a WorkflowConfig. Raises on malformed
+    input — the caller skips the record and keeps the rest.
+
+    Every scalar goes through the proto3 helpers: the server omits zero
+    values (position 0, refEnabled/enabled/triggerNow false, empty strings),
+    and an explicit null means the same. ``id``, a step's ``kind`` and
+    ``refId`` are required — empty, they identify nothing.
+    """
+    raw_steps = w.get("steps")
+    if raw_steps is None:
+        raw_steps = []
+    if not isinstance(raw_steps, list):
+        raise TypeError("'steps' is not a list")
+    steps = [
+        WorkflowStepConfig(
+            position=_int(s, "position"),
+            kind=_required_str(s, "kind"),
+            ref_id=_required_str(s, "refId"),
+            name=_str(s, "name"),
+            ref_enabled=_bool(s, "refEnabled"),
+        )
+        for s in raw_steps
+    ]
+    steps.sort(key=lambda s: s.position)
+    return WorkflowConfig(
+        id=_required_str(w, "id"),
+        name=_str(w, "name"),
+        schedule=_str(w, "schedule") or None,
+        enabled=_bool(w, "enabled"),
+        steps=steps,
+        trigger_now=_bool(w, "triggerNow"),
+        pending_run_id=_str(w, "pendingRunId"),
+        last_run_at=_parse_last_run_at(w),
+        last_run_status=_str(w, "lastRunStatus"),
     )
 
 
 def _parse_transformation_record(t: dict[str, Any]) -> TransformationConfig:
     """Map one API transformation record to a TransformationConfig. Raises on
-    malformed input — the caller skips the record and keeps the rest."""
-    git_credentials = t.get("gitCredentials", "{}")
+    malformed input — the caller skips the record and keeps the rest.
+
+    ``id`` and ``name`` are required: proto3 omits them only when empty, and
+    an empty id or name is a malformed record.
+    """
+    git_credentials = _str(t, "gitCredentials")
     return TransformationConfig(
         id=t["id"],
         name=t["name"],
-        repo_url=t.get("repoUrl", ""),
-        repo_ref=t.get("repoRef") or "main",
+        repo_url=_str(t, "repoUrl"),
+        repo_ref=_str(t, "repoRef") or "main",
         git_credentials=json.loads(git_credentials) if git_credentials else {},
-        schedule=t.get("schedule") or None,
-        trigger_after_pipeline_id=t.get("triggerAfterPipelineId", ""),
-        dbt_selector=t.get("dbtSelector", ""),
-        enabled=t.get("enabled", True),
-        trigger_now=t.get("triggerNow", False),
-        pending_run_id=t.get("pendingRunId", ""),
+        schedule=_str(t, "schedule") or None,
+        trigger_after_pipeline_id=_str(t, "triggerAfterPipelineId"),
+        dbt_selector=_str(t, "dbtSelector"),
+        enabled=_bool(t, "enabled"),
+        trigger_now=_bool(t, "triggerNow"),
+        pending_run_id=_str(t, "pendingRunId"),
         last_run_at=_parse_last_run_at(t),
     )

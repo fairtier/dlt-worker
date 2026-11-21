@@ -147,7 +147,10 @@ class TestWrites:
             self.recorder.finalize_stale_runs()
 
     def test_finalize_stale_runs_sweeps_both_tables(self) -> None:
-        with patch("dlt_worker.workspace_db.psycopg.connect", return_value=self.conn):
+        with (
+            patch("dlt_worker.workspace_db.psycopg.connect", return_value=self.conn),
+            patch.object(self.recorder, "_workflow_tables_present", return_value=False),
+        ):
             self.recorder.finalize_stale_runs()
 
         assert len(self.conn.executed) == 2
@@ -158,3 +161,156 @@ class TestWrites:
             assert "status = 'failed'" in query
             assert "worker restarted mid-run" in query
             assert "interval '2 hours'" in query
+
+    def test_finalize_stale_runs_leaves_workflow_runs_alone(self) -> None:
+        """Workflow runs are not swept by SQL: the orphans of a restart are
+        failed through the API (orphaned_workflow_runs + main), so the
+        failure notification fires, and the API's own step-liveness sweep
+        covers the rest."""
+        with (
+            patch("dlt_worker.workspace_db.psycopg.connect", return_value=self.conn),
+            patch.object(self.recorder, "_workflow_tables_present", return_value=True),
+        ):
+            self.recorder.finalize_stale_runs()
+
+        queries = [q for q, _ in self.conn.executed]
+        assert len(queries) == 2
+        assert not any("workflow" in q for q in queries)
+
+    def test_claim_orphaned_runs_fails_every_running_row(self) -> None:
+        """At startup every `running` row is an orphan, whatever its age:
+        one atomic UPDATE ... RETURNING per table, no interval, and each
+        claimed row comes back as the failure report that carries its own
+        columns (the API's update overwrites them)."""
+        started = datetime(2026, 1, 1, 3, 0, tzinfo=UTC)
+        done = datetime(2026, 1, 1, 3, 5, tzinfo=UTC)
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        p_cur, t_cur = MagicMock(), MagicMock()
+        p_cur.fetchall.return_value = [("pr-1", "p1", started, done, 7)]
+        t_cur.fetchall.return_value = [
+            ("tr-1", "t1", started, done, "abc", 3, 0, 2, 0, "[]")
+        ]
+        conn.execute.side_effect = [p_cur, t_cur]
+        with patch("dlt_worker.workspace_db.psycopg.connect", return_value=conn):
+            pipelines, transformations = self.recorder.claim_orphaned_runs()
+
+        queries = [c[0][0] for c in conn.execute.call_args_list]
+        assert "UPDATE pipeline_runs" in queries[0]
+        assert "UPDATE transformation_runs" in queries[1]
+        for query in queries:
+            assert "WHERE status = 'running'" in query
+            assert "interval" not in query
+            assert "RETURNING" in query
+            assert "worker restarted mid-run" in query
+        assert pipelines == [
+            PipelineRunReport(
+                pipeline_id="p1",
+                status="failed",
+                started_at=started.isoformat(),
+                completed_at=done.isoformat(),
+                rows_loaded=7,
+                error_message="worker restarted mid-run",
+                run_id="pr-1",
+            )
+        ]
+        assert transformations == [
+            TransformationRunReport(
+                transformation_id="t1",
+                status="failed",
+                started_at=started.isoformat(),
+                completed_at=done.isoformat(),
+                commit_sha="abc",
+                models_total=3,
+                tests_total=2,
+                model_results="[]",
+                error_message="worker restarted mid-run",
+                run_id="tr-1",
+            )
+        ]
+
+    def test_claim_orphaned_runs_swallows_db_errors(self) -> None:
+        with patch(
+            "dlt_worker.workspace_db.psycopg.connect",
+            side_effect=RuntimeError("connection refused"),
+        ):
+            assert self.recorder.claim_orphaned_runs() == ([], [])
+
+    def test_orphaned_workflow_runs_become_failure_reports(self) -> None:
+        """Every running workflow run, whatever its age, comes back as the
+        report that fails it: the running step failed (its run id kept),
+        steps that never ran skipped, finished steps as they were."""
+        started = datetime(2026, 1, 1, 3, 0, tzinfo=UTC)
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        runs_cur, steps_cur = MagicMock(), MagicMock()
+        runs_cur.fetchall.return_value = [("run-1", "wf-1", "schedule", started)]
+        steps_cur.fetchall.return_value = [
+            ("run-1", 0, "pipeline", "p0", "orders", "success", "pr-0", "",
+             started, started, ""),
+            ("run-1", 1, "pipeline", "p1", "customers", "running", "pr-1", "",
+             started, None, ""),
+            ("run-1", 2, "transformation", "t1", "marts", "pending", "", "",
+             None, None, ""),
+        ]  # fmt: skip
+        conn.execute.side_effect = [runs_cur, steps_cur]
+        with (
+            patch("dlt_worker.workspace_db.psycopg.connect", return_value=conn),
+            patch.object(self.recorder, "_workflow_tables_present", return_value=True),
+        ):
+            reports = self.recorder.orphaned_workflow_runs()
+
+        assert "status = 'running'" in conn.execute.call_args_list[0][0][0]
+        assert "interval" not in conn.execute.call_args_list[0][0][0]
+        assert len(reports) == 1
+        r = reports[0]
+        assert (r.run_id, r.workflow_id, r.status, r.trigger) == (
+            "run-1",
+            "wf-1",
+            "failed",
+            "schedule",
+        )
+        assert r.started_at == started.isoformat()
+        assert r.completed_at
+        assert r.error_message == (
+            "step 2 (pipeline 'customers') failed: worker restarted mid-run"
+        )
+        assert [s.status for s in r.step_runs] == ["success", "failed", "skipped"]
+        assert [s.pipeline_run_id for s in r.step_runs] == ["pr-0", "pr-1", ""]
+        assert r.step_runs[1].error_message.startswith("worker restarted mid-run")
+        assert r.step_runs[1].completed_at
+        assert r.step_runs[0].completed_at == started.isoformat()
+
+    def test_orphaned_workflow_runs_without_tables_or_db(self) -> None:
+        with patch.object(
+            self.recorder, "_workflow_tables_present", return_value=False
+        ):
+            assert self.recorder.orphaned_workflow_runs() == []
+        with (
+            patch.object(self.recorder, "_workflow_tables_present", return_value=True),
+            patch(
+                "dlt_worker.workspace_db.psycopg.connect",
+                side_effect=RuntimeError("connection refused"),
+            ),
+        ):
+            assert self.recorder.orphaned_workflow_runs() == []
+
+    def test_workflow_tables_probe(self) -> None:
+        """The probe answers from to_regclass and a broken connection
+        means "absent" — never an exception into the sweep."""
+        cur = MagicMock()
+        cur.fetchone.return_value = (False,)
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.execute.return_value = cur
+        with patch("dlt_worker.workspace_db.psycopg.connect", return_value=conn):
+            assert self.recorder._workflow_tables_present() is False
+            cur.fetchone.return_value = (True,)
+            assert self.recorder._workflow_tables_present() is True
+        assert "to_regclass('workflow_runs')" in conn.execute.call_args[0][0]
+
+        with patch(
+            "dlt_worker.workspace_db.psycopg.connect",
+            side_effect=RuntimeError("connection refused"),
+        ):
+            assert self.recorder._workflow_tables_present() is False
