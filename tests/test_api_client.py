@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -656,6 +658,53 @@ class TestGetWorkflowConfigs:
         assert notes[0].levelno == logging.INFO
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         # Optional feature: never flips the pod unready.
+        assert client.health_status()[0] is True
+
+    def test_api_without_workflow_service_over_real_http(self, caplog: Any) -> None:
+        """End to end against a server shaped like a workspace-api that
+        predates workflows: its internal mux serves the pipeline and
+        transformation services and answers any other path with the Go
+        ServeMux's plain-text 404. Workflows read as none, the services it
+        does serve keep working, and repeated ticks log nothing more."""
+        paths: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                paths.append(self.path)
+                if self.path.startswith("/transformation.v1.TransformationService/"):
+                    body, ctype, code = b"{}", "application/json", 200
+                else:
+                    body, ctype, code = b"404 page not found\n", "text/plain", 404
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: Any) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = APIClient(
+                base_url=f"http://127.0.0.1:{server.server_address[1]}",
+                customer_slug="acme",
+            )
+            with caplog.at_level(logging.INFO, logger="dlt_worker.api_client"):
+                for _ in range(3):
+                    assert client.get_workflow_configs() == []
+                    assert client.get_transformation_configs() == []
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        assert paths.count("/workflow.v1.WorkflowService/GetWorkflowConfigs") == 3
+        notes = [r for r in caplog.records if "does not serve workflows" in r.message]
+        assert len(notes) == 1
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert client.health_status()[0] is True
 
     def test_transport_error_returns_empty(self) -> None:
